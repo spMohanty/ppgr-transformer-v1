@@ -708,7 +708,7 @@ if __name__ == "__main__":
                                             add_relative_time_idx = True,
                                             use_food_covariates_from_prediction_window = True,
                                             
-                                            use_microbiome_embeddings = True,
+                                            use_microbiome_embeddings = False,
                                             microbiome_embeddings_df = microbiome_embeddings_df,
                                             
                                             temporal_categoricals = temporal_categoricals,
