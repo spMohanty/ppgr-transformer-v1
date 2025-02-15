@@ -204,7 +204,7 @@ class PPGRTimeSeriesDataset(Dataset):
             self.prepare_food_anchored_data()
         else:
             # 3.2 Prepare the data for the standard sliding window timeseries    
-            self.prepare_non_food_anchored_data()
+            self.prepare_sliding_window_data()
     
     def merge_ppgr_and_user_demographics(self):
         self.ppgr_df = self.ppgr_df.merge(self.user_demographics_df, on="user_id", how="left")
@@ -279,27 +279,59 @@ class PPGRTimeSeriesDataset(Dataset):
         self.microbiome_tensor = torch.tensor(self.microbiome_embeddings_df.to_numpy()).to(self.device)
         self.user_id_to_microbiome_idx = {user_id: idx for idx, user_id in enumerate(self.microbiome_embeddings_df.index)}
         
+    
+    def prepare_sliding_window_data(self):
+        # Iterate over each of the timeseries_block_ids 
+        groups = self.df_scaled.groupby(self.group_by_columns)
+        for _, group in tqdm(groups, total=len(groups)):
+            block_start = group.index[0]
+            block_end = group.index[-1]
+            
+            # 3. Keep a record of the microbiome index for this slice            
+            if self.use_microbiome_embeddings:
+                if "user_id" in self.categorical_encoders:
+                    # When user_id is a provided covariate
+                    user_id = int(self.categorical_encoders["user_id"].inverse_transform(group["user_id"].iloc[0]))
+                else:
+                    # When user_id is directly available from the dataframe
+                    # CAREFUL: if the user_id is a categorical variable, this this value is an encoded version
+                    # and doesnt not match the user_id in the whole dataset
+                    user_id = int(group["user_id"].iloc[0])
+                microbiome_idx = self.user_id_to_microbiome_idx[user_id]
+            else:
+                microbiome_idx = None
+            
+            # Iterate over the whole timeseries block            
+            for row_idx, row in group.iterrows():                
+                # 1. Identify the start and end of the context and prediction window
+                slice_start = row_idx - self.min_encoder_length
+                slice_end = row_idx + self.prediction_length
+                
+                # 2. Ignore the fringe points where the slice is not fully within the block
+                if slice_start < block_start or slice_end > block_end: continue 
+                
+                print(f"slice_start: {slice_start}, slice_end: {slice_end}")
+                # 3. Keep a record of the slice metadata to be used later in __getitem__
+                self.timeseries_slices_indices.append(
+                    PPGRTimeSeriesSliceMetadata(
+                        slice_start = slice_start, # recommended slice start  (using the minimum encoder length)
+                        slice_end = slice_end, # recommended slice end (using the minimum prediction length)
+                        anchor_row_idx = row_idx, # anchor row for this slice (usually the food intake row, but not necessarily)
+                        block_start = block_start, # start of the timeseries block
+                        block_end = block_end, # end of the timeseries block
+                        microbiome_idx = microbiome_idx # keep track of the microbiome index for this slice
+                    ))
             
     
     def prepare_food_anchored_data(self):
         # 1. Iterate over each of the timeseries_block_ids 
         groups = self.df_scaled.groupby(self.group_by_columns)
-        for _, group in tqdm(groups, total=len(groups)):
-            # 2. For each timeseries_block_id, identify the food intake rows
-            food_intake_mask = group["food_intake_row"] == 1
-            
-            # 3. Ensure that the there is enough past and future data for all potential slices
-            food_intake_mask.iloc[:self.max_encoder_length] = False
-            food_intake_mask.iloc[-self.prediction_length:] = False
-            
-            # 4. Get all the rows that have enough past and future data
-            food_intake_rows = group[food_intake_mask]
-            
-            # 4.5 Keep a record of the block_start so that we can randomize the encoder lengths during the training
+        for _, group in tqdm(groups, total=len(groups)):            
+            # 2 Keep a record of the block_start so that we can randomize the encoder lengths during the training
             block_start = group.index[0]
             block_end = group.index[-1]
             
-            # 4.6 Keep a record of the microbiome index for this slice            
+            # 3. Keep a record of the microbiome index for this slice            
             if self.use_microbiome_embeddings:
                 if "user_id" in self.categorical_encoders:
                     # When user_id is a provided covariate
@@ -313,13 +345,23 @@ class PPGRTimeSeriesDataset(Dataset):
             else:
                 microbiome_idx = None
 
-            # 5. Iterate over all the food intake rows
+            # 4. For each timeseries_block_id, identify the food intake rows
+            food_intake_mask = group["food_intake_row"] == 1
+            
+            # 5. Ensure that the there is enough past and future data for all potential slices
+            food_intake_mask.iloc[:self.max_encoder_length] = False
+            food_intake_mask.iloc[-self.prediction_length:] = False
+            
+            # 6. Get all the rows that have enough past and future data
+            food_intake_rows = group[food_intake_mask]
+
+            # 7. Iterate over all the food intake rows
             for row_idx, _ in food_intake_rows.iterrows():
-                # 6. For each food intake row, identify the start and end of the context and prediction window
+                # 8. For each food intake row, identify the start and end of the context and prediction window
                 slice_start = row_idx - self.min_encoder_length
                 slice_end = row_idx + self.prediction_length
                 
-                # 7. Store slice start, and slice end to be retrieved later in __getitem__
+                # 9. Store slice start, and slice end to be retrieved later in __getitem__
                 self.timeseries_slices_indices.append(
                     PPGRTimeSeriesSliceMetadata(
                         slice_start = slice_start, # recommended slice start  (using the minimum encoder length)
@@ -329,10 +371,6 @@ class PPGRTimeSeriesDataset(Dataset):
                         block_end = block_end, # end of the timeseries block
                         microbiome_idx = microbiome_idx # keep track of the microbiome index for this slice
                     ))
-    
-    def prepare_non_food_anchored_data(self):
-        raise NotImplementedError("Non food anchored data preparation not implemented")
-
     
     def __len__(self):
         return len(self.timeseries_slices_indices)
@@ -384,15 +422,15 @@ class PPGRTimeSeriesDataset(Dataset):
         # Gather Encoder Variables: 
         ############################################################        
         
-        # Temporal Categorical Columns
+        # Temporal Covariates
         x_temporal_cat = data_slice_encoder_tensor[:, self.temporal_categorical_col_idx]
         x_temporal_real = data_slice_encoder_tensor[:, self.temporal_real_col_idx]
         
-        # User Static Categorical Columns
+        # User Static Covariates
         x_user_cat = data_slice_encoder_tensor[:, self.user_static_categorical_col_idx]
         x_user_real = data_slice_encoder_tensor[:, self.user_static_real_col_idx]
         
-        # Gather Food Static Categorical Columns
+        # Food Static Covariates
         x_food_cat = data_slice_encoder_tensor[:, self.food_categorical_col_idx]
         x_food_real = data_slice_encoder_tensor[:, self.food_real_col_idx]
         
@@ -408,15 +446,15 @@ class PPGRTimeSeriesDataset(Dataset):
         # Gather Prediction Window Variables
         ############################################################
         
-        # Temporal Categorical Columns
+        # Temporal Covariates
         y_temporal_cat = data_slice_prediction_window_tensor[:, self.temporal_categorical_col_idx]
         y_temporal_real = data_slice_prediction_window_tensor[:, self.temporal_real_col_idx]
 
-        # Gather Prediction Window Variables: User Static Categorical Columns
+        # User Static Covariates
         y_user_cat = data_slice_prediction_window_tensor[:, self.user_static_categorical_col_idx]
         y_user_real = data_slice_prediction_window_tensor[:, self.user_static_real_col_idx]
 
-        # Gather Prediction Window Variables: Food Static Categorical Columns
+        # Food Static Covariates
         if self.use_food_covariates_from_prediction_window:
             y_food_cat = data_slice_prediction_window_tensor[:, self.food_categorical_col_idx]
             y_food_real = data_slice_prediction_window_tensor[:, self.food_real_col_idx]
@@ -424,14 +462,14 @@ class PPGRTimeSeriesDataset(Dataset):
             y_food_cat = None
             y_food_real = None
 
-        # Gather the target columns
+        # Target Variables
         y_real_target = data_slice_prediction_window_tensor[:, self.target_col_idx]
         target_scales = self.target_scales # mean, std : This can be varying later if we want to normalize by user_id or other columns
 
         # Calculate relative time indices
         # Encoder window: [-encoder_length, ..., 0]
         # Prediction window: [0, 1, ..., prediction_length-1]
-        encoder_time_idx = torch.arange(-encoder_length + 1, 0+1).to(self.device)
+        encoder_time_idx = torch.arange(-encoder_length + 1, 0+1).to(self.device) # the current anchor needs to be at index 0
         prediction_time_idx = torch.arange(1, prediction_length+1).to(self.device)
         relative_time_idx = torch.cat([encoder_time_idx, prediction_time_idx])
 
@@ -704,7 +742,7 @@ if __name__ == "__main__":
     # Create the training dataset
     training_dataset = PPGRTimeSeriesDataset(ppgr_df = training_df, 
                                             user_demographics_df = users_demographics_df,
-                                            is_food_anchored = True,
+                                            is_food_anchored = False, # When False, its the standard sliding window timeseries, but when True, every timeseries will have a food intake row at the last item of the context window
                                             time_idx = "read_at",
                                             target_columns = ["val"],
                                                                                     
