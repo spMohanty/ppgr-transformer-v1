@@ -10,15 +10,14 @@ from typing import Dict, List
 
 from tqdm import tqdm
 
-from utils import load_dataframe, enforce_column_types, setup_scalers_and_encoders
+from utils import load_dataframe, enforce_column_types, setup_scalers_and_encoders, ppgr_collate_fn
 
 from pytorch_forecasting.data.encoders import (
-    EncoderNormalizer,
-    GroupNormalizer,
-    MultiNormalizer,
     NaNLabelEncoder,
-    TorchNormalizer,
 )
+
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader
 
 
 import numpy as np
@@ -112,7 +111,9 @@ class PPGRTimeSeriesSliceMetadata:
 class PPGRTimeSeriesDataset(Dataset):
     def __init__(self,  ppgr_df: pd.DataFrame,
                         user_demographics_df: pd.DataFrame,
-                        is_food_anchored: bool = True, # decides if the timeseries is food anchored or not
+                        is_food_anchored: bool = False, # decides if the timeseries is food anchored or not
+                        sliding_window_stride: int = 10, # decides the stride of the sliding window (Only used when is_food_anchored is False)
+                        
                         time_idx: str = "time_idx", # Unique integral column in each timeseries for each datapoint (should be in the same order as read_at) 
 
                         target_columns: List[str] = ["val"], # These are the columns that are the targets (should also be provided in the time_varying_unknown_reals
@@ -139,13 +140,14 @@ class PPGRTimeSeriesDataset(Dataset):
                         categorical_encoders: Dict[str, NaNLabelEncoder] = {},  # These have to be provided to avoid mistakes
                         continuous_scalers: Dict[str, StandardScaler] = {}, # These have to be provided to avoid mistakes
                         
-                        add_relative_time_idx: bool = True,
                         device: torch.device = torch.device("cpu")
                     ):
         self.ppgr_df = ppgr_df
         self.user_demographics_df = user_demographics_df
         
         self.is_food_anchored = is_food_anchored
+        self.sliding_window_stride = sliding_window_stride
+        
         self.time_idx = time_idx
         
         self.target_columns = target_columns
@@ -175,13 +177,24 @@ class PPGRTimeSeriesDataset(Dataset):
         self.categorical_encoders = categorical_encoders
         self.continuous_scalers = continuous_scalers
         
-        self.add_relative_time_idx = add_relative_time_idx
         self.device = device
         
         self.timeseries_slices_indices = [] # Will house a list of PPGRTimeSeriesSliceMetadata that will be referenced in __getitem__
 
+        self.validate_parameters()
         self.prepare_data()
     
+    def validate_parameters(self):
+        assert self.min_encoder_length > 0, "Minimum encoder length must be greater than 0"
+        assert self.max_encoder_length > 0, "Maximum encoder length must be greater than 0"
+        assert self.prediction_length > 0, "Prediction length must be greater than 0"
+        assert self.sliding_window_stride is None or self.sliding_window_stride > 0, "Sliding window stride must be greater than 0"
+        
+        if self.is_food_anchored:
+            assert self.sliding_window_stride is None, "Sliding window stride must be None when is_food_anchored is True"
+        else:
+            assert self.sliding_window_stride is not None, "Sliding window stride must be provided when is_food_anchored is False"
+
     def prepare_data(self):
         
         # 0. Merge the ppgr_df and user_demographics_df
@@ -302,7 +315,7 @@ class PPGRTimeSeriesDataset(Dataset):
                 microbiome_idx = None
             
             # Iterate over the whole timeseries block            
-            for row_idx, row in group.iterrows():                
+            for row_idx in range(block_start, block_end + 1, self.sliding_window_stride):
                 # 1. Identify the start and end of the context and prediction window
                 slice_start = row_idx - self.min_encoder_length
                 slice_end = row_idx + self.prediction_length
@@ -471,7 +484,6 @@ class PPGRTimeSeriesDataset(Dataset):
         # Prediction window: [0, 1, ..., prediction_length-1]
         encoder_time_idx = torch.arange(-encoder_length + 1, 0+1).to(self.device) # the current anchor needs to be at index 0
         prediction_time_idx = torch.arange(1, prediction_length+1).to(self.device)
-        relative_time_idx = torch.cat([encoder_time_idx, prediction_time_idx])
 
         _response = dict(
             # Encoder Temporal Variables (dynamic)
@@ -508,11 +520,11 @@ class PPGRTimeSeriesDataset(Dataset):
             y_real_target = y_real_target, # [N', T_r]
             target_scales = target_scales, # [2]
             
-            # Metadata about the slice
+            encoder_length = torch.tensor(encoder_length, dtype=torch.int32).to(self.device), # scalar 
+            prediction_length = torch.tensor(prediction_length, dtype=torch.int32).to(self.device),    # converting to tensor so that the collate function doesnt need special cases.        
             
+            # Metadata about the slice
             metadata = dict(
-                encoder_length = encoder_length, # scalar 
-                prediction_length = prediction_length,
                 categorical_encoders = self.categorical_encoders,
                 continuous_scalers = self.continuous_scalers,
                 all_columns = self.all_columns,
@@ -525,10 +537,7 @@ class PPGRTimeSeriesDataset(Dataset):
                 target_columns = self.target_columns,
             )
         )
-        
-        if self.add_relative_time_idx:
-            _response["relative_time_idx"] = relative_time_idx
-        
+                
         return _response
         
     def inverse_transform_values(self, values, column_type: str) -> pd.DataFrame:
@@ -608,9 +617,7 @@ class PPGRTimeSeriesDataset(Dataset):
             "x_real_target": "target",
             "y_real_target": "target"
         }
-        
-        relative_time_idx = item["relative_time_idx"]
-        
+                
         transformed_item = {}
         # Process each key-value pair
         for key, value in item.items():
@@ -647,8 +654,6 @@ class PPGRTimeSeriesDataset(Dataset):
         
         # Merger encoder and decoder vertically        
         aggregated_df = pd.concat([encoder_df, decoder_df], axis=0)
-        if self.add_relative_time_idx:
-            aggregated_df["relative_time_idx"] = relative_time_idx
 
         return aggregated_df, encoder_df, decoder_df
 
@@ -688,7 +693,7 @@ if __name__ == "__main__":
     validation_percentage = 0.2
     test_percentage = 0.2
 
-
+    use_granular_food_data = True
     # Unique Grouping Column
     group_by_columns = ["timeseries_block_id"]
 
@@ -700,11 +705,7 @@ if __name__ == "__main__":
     food_categoricals = []
     food_reals = ['food__eaten_quantity_in_gram', 'food__energy_kcal_eaten',
         'food__carb_eaten', 'food__fat_eaten', 'food__protein_eaten',
-        'food__fiber_eaten', 'food__alcohol_eaten', 'food__vegetables_fruits',
-        'food__grains_potatoes_pulses', 'food__unclassified',
-        'food__non_alcoholic_beverages',
-        'food__dairy_products_meat_fish_eggs_tofu',
-        'food__sweets_salty_snacks_alcohol', 'food__oils_fats_nuts']
+        'food__fiber_eaten', 'food__alcohol_eaten']
 
 
     # Temporal Covariates
@@ -719,14 +720,15 @@ if __name__ == "__main__":
     
     
     # Load the data frames
-    ppgr_df, users_demographics_df, microbiome_embeddings_df = load_dataframe(dataset_version, debug_mode)
+    ppgr_df, users_demographics_df, dishes_df, microbiome_embeddings_df = load_dataframe(dataset_version, debug_mode)
 
     # Split the data frames into training, validation and test sets
     training_df, validation_df, test_df = split_timeseries_df_based_on_food_intake_rows(ppgr_df, validation_percentage=validation_percentage, test_percentage=test_percentage)
     
     # Validate the data frames
-    ppgr_df, users_demographics_df = enforce_column_types(  ppgr_df, 
+    ppgr_df, users_demographics_df, dishes_df = enforce_column_types(  ppgr_df, 
                                                             users_demographics_df, 
+                                                            dishes_df,
                                                             all_categorical_columns,
                                                             all_real_columns)
 
@@ -735,14 +737,17 @@ if __name__ == "__main__":
         ppgr_df = ppgr_df,
         training_df = training_df,
         users_demographics_df = users_demographics_df,
+        dishes_df=dishes_df,
         categorical_columns = all_categorical_columns,
-        real_columns = all_real_columns
+        real_columns = all_real_columns,
+        use_granular_food_data = use_granular_food_data # This determines which data to fit the encoders on
     ) # Note: the encoders are fit on the full ppgr_df, and the scalers are fit on the training_df
 
     # Create the training dataset
     training_dataset = PPGRTimeSeriesDataset(ppgr_df = training_df, 
                                             user_demographics_df = users_demographics_df,
                                             is_food_anchored = False, # When False, its the standard sliding window timeseries, but when True, every timeseries will have a food intake row at the last item of the context window
+                                            sliding_window_stride = 1, # This has to change everytime is_food_anchored is changed
                                             time_idx = "read_at",
                                             target_columns = ["val"],
                                                                                     
@@ -753,7 +758,6 @@ if __name__ == "__main__":
                                             
                                             prediction_length = 2 * 4, # 2 hours with 4 timepoints per hour
                                             
-                                            add_relative_time_idx = True,
                                             use_food_covariates_from_prediction_window = True,
                                             
                                             use_microbiome_embeddings = True,
@@ -769,23 +773,41 @@ if __name__ == "__main__":
                                             food_reals = food_reals,
                                             
                                             categorical_encoders = categorical_encoders,
-                                            continuous_scalers = continuous_scalers)
+                                            continuous_scalers = continuous_scalers,
+                                            )
 
     print(f"Length of training dataset: {len(training_dataset)}")
 
-
+    
     # data = training_dataset[0]
 
     # aggregated_df, encoder_df, decoder_df = training_dataset.inverse_transform_item(data)
     # display(encoder_df)
     # display(decoder_df)
 
-    for data in tqdm(training_dataset):
-        print(data["metadata"])
-        # aggregated_df, encoder_df, decoder_df = training_dataset.inverse_transform_item(data)
-        # print(encoder_df)
-        # print(decoder_df)
-        # break
-        # display(decoder_df)
-        break
-        
+    # for data in tqdm(training_dataset):
+    #     print(data["metadata"])
+    #     # aggregated_df, encoder_df, decoder_df = training_dataset.inverse_transform_item(data)
+    #     # print(encoder_df)
+    #     # print(decoder_df)
+    #     # break
+    #     # display(decoder_df)
+    #     break
+            
+    
+    
+    train_loader = DataLoader(
+        training_dataset,   # your PPGRTimeSeriesDataset instance
+        batch_size=512,
+        shuffle=True,
+        num_workers=1, # When using the data directly on GPU, ensure num_workers is 1
+        collate_fn=ppgr_collate_fn
+    )
+    # Example: Iterate through one batch
+    for batch in tqdm(train_loader):
+        # Now batch is a dictionary where variable-length sequences have been padded.
+        # print("x_temporal_cat shape:", batch["x_temporal_cat"].shape)
+        # print("relative_time_idx shape:", batch.get("relative_time_idx", None))
+        # Process your batch...
+        pass
+
