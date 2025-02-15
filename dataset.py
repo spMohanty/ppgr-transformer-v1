@@ -96,12 +96,14 @@ class PPGRTimeSeriesSliceMetadata:
                  slice_end: int,
                  anchor_row_idx: int, 
                  block_start: int,  # This is the start of the timeseries block
-                 block_end: int):  # This is the end of the timeseries block
+                 block_end: int,  # This is the end of the timeseries block
+                 microbiome_idx: Optional[int] = None):  # This is the index of the microbiome embedding for this slice
         self.slice_start = slice_start
         self.slice_end = slice_end
         self.anchor_row_idx = anchor_row_idx
         self.block_start = block_start
         self.block_end = block_end
+        self.microbiome_idx = microbiome_idx
     
     def __repr__(self):
         return f"PPGRTimeSeriesSliceMetadata(slice_start={self.slice_start}, slice_end={self.slice_end}, encoder_length={self.encoder_length}, prediction_length={self.prediction_length})"
@@ -154,6 +156,9 @@ class PPGRTimeSeriesDataset(Dataset):
         
         self.use_food_covariates_from_prediction_window = use_food_covariates_from_prediction_window
         
+        self.use_microbiome_embeddings = use_microbiome_embeddings
+        self.microbiome_embeddings_df = microbiome_embeddings_df
+        
         # Temporal Covariates
         self.temporal_categoricals = temporal_categoricals
         self.temporal_reals = temporal_reals
@@ -187,6 +192,9 @@ class PPGRTimeSeriesDataset(Dataset):
                 
         # 1. Scale and CatEmbed the dataset df
         self.prepare_scaled_and_catembed_dataset()
+        
+        # 1.1. Prepare the microbiome embeddings
+        self.prepare_microbiome_embeddings()
         
         # 2. Sort by group_by_columns and time_idx
         self.ppgr_df = self.ppgr_df.sort_values(by=self.group_by_columns + [self.time_idx])
@@ -258,6 +266,20 @@ class PPGRTimeSeriesDataset(Dataset):
         
         # NOTE: It is important that the indices of both df_scaled and df_scaled_tensor align, 
         # which is why we did the reset_index just before
+        
+        
+    def prepare_microbiome_embeddings(self):
+        """
+        microbiome embeddings expect that all the user_ids are present in the microbiome embeddings dataframe
+        and that the data is already normalized
+        """
+        self.microbiome_embeddings_df = self.microbiome_embeddings_df.sort_index()
+        assert set(self.ppgr_df["user_id"].astype(int).unique()) == set(self.microbiome_embeddings_df.index), "All user_ids in the ppgr_df must be present in the microbiome_embeddings_df, and vice versa"
+        
+        self.microbiome_tensor = torch.tensor(self.microbiome_embeddings_df.to_numpy()).to(self.device)
+        self.user_id_to_microbiome_idx = {user_id: idx for idx, user_id in enumerate(self.microbiome_embeddings_df.index)}
+        
+            
     
     def prepare_food_anchored_data(self):
         # 1. Iterate over each of the timeseries_block_ids 
@@ -277,6 +299,20 @@ class PPGRTimeSeriesDataset(Dataset):
             block_start = group.index[0]
             block_end = group.index[-1]
             
+            # 4.6 Keep a record of the microbiome index for this slice            
+            if self.use_microbiome_embeddings:
+                if "user_id" in self.categorical_encoders:
+                    # When user_id is a provided covariate
+                    user_id = int(self.categorical_encoders["user_id"].inverse_transform(group["user_id"].iloc[0]))
+                else:
+                    # When user_id is directly available from the dataframe
+                    # CAREFUL: if the user_id is a categorical variable, this this value is an encoded version
+                    # and doesnt not match the user_id in the whole dataset
+                    user_id = int(group["user_id"].iloc[0])
+                microbiome_idx = self.user_id_to_microbiome_idx[user_id]
+            else:
+                microbiome_idx = None
+
             # 5. Iterate over all the food intake rows
             for row_idx, _ in food_intake_rows.iterrows():
                 # 6. For each food intake row, identify the start and end of the context and prediction window
@@ -290,7 +326,8 @@ class PPGRTimeSeriesDataset(Dataset):
                         slice_end = slice_end, # recommended slice end (using the minimum prediction length)
                         anchor_row_idx = row_idx, # anchor row for this slice (usually the food intake row, but not necessarily)
                         block_start = block_start, # start of the timeseries block
-                        block_end = block_end # end of the timeseries block
+                        block_end = block_end, # end of the timeseries block
+                        microbiome_idx = microbiome_idx # keep track of the microbiome index for this slice
                     ))
     
     def prepare_non_food_anchored_data(self):
@@ -361,6 +398,11 @@ class PPGRTimeSeriesDataset(Dataset):
         
         # Gather Historical Value of the Target(s)
         x_real_target = data_slice_encoder_tensor[:, self.target_col_idx]
+        
+        if self.use_microbiome_embeddings:
+            x_microbiome_embedding = self.microbiome_tensor[slice_metadata.microbiome_idx, :]
+        else:
+            x_microbiome_embedding = None
 
         ############################################################
         # Gather Prediction Window Variables
@@ -405,6 +447,9 @@ class PPGRTimeSeriesDataset(Dataset):
             # Encoder Food Variables (dynamic)
             x_food_cat = x_food_cat, # [N, F_c]
             x_food_real = x_food_real, # [N, F_r]
+            
+            # Encoder Microbiome Embedding Variables (static)
+            x_microbiome_embedding = x_microbiome_embedding, # [N, M]
             
             # Encoder Target Variables # Historical value of the overall target
             x_real_target = x_real_target, # [N, T_r]
@@ -528,6 +573,8 @@ class PPGRTimeSeriesDataset(Dataset):
                     transformed_item[key] = _transformed_df_columns
                 else:
                     transformed_item[key] = None
+            else:
+                logger.warning(f"Key {key} not found in key_to_type")
         
         
         # Merge encoder values horizontally
@@ -595,7 +642,6 @@ if __name__ == "__main__":
 
 
     # Unique Grouping Column
-    timeseries_id = "time_series_cluster_id"
     group_by_columns = ["timeseries_block_id"]
 
     # User 
@@ -603,9 +649,7 @@ if __name__ == "__main__":
     user_static_reals = ["user__age", "user__weight", "user__height", "user__bmi", "user__general_hunger_level", "user__morning_hunger_level", "user__mid_hunger_level", "user__evening_hunger_level"]
 
     # Food Covariates
-    food_categoricals = [
-        # "food__food_group_cname"
-    ]
+    food_categoricals = []
     food_reals = ['food__eaten_quantity_in_gram', 'food__energy_kcal_eaten',
         'food__carb_eaten', 'food__fat_eaten', 'food__protein_eaten',
         'food__fiber_eaten', 'food__alcohol_eaten', 'food__vegetables_fruits',
@@ -690,9 +734,10 @@ if __name__ == "__main__":
 
     for data in tqdm(training_dataset):
         # print(data)
-        aggregated_df, encoder_df, decoder_df = training_dataset.inverse_transform_item(data)
-        print(encoder_df)
-        print(decoder_df)
-        break
+        # aggregated_df, encoder_df, decoder_df = training_dataset.inverse_transform_item(data)
+        # print(encoder_df)
+        # print(decoder_df)
+        # break
         # display(decoder_df)
+        pass
         
