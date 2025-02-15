@@ -474,7 +474,17 @@ class PPGRTimeSeriesDataset(Dataset):
             
             metadata = dict(
                 encoder_length = encoder_length, # scalar 
-                prediction_length = prediction_length
+                prediction_length = prediction_length,
+                categorical_encoders = self.categorical_encoders,
+                continuous_scalers = self.continuous_scalers,
+                all_columns = self.all_columns,
+                temporal_categoricals = self.temporal_categoricals,
+                temporal_reals = self.temporal_reals,
+                user_static_categoricals = self.user_static_categoricals,
+                user_static_reals = self.user_static_reals,
+                food_categoricals = self.food_categoricals,
+                food_reals = self.food_reals,
+                target_columns = self.target_columns,
             )
         )
         
@@ -708,7 +718,7 @@ if __name__ == "__main__":
                                             add_relative_time_idx = True,
                                             use_food_covariates_from_prediction_window = True,
                                             
-                                            use_microbiome_embeddings = False,
+                                            use_microbiome_embeddings = True,
                                             microbiome_embeddings_df = microbiome_embeddings_df,
                                             
                                             temporal_categoricals = temporal_categoricals,
@@ -733,11 +743,11 @@ if __name__ == "__main__":
     # display(decoder_df)
 
     for data in tqdm(training_dataset):
-        # print(data)
+        print(data["metadata"])
         # aggregated_df, encoder_df, decoder_df = training_dataset.inverse_transform_item(data)
         # print(encoder_df)
         # print(decoder_df)
         # break
         # display(decoder_df)
-        pass
+        break
         
