@@ -225,7 +225,10 @@ def ppgr_collate_fn(batch):
                 # These are the other variables, that should not need padding by default and a simple stacking should do the trick
                 collated[key] = torch.stack([batch[_idx][key] for _idx in range(len(batch))])
         else:
-            raise ValueError(f"Key {key} is not a tensor")
+            # raise Error unless y_food_cat or y_food_real, as they might be suppressed 
+            # when future food information is not allowed
+            if key not in ["y_food_cat", "y_food_real"]:
+                raise ValueError(f"Key {key} is not a tensor")
     
     # Add masks to the collated dictionary
     collated["encoder_mask"] = encoder_mask

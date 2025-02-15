@@ -323,7 +323,7 @@ class PPGRTimeSeriesDataset(Dataset):
                 # 2. Ignore the fringe points where the slice is not fully within the block
                 if slice_start < block_start or slice_end > block_end: continue 
                 
-                print(f"slice_start: {slice_start}, slice_end: {slice_end}")
+                # print(f"slice_start: {slice_start}, slice_end: {slice_end}")
                 # 3. Keep a record of the slice metadata to be used later in __getitem__
                 self.timeseries_slices_indices.append(
                     PPGRTimeSeriesSliceMetadata(
@@ -746,19 +746,19 @@ if __name__ == "__main__":
     # Create the training dataset
     training_dataset = PPGRTimeSeriesDataset(ppgr_df = training_df, 
                                             user_demographics_df = users_demographics_df,
+                                            time_idx = "read_at",
+                                            target_columns = ["val"],                                                                                    
+                                            group_by_columns = ["timeseries_block_id"],
+
                                             is_food_anchored = False, # When False, its the standard sliding window timeseries, but when True, every timeseries will have a food intake row at the last item of the context window
                                             sliding_window_stride = 1, # This has to change everytime is_food_anchored is changed
-                                            time_idx = "read_at",
-                                            target_columns = ["val"],
-                                                                                    
-                                            group_by_columns = ["timeseries_block_id"],
 
                                             min_encoder_length = 8 * 4, # 8 hours with 4 timepoints per hour
                                             max_encoder_length = 12 * 4, # 12 hours with 4 timepoints per hour
                                             
                                             prediction_length = 2 * 4, # 2 hours with 4 timepoints per hour
                                             
-                                            use_food_covariates_from_prediction_window = True,
+                                            use_food_covariates_from_prediction_window = False,
                                             
                                             use_microbiome_embeddings = True,
                                             microbiome_embeddings_df = microbiome_embeddings_df,
