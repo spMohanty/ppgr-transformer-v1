@@ -2,11 +2,15 @@ import pandas as pd
 from pytorch_forecasting.data import TimeSeriesDataSet
 from loguru import logger
 
-from typing import Tuple
+from sklearn.preprocessing import StandardScaler
+
+from typing import Tuple, Optional
+from typing import Dict, List
+
 
 from tqdm import tqdm
 
-from utils import load_dataframe, create_slice
+from utils import load_dataframe, enforce_column_types, setup_scalers_and_encoders
 
 from pytorch_forecasting.data.encoders import (
     EncoderNormalizer,
@@ -16,7 +20,6 @@ from pytorch_forecasting.data.encoders import (
     TorchNormalizer,
 )
 
-from typing import Dict, List
 
 import numpy as np
 
@@ -87,123 +90,6 @@ def split_timeseries_df_based_on_food_intake_rows(
     return training_df, validation_df, test_df        
     
 
-
-
-
-
-
-
-dataset_version = "v0.4"
-debug_mode = True
-
-max_encoder_length = 48*4
-max_prediction_length = 2*4
-validation_percentage = 0.2
-test_percentage = 0.2
-
-ppgr_df, users_demographics_df = load_dataframe(dataset_version, debug_mode)
-
-training_df, validation_df, test_df = split_timeseries_df_based_on_food_intake_rows(ppgr_df, validation_percentage=validation_percentage, test_percentage=test_percentage)
-
-
-# Unique Grouping Column
-timeseries_id = "time_series_cluster_id"
-group_by_columns = ["timeseries_block_id"]
-
-# User 
-user_static_categoricals = ["user_id", "user__edu_degree", "user__income", "user__household_desc", "user__job_status", "user__smoking", "user__health_state", "user__physical_activities_frequency"]
-user_static_reals = ["user__age", "user__weight", "user__height", "user__bmi", "user__general_hunger_level", "user__morning_hunger_level", "user__mid_hunger_level", "user__evening_hunger_level"]
-
-# Food Covariates
-food_categoricals = [
-    # "food__food_group_cname"
-]
-food_reals = ['food__eaten_quantity_in_gram', 'food__energy_kcal_eaten',
-       'food__carb_eaten', 'food__fat_eaten', 'food__protein_eaten',
-       'food__fiber_eaten', 'food__alcohol_eaten', 'food__vegetables_fruits',
-       'food__grains_potatoes_pulses', 'food__unclassified',
-       'food__non_alcoholic_beverages',
-       'food__dairy_products_meat_fish_eggs_tofu',
-       'food__sweets_salty_snacks_alcohol', 'food__oils_fats_nuts']
-
-
-# Temporal Covariates
-temporal_categoricals = ["loc_eaten_dow", "loc_eaten_dow_type", "loc_eaten_season"]
-temporal_reals = ["loc_eaten_hour"]
-
-# Targets
-targets = ["val"]
-
-use_food_covariates_from_prediction_window = False
-
-
-all_categorical_columns = user_static_categoricals + food_categoricals + temporal_categoricals
-all_real_columns = user_static_reals + food_reals + temporal_reals + targets
-
-# Validate that the categorical and real columns are present in the ppgr_df and users_demographics_df
-# and ensure they are of the correct type
-# - ensure all categorical columns are strings
-for col in all_categorical_columns:
-    if col in ppgr_df.columns:
-        ppgr_df[col] = ppgr_df[col].astype(str)
-    elif col in users_demographics_df.columns:
-        users_demographics_df[col] = users_demographics_df[col].astype(str)
-    else:
-        raise ValueError(f"Column {col} not found in ppgr_df or users_demographics_df")
-
-# - ensure all real columns are floats
-for col in all_real_columns:
-    if col in ppgr_df.columns:
-        ppgr_df[col] = ppgr_df[col].astype(float)
-    elif col in users_demographics_df.columns:
-        users_demographics_df[col] = users_demographics_df[col].astype(float)
-    else:
-        raise ValueError(f"Column {col} not found in ppgr_df or users_demographics_df")
-
-
-print(f"timeseries_id: {timeseries_id}")
-print(f"group_by_columns: {group_by_columns}")
-
-# Setup Categorical Encoder for all categorical columns
-# so we use the same encoder for the training, validation and test sets
-categorical_encoders = {}
-
-for col in all_categorical_columns:
-    categorical_encoders[col] = NaNLabelEncoder(
-        add_nan=True, warn=True
-    )
-    if col in ppgr_df.columns:
-        categorical_encoders[col].fit(ppgr_df[col])
-    elif col in users_demographics_df.columns:
-        categorical_encoders[col].fit(users_demographics_df[col])
-    else:
-        raise ValueError(f"Column {col} not found in ppgr_df or users_demographics_df")
-    
-    
-from sklearn.preprocessing import StandardScaler
-
-# Scale continuous variables
-
-# Scale on train DF and apply for all dataframes
-continuous_scalers = {}
-for col in all_real_columns:
-    # IMPORTANT: The scalers HAVE-TO be fit only on the training set
-    #           to avoid test set contamination
-    if col in ppgr_df.columns:
-        all_values = training_df[col].to_numpy() # [N,]
-    elif col in users_demographics_df.columns:
-        all_values = users_demographics_df[col].to_numpy() # [N,]
-    else:
-        raise ValueError(f"Column {col} not found in ppgr_df or users_demographics_df")
-    
-    
-    all_values = all_values.reshape(-1, 1) # [N, 1]
-    continuous_scalers[col] = StandardScaler().fit(all_values)
-    print(f"continuous_scalers[{col}], mean, scale: {continuous_scalers[col].mean_}, {continuous_scalers[col].scale_}")
-    
-    
-
-
 class PPGRTimeSeriesSliceMetadata:
     def __init__(self, 
                  slice_start: int,
@@ -224,31 +110,35 @@ class PPGRTimeSeriesSliceMetadata:
 class PPGRTimeSeriesDataset(Dataset):
     def __init__(self,  ppgr_df: pd.DataFrame,
                         user_demographics_df: pd.DataFrame,
-                        is_food_anchored: bool, # decides if the timeseries is food anchored or not
-                        time_idx: str, # Unique integral column in each timeseries for each datapoint (should be in the same order as read_at) 
+                        is_food_anchored: bool = True, # decides if the timeseries is food anchored or not
+                        time_idx: str = "time_idx", # Unique integral column in each timeseries for each datapoint (should be in the same order as read_at) 
 
-                        target_columns: List[str], # These are the columns that are the targets (should also be provided in the time_varying_unknown_reals
-                        group_by_columns: List[str], # Decides what the timeseries grouping/boundaries are
+                        target_columns: List[str] = ["val"], # These are the columns that are the targets (should also be provided in the time_varying_unknown_reals
+                        group_by_columns: List[str] = ["timeseries_block_id"], # Decides what the timeseries grouping/boundaries are
                         
-                        min_encoder_length: int, # context window
-                        max_encoder_length: int, # context window
-                        prediction_length: int, # prediction window
+                        min_encoder_length: int = 8 * 4, # context window
+                        max_encoder_length: int = 12 * 4, # context window
+                        prediction_length: int = 3 * 4, # prediction window
                         
-                        use_food_covariates_from_prediction_window: bool, # decides if the food covariates are used from the prediction window as well
+                        use_food_covariates_from_prediction_window: bool = True, # decides if the food covariates are used from the prediction window as well
                         
-                        temporal_categoricals: List[str], # these also need to be provded in the static_categoricals list
-                        temporal_reals: List[str], # these also need to be provded in the static_reals list
+                        use_microbiome_embeddings: bool = True, # decides if the microbiome embeddings are used
+                        microbiome_embeddings_df: Optional[pd.DataFrame] = None, # the microbiome embeddings dataframe
                         
-                        user_static_categoricals: List[str], # these also need to be provded in the static_categoricals list
-                        user_static_reals: List[str], # these also need to be provded in the static_reals list
+                        temporal_categoricals: List[str] = [], # these also need to be provded in the static_categoricals list
+                        temporal_reals: List[str] = [], # these also need to be provded in the static_reals list
                         
-                        food_categoricals: List[str], # these also need to be provded in the static_categoricals list
-                        food_reals: List[str], # these also need to be provded in the static_reals list
+                        user_static_categoricals: List[str] = [], # these also need to be provded in the static_categoricals list
+                        user_static_reals: List[str] = [], # these also need to be provded in the static_reals list
                         
-                        categorical_encoders: Dict[str, NaNLabelEncoder],  # These have to be provided to avoid mistakes
-                        continuous_scalers: Dict[str, StandardScaler], # These have to be provided to avoid mistakes
+                        food_categoricals: List[str] = [], # these also need to be provded in the static_categoricals list
+                        food_reals: List[str] = [], # these also need to be provded in the static_reals list
+                        
+                        categorical_encoders: Dict[str, NaNLabelEncoder] = {},  # These have to be provided to avoid mistakes
+                        continuous_scalers: Dict[str, StandardScaler] = {}, # These have to be provided to avoid mistakes
                         
                         add_relative_time_idx: bool = True,
+                        device: torch.device = torch.device("cpu")
                     ):
         self.ppgr_df = ppgr_df
         self.user_demographics_df = user_demographics_df
@@ -281,6 +171,7 @@ class PPGRTimeSeriesDataset(Dataset):
         self.continuous_scalers = continuous_scalers
         
         self.add_relative_time_idx = add_relative_time_idx
+        self.device = device
         
         self.timeseries_slices_indices = [] # Will house a list of PPGRTimeSeriesSliceMetadata that will be referenced in __getitem__
 
@@ -357,13 +248,13 @@ class PPGRTimeSeriesDataset(Dataset):
         self.target_scales =[]
         for col in self.target_columns:
             self.target_scales.append([self.continuous_scalers[col].mean_, self.continuous_scalers[col].scale_])
-        self.target_scales = torch.tensor(self.target_scales).squeeze()
+        self.target_scales = torch.tensor(np.array(self.target_scales)).to(self.device)
         
         # reset the index so we can start from index 0 and maintain a continuous index that aligns with the torch indexing system
         self.df_scaled = self.df_scaled.reset_index(drop=True)
         
         # Create a tensor optimized version of the dataframe with only the relevant columns
-        self.df_scaled_tensor = torch.tensor(self.df_scaled[self.all_columns].to_numpy())
+        self.df_scaled_tensor = torch.tensor(self.df_scaled[self.all_columns].to_numpy()).to(self.device)
         
         # NOTE: It is important that the indices of both df_scaled and df_scaled_tensor align, 
         # which is why we did the reset_index just before
@@ -409,18 +300,39 @@ class PPGRTimeSeriesDataset(Dataset):
     def __len__(self):
         return len(self.timeseries_slices_indices)
     
+    def _get_slice_start_and_end(self, slice_metadata: PPGRTimeSeriesSliceMetadata):
+        
+        # Get block boundaries and anchor point
+        block_start = slice_metadata.block_start
+        slice_anchor_row_idx = slice_metadata.anchor_row_idx
+        slice_end = slice_metadata.slice_end
+        
+        # Randomly sample encoder length between min and max
+        max_possible_encoder_length = min(
+            self.max_encoder_length,
+            slice_anchor_row_idx - block_start  # Ensure we don't go before block start
+        )
+        encoder_length = torch.randint(
+            low=self.min_encoder_length,
+            high=max_possible_encoder_length + 1,  # +1 because randint's high is exclusive
+            size=(1,)
+        ).item()
+        
+        # Calculate slice start based on randomly sampled encoder length
+        slice_start = slice_anchor_row_idx - encoder_length        
+        slice_end = slice_metadata.slice_end
+        
+        return slice_start, slice_end, encoder_length
+    
     def __getitem__(self, idx):
         slice_metadata = self.timeseries_slices_indices[idx]
         
-        # Gather slice start and slice end (by considering randomization)
-        slice_start = slice_metadata.slice_start
-        slice_end = slice_metadata.slice_end
-        
-        encoder_length = slice_metadata.anchor_row_idx - slice_start
+
+        slice_start, slice_end, encoder_length = self._get_slice_start_and_end(slice_metadata) # Takes care of randomizing the encoder length between min and max encoder lengths
         prediction_length = slice_end - slice_metadata.anchor_row_idx 
         
         # Get the slice from the dataframe
-        data_slice_tensor = self.df_scaled_tensor[slice_start:slice_end, :] # [T, C] where T is the number of rows in the slice and C is the number of all relevant columns
+        data_slice_tensor = self.df_scaled_tensor[slice_start:slice_end, :].clone() # [T, C] where T is the number of rows in the slice and C is the number of all relevant columns
                 
         # Calculate slices for encoder and prediction window
         data_slice_encoder_tensor = data_slice_tensor[:encoder_length, :]
@@ -477,8 +389,8 @@ class PPGRTimeSeriesDataset(Dataset):
         # Calculate relative time indices
         # Encoder window: [-encoder_length, ..., 0]
         # Prediction window: [0, 1, ..., prediction_length-1]
-        encoder_time_idx = torch.arange(-encoder_length, 0+1)
-        prediction_time_idx = torch.arange(1, prediction_length)
+        encoder_time_idx = torch.arange(-encoder_length + 1, 0+1).to(self.device)
+        prediction_time_idx = torch.arange(1, prediction_length+1).to(self.device)
         relative_time_idx = torch.cat([encoder_time_idx, prediction_time_idx])
 
         _response = dict(
@@ -511,7 +423,7 @@ class PPGRTimeSeriesDataset(Dataset):
             
             # Prediction Window Target Variables (Overall Target of the model)
             y_real_target = y_real_target, # [N', T_r]
-            target_scales = target_scales,
+            target_scales = target_scales, # [2]
             
             # Metadata about the slice
             
@@ -564,8 +476,8 @@ class PPGRTimeSeriesDataset(Dataset):
             if column_type in ["temporal_real", "user_real", "food_real", "target"]:
                 _inverted_value = encoder.inverse_transform(values[:, col_idx].reshape(-1, 1)).flatten()
             else:
-                _inverted_value = encoder.inverse_transform(values[:, col_idx])
-                
+                _inverted_value = encoder.inverse_transform(values[:, col_idx].to(torch.int16))
+
             transformed.append(_inverted_value)
                 
         # Organize the transformed values into the same shape as the input values
@@ -670,46 +582,117 @@ class PPGRTimeSeriesDataset(Dataset):
         return obj
 
 
-training_dataset = PPGRTimeSeriesDataset(ppgr_df = training_df, 
-                                         user_demographics_df = users_demographics_df,
-                                         is_food_anchored = True,
-                                         time_idx = "read_at",
-                                         target_columns = ["val"],
-                                                                                  
-                                         group_by_columns = ["timeseries_block_id"],
 
-                                         min_encoder_length = 8 * 4, # 8 hours with 4 timepoints per hour
-                                         max_encoder_length = 12 * 4, # 12 hours with 4 timepoints per hour
-                                         
-                                         prediction_length = 2 * 4, # 2 hours with 4 timepoints per hour
-                                         
-                                         add_relative_time_idx = True,
-                                         use_food_covariates_from_prediction_window = True,
-                                         
-                                         temporal_categoricals = temporal_categoricals,
-                                         temporal_reals = temporal_reals,
+if __name__ == "__main__":
 
-                                         user_static_categoricals = user_static_categoricals,
-                                         user_static_reals = user_static_reals,
-                                         
-                                         food_categoricals = food_categoricals,
-                                         food_reals = food_reals,
-                                         
-                                         categorical_encoders = categorical_encoders,
-                                         continuous_scalers = continuous_scalers)
+    dataset_version = "v0.4"
+    debug_mode = True
 
-print(f"Length of training dataset: {len(training_dataset)}")
+    max_encoder_length = 48*4
+    max_prediction_length = 2*4
+    validation_percentage = 0.2
+    test_percentage = 0.2
 
 
-# data = training_dataset[0]
+    # Unique Grouping Column
+    timeseries_id = "time_series_cluster_id"
+    group_by_columns = ["timeseries_block_id"]
 
-# aggregated_df, encoder_df, decoder_df = training_dataset.inverse_transform_item(data)
-# display(encoder_df)
-# display(decoder_df)
+    # User 
+    user_static_categoricals = ["user_id", "user__edu_degree", "user__income", "user__household_desc", "user__job_status", "user__smoking", "user__health_state", "user__physical_activities_frequency"]
+    user_static_reals = ["user__age", "user__weight", "user__height", "user__bmi", "user__general_hunger_level", "user__morning_hunger_level", "user__mid_hunger_level", "user__evening_hunger_level"]
 
-for i in tqdm(range(len(training_dataset))):
-    data = training_dataset[i]
+    # Food Covariates
+    food_categoricals = [
+        # "food__food_group_cname"
+    ]
+    food_reals = ['food__eaten_quantity_in_gram', 'food__energy_kcal_eaten',
+        'food__carb_eaten', 'food__fat_eaten', 'food__protein_eaten',
+        'food__fiber_eaten', 'food__alcohol_eaten', 'food__vegetables_fruits',
+        'food__grains_potatoes_pulses', 'food__unclassified',
+        'food__non_alcoholic_beverages',
+        'food__dairy_products_meat_fish_eggs_tofu',
+        'food__sweets_salty_snacks_alcohol', 'food__oils_fats_nuts']
+
+
+    # Temporal Covariates
+    temporal_categoricals = ["loc_eaten_dow", "loc_eaten_dow_type", "loc_eaten_season"]
+    temporal_reals = ["loc_eaten_hour"]
+
+    # Targets
+    targets = ["val"]
+
+    all_categorical_columns = user_static_categoricals + food_categoricals + temporal_categoricals
+    all_real_columns = user_static_reals + food_reals + temporal_reals + targets
+    
+    
+    # Load the data frames
+    ppgr_df, users_demographics_df, microbiome_embeddings_df = load_dataframe(dataset_version, debug_mode)
+
+    # Split the data frames into training, validation and test sets
+    training_df, validation_df, test_df = split_timeseries_df_based_on_food_intake_rows(ppgr_df, validation_percentage=validation_percentage, test_percentage=test_percentage)
+    
+    # Validate the data frames
+    ppgr_df, users_demographics_df = enforce_column_types(  ppgr_df, 
+                                                            users_demographics_df, 
+                                                            all_categorical_columns,
+                                                            all_real_columns)
+
+    # Setup the scalers and encoders
+    categorical_encoders, continuous_scalers = setup_scalers_and_encoders(
+        ppgr_df = ppgr_df,
+        training_df = training_df,
+        users_demographics_df = users_demographics_df,
+        categorical_columns = all_categorical_columns,
+        real_columns = all_real_columns
+    ) # Note: the encoders are fit on the full ppgr_df, and the scalers are fit on the training_df
+
+    # Create the training dataset
+    training_dataset = PPGRTimeSeriesDataset(ppgr_df = training_df, 
+                                            user_demographics_df = users_demographics_df,
+                                            is_food_anchored = True,
+                                            time_idx = "read_at",
+                                            target_columns = ["val"],
+                                                                                    
+                                            group_by_columns = ["timeseries_block_id"],
+
+                                            min_encoder_length = 8 * 4, # 8 hours with 4 timepoints per hour
+                                            max_encoder_length = 12 * 4, # 12 hours with 4 timepoints per hour
+                                            
+                                            prediction_length = 2 * 4, # 2 hours with 4 timepoints per hour
+                                            
+                                            add_relative_time_idx = True,
+                                            use_food_covariates_from_prediction_window = True,
+                                            
+                                            use_microbiome_embeddings = True,
+                                            microbiome_embeddings_df = microbiome_embeddings_df,
+                                            
+                                            temporal_categoricals = temporal_categoricals,
+                                            temporal_reals = temporal_reals,
+
+                                            user_static_categoricals = user_static_categoricals,
+                                            user_static_reals = user_static_reals,
+                                            
+                                            food_categoricals = food_categoricals,
+                                            food_reals = food_reals,
+                                            
+                                            categorical_encoders = categorical_encoders,
+                                            continuous_scalers = continuous_scalers)
+
+    print(f"Length of training dataset: {len(training_dataset)}")
+
+
+    # data = training_dataset[0]
+
     # aggregated_df, encoder_df, decoder_df = training_dataset.inverse_transform_item(data)
     # display(encoder_df)
     # display(decoder_df)
-    
+
+    for data in tqdm(training_dataset):
+        # print(data)
+        aggregated_df, encoder_df, decoder_df = training_dataset.inverse_transform_item(data)
+        print(encoder_df)
+        print(decoder_df)
+        break
+        # display(decoder_df)
+        
