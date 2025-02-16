@@ -19,6 +19,7 @@ from pytorch_forecasting.data.encoders import (
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 
+import p_tqdm
 
 import numpy as np
 
@@ -111,6 +112,8 @@ class PPGRTimeSeriesSliceMetadata:
 class PPGRTimeSeriesDataset(Dataset):
     def __init__(self,  ppgr_df: pd.DataFrame,
                         user_demographics_df: pd.DataFrame,
+                        dishes_df: pd.DataFrame,
+                        
                         is_food_anchored: bool = False, # decides if the timeseries is food anchored or not
                         sliding_window_stride: int = 10, # decides the stride of the sliding window (Only used when is_food_anchored is False)
                         
@@ -124,6 +127,8 @@ class PPGRTimeSeriesDataset(Dataset):
                         prediction_length: int = 3 * 4, # prediction window
                         
                         use_food_covariates_from_prediction_window: bool = True, # decides if the food covariates are used from the prediction window as well
+                        
+                        use_meal_level_food_covariates: bool = True, # decides if the meal level food covariates are used (instead of the aggregated onces)
                         
                         use_microbiome_embeddings: bool = True, # decides if the microbiome embeddings are used
                         microbiome_embeddings_df: Optional[pd.DataFrame] = None, # the microbiome embeddings dataframe
@@ -144,6 +149,7 @@ class PPGRTimeSeriesDataset(Dataset):
                     ):
         self.ppgr_df = ppgr_df
         self.user_demographics_df = user_demographics_df
+        self.dishes_df = dishes_df
         
         self.is_food_anchored = is_food_anchored
         self.sliding_window_stride = sliding_window_stride
@@ -157,6 +163,8 @@ class PPGRTimeSeriesDataset(Dataset):
         self.prediction_length = prediction_length
         
         self.use_food_covariates_from_prediction_window = use_food_covariates_from_prediction_window
+        
+        self.use_meal_level_food_covariates = use_meal_level_food_covariates
         
         self.use_microbiome_embeddings = use_microbiome_embeddings
         self.microbiome_embeddings_df = microbiome_embeddings_df
@@ -200,7 +208,7 @@ class PPGRTimeSeriesDataset(Dataset):
         # 0. Merge the ppgr_df and user_demographics_df
         self.merge_ppgr_and_user_demographics()
         
-        # 0.1. Prepare the all dataset columns
+        # 2. Prepare the all dataset columns
         self.prepare_all_dataset_columns()                
                 
         # 1. Scale and CatEmbed the dataset df
@@ -208,60 +216,81 @@ class PPGRTimeSeriesDataset(Dataset):
         
         # 1.1. Prepare the microbiome embeddings
         self.prepare_microbiome_embeddings()
-        
-        # 2. Sort by group_by_columns and time_idx
-        self.ppgr_df = self.ppgr_df.sort_values(by=self.group_by_columns + [self.time_idx])
-        
+                
         if self.is_food_anchored:
             # 3.1. Prepare the data for food anchored timeseries
             self.prepare_food_anchored_data()
         else:
             # 3.2 Prepare the data for the standard sliding window timeseries    
             self.prepare_sliding_window_data()
+            
+        # 4. Prepare the cross index of the ppgr_df and the dishes_df
+        self.prepare_cross_index_of_ppgr_df_and_dishes_df()
     
     def merge_ppgr_and_user_demographics(self):
         self.ppgr_df = self.ppgr_df.merge(self.user_demographics_df, on="user_id", how="left")
+        self.ppgr_df = self.ppgr_df.sort_values(by=self.group_by_columns + [self.time_idx]).reset_index(drop=True)
+        
     
     def prepare_all_dataset_columns(self):
-        # Gather all columns in a single place
-        self.all_categorical_columns = sorted(self.user_static_categoricals + self.food_categoricals + self.temporal_categoricals)
-        self.all_real_columns = sorted(self.user_static_reals + self.food_reals + self.temporal_reals + self.target_columns)
-        self.all_columns = self.all_categorical_columns + self.all_real_columns
+        
+        if not self.use_meal_level_food_covariates:
+            # Gather all columns in a single place
+            self.main_df_scaled_all_categorical_columns = sorted(self.user_static_categoricals + self.food_categoricals + self.temporal_categoricals)
+            self.main_df_scaled_all_real_columns = sorted(self.user_static_reals + self.food_reals + self.temporal_reals + self.target_columns)
+            self.main_df_all_columns = self.main_df_scaled_all_categorical_columns + self.main_df_scaled_all_real_columns
+        else:
+            # Case when using meal level food covariates
+            
+            # Main DF columns  
+            self.main_df_scaled_all_categorical_columns = sorted(self.user_static_categoricals + self.temporal_categoricals)
+            self.main_df_scaled_all_real_columns = sorted(self.user_static_reals + self.temporal_reals + self.target_columns)
+            self.main_df_all_columns = self.main_df_scaled_all_categorical_columns + self.main_df_scaled_all_real_columns
+
 
         # Gather the indices of the individual columns for easy access using tensor indexing
         # Temporal Covariates   
-        self.temporal_categorical_col_idx = [self.all_columns.index(col) for col in self.temporal_categoricals]
-        self.temporal_real_col_idx = [self.all_columns.index(col) for col in self.temporal_reals]        
+        self.temporal_categorical_col_idx = [self.main_df_all_columns.index(col) for col in self.temporal_categoricals]
+        self.temporal_real_col_idx = [self.main_df_all_columns.index(col) for col in self.temporal_reals]        
         
         # User Static Covariates
-        self.user_static_categorical_col_idx = [self.all_columns.index(col) for col in self.user_static_categoricals]
-        self.user_static_real_col_idx = [self.all_columns.index(col) for col in self.user_static_reals]
-        
-        # Food Categorical Columns
-        self.food_categorical_col_idx = [self.all_columns.index(col) for col in self.food_categoricals]
-        self.food_real_col_idx = [self.all_columns.index(col) for col in self.food_reals]
-                
+        self.user_static_categorical_col_idx = [self.main_df_all_columns.index(col) for col in self.user_static_categoricals]
+        self.user_static_real_col_idx = [self.main_df_all_columns.index(col) for col in self.user_static_reals]
+                            
         # Target Columns
-        self.target_col_idx = [self.all_columns.index(col) for col in self.target_columns]
-    
+        self.target_col_idx = [self.main_df_all_columns.index(col) for col in self.target_columns]
+
+        if not self.use_meal_level_food_covariates:
+            # Food Categorical Columns for the main DF
+            self.food_categorical_col_idx = [self.main_df_all_columns.index(col) for col in self.food_categoricals]
+            self.food_real_col_idx = [self.main_df_all_columns.index(col) for col in self.food_reals]          
+        else: 
+            # Food Categorical Columns for the dishes_df
+            self.dish_df_scaled_all_columns = sorted(self.food_categoricals + self.food_reals)
+            
+            self.food_categorical_col_idx = [self.dish_df_scaled_all_columns.index(col) for col in self.food_categoricals] 
+            self.food_real_col_idx = [self.dish_df_scaled_all_columns.index(col) for col in self.food_reals]
+
     
     def prepare_scaled_and_catembed_dataset(self):
         """
         Prepares a scaled + categorical embedded version of the dataset that can be readily accessed in __getitem__
         """
+        ### 1. Handle the scaling of the main DF first
+
         self.df_scaled = self.ppgr_df.copy() # NOTE: This should be the merged dataframe by now
         
         assert (self.df_scaled.index == self.ppgr_df.index).all()
         
         # Scale the continuous variables
-        for col in self.continuous_scalers:
-            logger.debug(f"Scaling {col}")
+        for col in self.main_df_scaled_all_real_columns:
+            logger.debug(f"Scaling {col}")            
             self.df_scaled[col] = self.continuous_scalers[col].transform(
                 self.df_scaled[col].to_numpy().reshape(-1, 1)
             )
             
-        # Encode the categorical variables
-        for col in self.categorical_encoders:
+        ### 2. Encode the categorical variables
+        for col in self.main_df_scaled_all_categorical_columns:            
             logger.debug(f"Encoding {col}")
             self.df_scaled[col] = self.categorical_encoders[col].transform(self.df_scaled[col])
             
@@ -275,10 +304,45 @@ class PPGRTimeSeriesDataset(Dataset):
         self.df_scaled = self.df_scaled.reset_index(drop=True)
         
         # Create a tensor optimized version of the dataframe with only the relevant columns
-        self.df_scaled_tensor = torch.tensor(self.df_scaled[self.all_columns].to_numpy()).to(self.device)
+        self.df_scaled_tensor = torch.tensor(self.df_scaled[self.main_df_all_columns].to_numpy()).to(self.device)
         
         # NOTE: It is important that the indices of both df_scaled and df_scaled_tensor align, 
         # which is why we did the reset_index just before
+        
+        ### 3. Handle the scaling of the dishes_df if required
+        if self.use_meal_level_food_covariates:
+            self.dishes_df_scaled = self.dishes_df.copy()
+            
+            assert len(self.food_categoricals) > 0, "Food categoricals should not be empty when using meal level food covariates. We should atleast have food_id column"
+            assert "food_id" in self.food_categoricals, "food_id should be present in the food_categoricals list when using meal level food covariates"
+            
+            assert len(self.food_reals) > 0, "Food reals should not be empty when using meal level food covariates"
+            
+            # In this mode, the food_id and food_group_cname are the categorical columns
+            
+            # Scale the continuous variables
+            for col in self.food_reals:
+                logger.debug(f"Scaling {col}")
+                # Note: in this mode, the continuous scalers are already fit on the dishes data (instead of that of the ppgr_df)
+                # check setup_scalers_and_encoders in utils.py for more details
+                
+                # temporary: some column values may be nan, so we fillna with 0 first (this is not the case for the ppgr_df)
+                # ideally, we should move this pre-processing to the fay-data-aggregator. 
+                self.dishes_df_scaled[col] = self.dishes_df_scaled[col].fillna(0)
+                
+                # scale !
+                self.dishes_df_scaled[col] = self.continuous_scalers[col].transform(
+                    self.dishes_df_scaled[col].to_numpy().reshape(-1, 1)
+                )
+            # Encode the categorical variables
+            for col in self.food_categoricals:
+                logger.debug(f"Encoding {col}")
+                self.dishes_df_scaled[col] = self.categorical_encoders[col].transform(self.dishes_df_scaled[col])
+            
+            
+            # Prepare the dishes df tensor
+            self.dishes_df_scaled = self.dishes_df_scaled.reset_index(drop=True)
+            self.dishes_df_scaled_tensor = torch.tensor(self.dishes_df_scaled[self.dish_df_scaled_all_columns].to_numpy()).to(self.device)        
         
         
     def prepare_microbiome_embeddings(self):
@@ -286,7 +350,7 @@ class PPGRTimeSeriesDataset(Dataset):
         microbiome embeddings expect that all the user_ids are present in the microbiome embeddings dataframe
         and that the data is already normalized
         """
-        self.microbiome_embeddings_df = self.microbiome_embeddings_df.sort_index()
+        self.microbiome_embeddings_df = self.microbiome_embeddings_df.sort_index() # Note: user_id is the index of the microbiome embeddings dataframe
         assert set(self.ppgr_df["user_id"].astype(int).unique()) == set(self.microbiome_embeddings_df.index), "All user_ids in the ppgr_df must be present in the microbiome_embeddings_df, and vice versa"
         
         self.microbiome_tensor = torch.tensor(self.microbiome_embeddings_df.to_numpy()).to(self.device)
@@ -385,6 +449,37 @@ class PPGRTimeSeriesDataset(Dataset):
                         microbiome_idx = microbiome_idx # keep track of the microbiome index for this slice
                     ))
     
+    def prepare_cross_index_of_ppgr_df_and_dishes_df(self):
+        """
+        This function prepares a cross index of the ppgr_df and the dishes_df
+        """
+        
+        # For all the rows in ppgr_df, we want to identify the exact index number of the corresponding
+        # dish items, so that it is easy to access them in __getitem__        
+
+        # This assumes that ppgr_df, df_scaled, dishes_df will not change their indices
+        # or be reset etc after
+                
+        # rows with non-null dish ids
+        ppgr_df_with_dish_ids = self.ppgr_df[~self.ppgr_df["dish_id"].isna()]
+        
+        
+        self.ppgr_df_row_idx_to_dishes_df_idxs = {} # Dictionary which will store a mapping of ppgr_df index to dishes_df_scaled indices
+        
+        # Iterate over each of the rows
+        for idx, row in tqdm(ppgr_df_with_dish_ids.iterrows(), total=len(ppgr_df_with_dish_ids)):
+            row_index = row.name
+            
+            # currently multiple dish ids are stored as: "123 || 456"
+            mfr_dish_ids = [int(x) for x in str(row["dish_id"]).split("||")]
+            
+            internal_dish_idxs = [] # These will store the indices of the dishes_df_scaled tensor
+            for mfr_dish_id in mfr_dish_ids:
+                internal_dish_idx = self.dishes_df_scaled[self.dishes_df_scaled["dish_id"] == mfr_dish_id].index.values
+                internal_dish_idxs.append(internal_dish_idx)
+        
+            self.ppgr_df_row_idx_to_dishes_df_idxs[row_index] = torch.tensor(np.concatenate(internal_dish_idxs)).to(self.device)
+        
     def __len__(self):
         return len(self.timeseries_slices_indices)
     
@@ -411,13 +506,32 @@ class PPGRTimeSeriesDataset(Dataset):
         slice_end = slice_metadata.slice_end
         
         return slice_start, slice_end, encoder_length
+
+    def _get_dish_tensors_for_this_slice(self, slice_start: int, slice_end: int):
+        """
+        This function returns the dish tensors for the current slice
+        """
+        
+        # For all the rows in the current slice, gather the dish_idxs
+        dish_tensors_cat_for_this_slice = []
+        dish_tensors_real_for_this_slice = []
+        
+        num_food_covariates = len(self.food_categorical_col_idx) + len(self.food_real_col_idx)
+        for slice_row_idx in range(slice_start, slice_end+1):                
+            dish_idxs_for_this_row = self.ppgr_df_row_idx_to_dishes_df_idxs.get(slice_row_idx, torch.tensor([], dtype=torch.int32).to(self.device))
+            dish_tensors_for_this_row = self.dishes_df_scaled_tensor[dish_idxs_for_this_row]
+            dish_tensors_cat_for_this_slice.append(dish_tensors_for_this_row[:, self.food_categorical_col_idx])
+            dish_tensors_real_for_this_slice.append(dish_tensors_for_this_row[:, self.food_real_col_idx])
+            
+        return dish_tensors_cat_for_this_slice, dish_tensors_real_for_this_slice
     
     def __getitem__(self, idx):
         slice_metadata = self.timeseries_slices_indices[idx]
         
 
         slice_start, slice_end, encoder_length = self._get_slice_start_and_end(slice_metadata) # Takes care of randomizing the encoder length between min and max encoder lengths
-        prediction_length = slice_end - slice_metadata.anchor_row_idx 
+        slice_anchor = slice_metadata.anchor_row_idx
+        prediction_length = slice_end - slice_anchor 
         
         # Get the slice from the dataframe
         data_slice_tensor = self.df_scaled_tensor[slice_start:slice_end, :].clone() # [T, C] where T is the number of rows in the slice and C is the number of all relevant columns
@@ -444,8 +558,15 @@ class PPGRTimeSeriesDataset(Dataset):
         x_user_real = data_slice_encoder_tensor[:, self.user_static_real_col_idx]
         
         # Food Static Covariates
-        x_food_cat = data_slice_encoder_tensor[:, self.food_categorical_col_idx]
-        x_food_real = data_slice_encoder_tensor[:, self.food_real_col_idx]
+        if self.use_meal_level_food_covariates:
+            # Gather the food covariates for the current slice            
+            x_food_cat, x_food_real = self._get_dish_tensors_for_this_slice(slice_start, slice_anchor)            
+            # Note: IMPORTANT!! - The sequence length will vary by design for each slice
+            # and the type here will be a list of tensors, instead of a full fleged batch            
+        else:    
+            # Gather the dish_idxs for the current slice            
+            x_food_cat = data_slice_encoder_tensor[:, self.food_categorical_col_idx]
+            x_food_real = data_slice_encoder_tensor[:, self.food_real_col_idx]
         
         # Gather Historical Value of the Target(s)
         x_real_target = data_slice_encoder_tensor[:, self.target_col_idx]
@@ -469,8 +590,13 @@ class PPGRTimeSeriesDataset(Dataset):
 
         # Food Static Covariates
         if self.use_food_covariates_from_prediction_window:
-            y_food_cat = data_slice_prediction_window_tensor[:, self.food_categorical_col_idx]
-            y_food_real = data_slice_prediction_window_tensor[:, self.food_real_col_idx]
+            if self.use_meal_level_food_covariates:
+                # When we want meal level data
+                y_food_cat, y_food_real = self._get_dish_tensors_for_this_slice(slice_anchor, slice_end)
+            else:
+                # standard aggregated food covariates
+                y_food_cat = data_slice_prediction_window_tensor[:, self.food_categorical_col_idx]
+                y_food_real = data_slice_prediction_window_tensor[:, self.food_real_col_idx]
         else:
             y_food_cat = None
             y_food_real = None
@@ -479,12 +605,8 @@ class PPGRTimeSeriesDataset(Dataset):
         y_real_target = data_slice_prediction_window_tensor[:, self.target_col_idx]
         target_scales = self.target_scales # mean, std : This can be varying later if we want to normalize by user_id or other columns
 
-        # Calculate relative time indices
-        # Encoder window: [-encoder_length, ..., 0]
-        # Prediction window: [0, 1, ..., prediction_length-1]
-        encoder_time_idx = torch.arange(-encoder_length + 1, 0+1).to(self.device) # the current anchor needs to be at index 0
-        prediction_time_idx = torch.arange(1, prediction_length+1).to(self.device)
 
+        
         _response = dict(
             # Encoder Temporal Variables (dynamic)
             x_temporal_cat = x_temporal_cat, # [N, T_c]
@@ -527,7 +649,7 @@ class PPGRTimeSeriesDataset(Dataset):
             metadata = dict(
                 categorical_encoders = self.categorical_encoders,
                 continuous_scalers = self.continuous_scalers,
-                all_columns = self.all_columns,
+                main_df_all_columns = self.main_df_all_columns,
                 temporal_categoricals = self.temporal_categoricals,
                 temporal_reals = self.temporal_reals,
                 user_static_categoricals = self.user_static_categoricals,
@@ -597,9 +719,7 @@ class PPGRTimeSeriesDataset(Dataset):
         
         NOTE: When we provide more granual info per food in an item, 
         we need to change this function to accomodate that
-        """
-        transformed_dfs = []
-        
+        """        
         # Map item keys to their column types
         key_to_type = {
             "x_temporal_cat": "temporal_cat",
@@ -693,7 +813,11 @@ if __name__ == "__main__":
     validation_percentage = 0.2
     test_percentage = 0.2
 
-    use_granular_food_data = True
+    use_meal_level_food_covariates = True
+    
+    use_microbiome_embeddings = True
+    
+    
     # Unique Grouping Column
     group_by_columns = ["timeseries_block_id"]
 
@@ -703,10 +827,16 @@ if __name__ == "__main__":
 
     # Food Covariates
     food_categoricals = []
+    if use_meal_level_food_covariates:
+        food_categoricals = ['food__food_group_cname', 'food_id']
+    else:
+        food_categoricals = [   'food__vegetables_fruits', 'food__grains_potatoes_pulses', 'food__unclassified',
+                                'food__non_alcoholic_beverages', 'food__dairy_products_meat_fish_eggs_tofu',
+                                'food__sweets_salty_snacks_alcohol', 'food__oils_fats_nuts'] 
+    
     food_reals = ['food__eaten_quantity_in_gram', 'food__energy_kcal_eaten',
         'food__carb_eaten', 'food__fat_eaten', 'food__protein_eaten',
         'food__fiber_eaten', 'food__alcohol_eaten']
-
 
     # Temporal Covariates
     temporal_categoricals = ["loc_eaten_dow", "loc_eaten_dow_type", "loc_eaten_season"]
@@ -715,8 +845,8 @@ if __name__ == "__main__":
     # Targets
     targets = ["val"]
 
-    all_categorical_columns = user_static_categoricals + food_categoricals + temporal_categoricals
-    all_real_columns = user_static_reals + food_reals + temporal_reals + targets
+    main_df_scaled_all_categorical_columns = user_static_categoricals + food_categoricals + temporal_categoricals
+    main_df_scaled_all_real_columns = user_static_reals + food_reals + temporal_reals + targets
     
     
     # Load the data frames
@@ -729,8 +859,8 @@ if __name__ == "__main__":
     ppgr_df, users_demographics_df, dishes_df = enforce_column_types(  ppgr_df, 
                                                             users_demographics_df, 
                                                             dishes_df,
-                                                            all_categorical_columns,
-                                                            all_real_columns)
+                                                            main_df_scaled_all_categorical_columns,
+                                                            main_df_scaled_all_real_columns)
 
     # Setup the scalers and encoders
     categorical_encoders, continuous_scalers = setup_scalers_and_encoders(
@@ -738,29 +868,32 @@ if __name__ == "__main__":
         training_df = training_df,
         users_demographics_df = users_demographics_df,
         dishes_df=dishes_df,
-        categorical_columns = all_categorical_columns,
-        real_columns = all_real_columns,
-        use_granular_food_data = use_granular_food_data # This determines which data to fit the encoders on
+        categorical_columns = main_df_scaled_all_categorical_columns,
+        real_columns = main_df_scaled_all_real_columns,
+        use_meal_level_food_covariates = use_meal_level_food_covariates # This determines which data to fit the encoders on
     ) # Note: the encoders are fit on the full ppgr_df, and the scalers are fit on the training_df
 
     # Create the training dataset
     training_dataset = PPGRTimeSeriesDataset(ppgr_df = training_df, 
                                             user_demographics_df = users_demographics_df,
+                                            dishes_df = dishes_df,
                                             time_idx = "read_at",
                                             target_columns = ["val"],                                                                                    
                                             group_by_columns = ["timeseries_block_id"],
 
-                                            is_food_anchored = False, # When False, its the standard sliding window timeseries, but when True, every timeseries will have a food intake row at the last item of the context window
-                                            sliding_window_stride = 1, # This has to change everytime is_food_anchored is changed
+                                            is_food_anchored = True, # When False, its the standard sliding window timeseries, but when True, every timeseries will have a food intake row at the last item of the context window
+                                            sliding_window_stride = None, # This has to change everytime is_food_anchored is changed
 
                                             min_encoder_length = 8 * 4, # 8 hours with 4 timepoints per hour
                                             max_encoder_length = 12 * 4, # 12 hours with 4 timepoints per hour
                                             
                                             prediction_length = 2 * 4, # 2 hours with 4 timepoints per hour
                                             
-                                            use_food_covariates_from_prediction_window = False,
+                                            use_food_covariates_from_prediction_window = True,
                                             
-                                            use_microbiome_embeddings = True,
+                                            use_meal_level_food_covariates = use_meal_level_food_covariates, # This uses the granular meal level food covariates instead of the food item level covariates
+                                            
+                                            use_microbiome_embeddings = use_microbiome_embeddings,
                                             microbiome_embeddings_df = microbiome_embeddings_df,
                                             
                                             temporal_categoricals = temporal_categoricals,
@@ -803,11 +936,14 @@ if __name__ == "__main__":
         num_workers=1, # When using the data directly on GPU, ensure num_workers is 1
         collate_fn=ppgr_collate_fn
     )
+    
+    print(training_dataset[0])
+    
     # Example: Iterate through one batch
-    for batch in tqdm(train_loader):
-        # Now batch is a dictionary where variable-length sequences have been padded.
-        # print("x_temporal_cat shape:", batch["x_temporal_cat"].shape)
-        # print("relative_time_idx shape:", batch.get("relative_time_idx", None))
-        # Process your batch...
-        pass
+    # for batch in tqdm(train_loader):
+    #     # Now batch is a dictionary where variable-length sequences have been padded.
+    #     # print("x_temporal_cat shape:", batch["x_temporal_cat"].shape)
+    #     # print("relative_time_idx shape:", batch.get("relative_time_idx", None))
+    #     # Process your batch...
+    #     pass
 

@@ -50,7 +50,7 @@ def load_dataframe(dataset_version: str, debug_mode: bool) -> tuple[pd.DataFrame
     ppgr_df = pd.read_csv(ppgr_path)
     users_demographics_df = pd.read_csv(demographics_path)
     microbiome_embeddings_df = pd.read_csv(microbiome_embeddings_path).set_index("user_id")
-    dishes_df = pd.read_csv(dishes_path)
+    dishes_df = pd.read_csv(dishes_path).reset_index(drop=True)
     
     
     # Convert user_id to string in both dataframes
@@ -127,7 +127,7 @@ def setup_scalers_and_encoders(
     dishes_df: pd.DataFrame,
     categorical_columns: list[str],
     real_columns: list[str],
-    use_granular_food_data: bool = False
+    use_meal_level_food_covariates: bool = False
 ) -> tuple[dict[str, NaNLabelEncoder], dict[str, StandardScaler]]:
     """
     Setup and fit categorical encoders and continuous scalers using the training data.
@@ -141,12 +141,15 @@ def setup_scalers_and_encoders(
         encoder = NaNLabelEncoder(add_nan=True, warn=True)
         if col in ppgr_df.columns:
             # In case of food columns, check if we want to use the granular food data or the aggregated food data
-            if col.startswith("food__") and use_granular_food_data:
+            if col.startswith("food__") and use_meal_level_food_covariates:
                 encoder.fit(dishes_df[col])
             else:
                 encoder.fit(ppgr_df[col])
+                
         elif col in users_demographics_df.columns:
             encoder.fit(users_demographics_df[col])
+        elif col in dishes_df.columns: # fallback to the dishes dataframe if also not present in ppgr_df
+            encoder.fit(dishes_df[col])
         else:
             raise ValueError(f"Categorical column '{col}' not found in either dataframe.")
         categorical_encoders[col] = encoder
@@ -154,7 +157,7 @@ def setup_scalers_and_encoders(
     # Initialize and fit continuous scalers on the training set only
     
     ## Calculate all the dishes in the training set (for fitting scalers on the granular food data)
-    if use_granular_food_data:
+    if use_meal_level_food_covariates:
         dish_ids_from_training_set = get_all_dishes_in_df(training_df)
         dishes_training_df = dishes_df[dishes_df["dish_id"].isin(dish_ids_from_training_set)]
     
@@ -162,7 +165,7 @@ def setup_scalers_and_encoders(
     for col in real_columns:
         if col in training_df.columns:
             # In case of food columns, check if we want to use the granular food data or the aggregated food data
-            if col.startswith("food__") and use_granular_food_data:
+            if col.startswith("food__") and use_meal_level_food_covariates:
                 values = dishes_training_df[col].to_numpy().reshape(-1, 1)
             else:
                 values = training_df[col].to_numpy().reshape(-1, 1)
@@ -227,6 +230,9 @@ def ppgr_collate_fn(batch):
         else:
             # raise Error unless y_food_cat or y_food_real, as they might be suppressed 
             # when future food information is not allowed
+            
+            # TODO: Handle the case of x_food_cat and x_food_real and also y_food_cat and y_food_real being sequences of individual dish tensors
+            
             if key not in ["y_food_cat", "y_food_real"]:
                 raise ValueError(f"Key {key} is not a tensor")
     
