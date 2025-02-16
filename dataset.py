@@ -123,12 +123,13 @@ class PPGRTimeSeriesDataset(Dataset):
                         group_by_columns: List[str] = ["timeseries_block_id"], # Decides what the timeseries grouping/boundaries are
                         
                         min_encoder_length: int = 8 * 4, # context window
-                        max_encoder_length: int = 12 * 4, # context window
+                        max_encoder_length: int = False, # context window
                         prediction_length: int = 3 * 4, # prediction window
                         
                         use_food_covariates_from_prediction_window: bool = True, # decides if the food covariates are used from the prediction window as well
                         
                         use_meal_level_food_covariates: bool = True, # decides if the meal level food covariates are used (instead of the aggregated onces)
+                        max_meals_per_timestep: int = 11, # maximum number of meals per timestep, the rest are discarded
                         
                         use_microbiome_embeddings: bool = True, # decides if the microbiome embeddings are used
                         microbiome_embeddings_df: Optional[pd.DataFrame] = None, # the microbiome embeddings dataframe
@@ -161,10 +162,11 @@ class PPGRTimeSeriesDataset(Dataset):
         self.min_encoder_length = min_encoder_length
         self.max_encoder_length = max_encoder_length
         self.prediction_length = prediction_length
-        
+                
         self.use_food_covariates_from_prediction_window = use_food_covariates_from_prediction_window
         
         self.use_meal_level_food_covariates = use_meal_level_food_covariates
+        self.max_meals_per_timestep = max_meals_per_timestep
         
         self.use_microbiome_embeddings = use_microbiome_embeddings
         self.microbiome_embeddings_df = microbiome_embeddings_df
@@ -194,7 +196,7 @@ class PPGRTimeSeriesDataset(Dataset):
     
     def validate_parameters(self):
         assert self.min_encoder_length > 0, "Minimum encoder length must be greater than 0"
-        assert self.max_encoder_length > 0, "Maximum encoder length must be greater than 0"
+        assert self.max_encoder_length > 0 or self.max_encoder_length is False, "Maximum encoder length must be greater than 0 or set to False to disable randomization"
         assert self.prediction_length > 0, "Prediction length must be greater than 0"
         assert self.sliding_window_stride is None or self.sliding_window_stride > 0, "Sliding window stride must be greater than 0"
         
@@ -426,7 +428,7 @@ class PPGRTimeSeriesDataset(Dataset):
             food_intake_mask = group["food_intake_row"] == 1
             
             # 5. Ensure that the there is enough past and future data for all potential slices
-            food_intake_mask.iloc[:self.max_encoder_length] = False
+            food_intake_mask.iloc[:self.min_encoder_length] = False
             food_intake_mask.iloc[-self.prediction_length:] = False
             
             # 6. Get all the rows that have enough past and future data
@@ -453,12 +455,17 @@ class PPGRTimeSeriesDataset(Dataset):
         """
         This function prepares a cross index of the ppgr_df and the dishes_df
         """
-        
+    
         # For all the rows in ppgr_df, we want to identify the exact index number of the corresponding
         # dish items, so that it is easy to access them in __getitem__        
 
         # This assumes that ppgr_df, df_scaled, dishes_df will not change their indices
         # or be reset etc after
+        
+        
+        if not self.use_meal_level_food_covariates:
+            # This function is not needed when not using the meal level food covariates
+            return 
                 
         # rows with non-null dish ids
         ppgr_df_with_dish_ids = self.ppgr_df[~self.ppgr_df["dish_id"].isna()]
@@ -490,16 +497,19 @@ class PPGRTimeSeriesDataset(Dataset):
         slice_anchor_row_idx = slice_metadata.anchor_row_idx
         slice_end = slice_metadata.slice_end
         
-        # Randomly sample encoder length between min and max
-        max_possible_encoder_length = min(
-            self.max_encoder_length,
-            slice_anchor_row_idx - block_start  # Ensure we don't go before block start
-        )
-        encoder_length = torch.randint(
-            low=self.min_encoder_length,
-            high=max_possible_encoder_length + 1,  # +1 because randint's high is exclusive
-            size=(1,)
-        ).item()
+        if self.max_encoder_length is False:
+            encoder_length = self.min_encoder_length
+        else:
+            # Randomly sample encoder length between min and max
+            max_possible_encoder_length = min(
+                self.max_encoder_length,
+                slice_anchor_row_idx - block_start  # Ensure we don't go before block start
+            )
+            encoder_length = torch.randint(
+                low=self.min_encoder_length,
+                high=max_possible_encoder_length + 1,  # +1 because randint's high is exclusive
+                size=(1,)
+            ).item()
         
         # Calculate slice start based on randomly sampled encoder length
         slice_start = slice_anchor_row_idx - encoder_length + 1
@@ -507,17 +517,14 @@ class PPGRTimeSeriesDataset(Dataset):
         
         return slice_start, slice_end, encoder_length
 
-    def _get_dish_tensors_for_this_slice(self, slice_start: int, slice_end: int, max_dishes_per_row: int=11):
+    def _get_dish_tensors_for_this_slice(self, slice_start: int, slice_end: int):
         """
         This function returns the dish tensors for the current slice, with a special start/empty token
         at the beginning of each timestep's sequence.
         
         Args:
             slice_start (int): Starting index of the slice (inclusive)
-            slice_end (int): Ending index of the slice (inclusive)
-            max_dishes_per_row (int): Maximum number of dishes to include per row (including start token)
-                (in practice, every row will have an extra "start tensor" as well)
-        
+            slice_end (int): Ending index of the slice (inclusive)        
         Returns:
             Tuple of lists containing categorical and real tensors for dishes
         """
@@ -530,11 +537,14 @@ class PPGRTimeSeriesDataset(Dataset):
         num_cat_features = len(self.food_categorical_col_idx)
         num_real_features = len(self.food_real_col_idx)
         
+        START_TOKEN = 0 # TODO: choose appropriate values later for this. Too brainfucked to think right now.
+        
         # Create start/empty token tensors (using -100 to distinguish from regular -1 padding)
-        start_cat_tensor = torch.full((1, num_cat_features), -100, dtype=torch.int32, device=self.device)
-        start_real_tensor = torch.full((1, num_real_features), -100, dtype=torch.float32, device=self.device)
+        start_cat_tensor = torch.full((1, num_cat_features), START_TOKEN, dtype=torch.int32, device=self.device)
+        start_real_tensor = torch.full((1, num_real_features), START_TOKEN, dtype=torch.float32, device=self.device)
         
         # TODO: Setup sensible values for the start token
+        max_meals_per_timestep = self.max_meals_per_timestep
         
         dish_tensors_recorded = []
         # Use range(start, end + 1) to make end inclusive
@@ -551,21 +561,36 @@ class PPGRTimeSeriesDataset(Dataset):
                 # If dishes exist, concatenate start token with dish tensors
                 dish_tensors_for_this_row = self.dishes_df_scaled_tensor[dish_idxs_for_this_row]
                 
-                # Only use up to max_dishes_per_row (to leave room for start token)
+                # Only use up to max_dishes_per_row 
                 cat_tensor = torch.cat([
                     start_cat_tensor,
-                    dish_tensors_for_this_row[:max_dishes_per_row, self.food_categorical_col_idx]
+                    dish_tensors_for_this_row[:max_meals_per_timestep, self.food_categorical_col_idx]
                 ], dim=0)
                 real_tensor = torch.cat([
                     start_real_tensor,
-                    dish_tensors_for_this_row[:max_dishes_per_row, self.food_real_col_idx]
+                    dish_tensors_for_this_row[:max_meals_per_timestep, self.food_real_col_idx]
                 ], dim=0)
                 
                 dish_tensors_cat_for_this_slice.append(cat_tensor)
                 dish_tensors_real_for_this_slice.append(real_tensor)
                 
-                # Update the max number of dishes observed
-                dish_tensors_recorded.append(len(dish_idxs_for_this_row))
+                dish_tensors_recorded.append( len(dish_idxs_for_this_row) + 1) # +1 for the start token
+        
+        # We return everything as a nested tensor        
+        dish_tensors_cat_for_this_slice = torch.nested.nested_tensor(dish_tensors_cat_for_this_slice)
+        dish_tensors_real_for_this_slice = torch.nested.nested_tensor(dish_tensors_real_for_this_slice)
+        
+        # Padd the sequences to the same size for easier batching
+        # Probably better to move the padding to the collate function
+        # PADDING_VALUE = -1
+        # dish_tensors_cat_for_this_slice = torch.nested.to_padded_tensor(dish_tensors_cat_for_this_slice, PADDING_VALUE, output_size=(max_meals_per_timestep, num_cat_features))
+        # dish_tensors_real_for_this_slice = torch.nested.to_padded_tensor(dish_tensors_real_for_this_slice, PADDING_VALUE, output_size=(max_meals_per_timestep, num_real_features))
+
+        ## Padding example: 
+        ### 32 = batch size
+        ### 8 = max number of dishes per row (can change this as we please)
+        ### 2 = number of features per dish (cat and real)
+        ### torch.nested.to_padded_tensor(ab, -1, output_size=(32, 8, 2))
         
         return dish_tensors_cat_for_this_slice, dish_tensors_real_for_this_slice, dish_tensors_recorded
 
@@ -608,13 +633,6 @@ class PPGRTimeSeriesDataset(Dataset):
             
             # x_dish_tensors_recorded is a list of the number of dish tensors recorded for each row in the slice
             # we can use this to reconstruct the structure of the food covariates later
-            
-            breakpoint()
-            # Pad the food covariates to the same length
-            x_food_cat = pad_sequence(x_food_cat, batch_first=True, padding_side="left", padding_value=-1).view(encoder_length, -1)
-            x_food_real = pad_sequence(x_food_real, batch_first=True, padding_side="left", padding_value=-1).view(encoder_length, -1)
-            # Note: IMPORTANT!! - The sequence length will vary by design for each slice
-            # and hence we are padding to the same length 
         else:    
             # Gather the dish_idxs for the current slice            
             x_food_cat = data_slice_encoder_tensor[:, self.food_categorical_col_idx]
@@ -644,11 +662,11 @@ class PPGRTimeSeriesDataset(Dataset):
         if self.use_food_covariates_from_prediction_window:
             if self.use_meal_level_food_covariates:
                 # When we want meal level data
-                y_food_cat, y_food_real = self._get_dish_tensors_for_this_slice(slice_anchor, slice_end)
+                y_food_cat, y_food_real, y_dish_tensors_recorded = self._get_dish_tensors_for_this_slice(slice_anchor+1, slice_end)
                 
                 # Padd the sequences to the same length
-                y_food_cat = pad_sequence(y_food_cat, batch_first=True, padding_side="right", padding_value=-1).view(prediction_length, -1)
-                y_food_real = pad_sequence(y_food_real, batch_first=True, padding_side="right", padding_value=-1).view(prediction_length, -1)                
+                # y_food_cat = pad_sequence(y_food_cat, batch_first=True, padding_side="right", padding_value=-1)
+                # y_food_real = pad_sequence(y_food_real, batch_first=True, padding_side="right", padding_value=-1)
             else:
                 # standard aggregated food covariates
                 y_food_cat = data_slice_prediction_window_tensor[:, self.food_categorical_col_idx]
@@ -661,6 +679,12 @@ class PPGRTimeSeriesDataset(Dataset):
         y_real_target = data_slice_prediction_window_tensor[:, self.target_col_idx]
         target_scales = self.target_scales # mean, std : This can be varying later if we want to normalize by user_id or other columns
 
+        if self.use_meal_level_food_covariates:
+            x_dish_tensors_recorded = torch.tensor(x_dish_tensors_recorded, dtype=torch.int32).to(self.device), # [N]
+            y_dish_tensors_recorded = torch.tensor(y_dish_tensors_recorded, dtype=torch.int32).to(self.device), # [N']
+        else:
+            x_dish_tensors_recorded = None
+            y_dish_tensors_recorded = None
 
         
         _response = dict(
@@ -698,9 +722,12 @@ class PPGRTimeSeriesDataset(Dataset):
             y_real_target = y_real_target, # [N', T_r]
             target_scales = target_scales, # [2]
             
+            x_dish_tensors_recorded = x_dish_tensors_recorded, # [N]
+            y_dish_tensors_recorded = y_dish_tensors_recorded, # [N']
+            
             encoder_length = torch.tensor(encoder_length, dtype=torch.int32).to(self.device), # scalar 
             prediction_length = torch.tensor(prediction_length, dtype=torch.int32).to(self.device),    # converting to tensor so that the collate function doesnt need special cases.        
-            
+                        
             # Metadata about the slice
             metadata = dict(
                 categorical_encoders = self.categorical_encoders,
@@ -713,6 +740,8 @@ class PPGRTimeSeriesDataset(Dataset):
                 food_categoricals = self.food_categoricals,
                 food_reals = self.food_reals,
                 target_columns = self.target_columns,
+                use_meal_level_food_covariates = self.use_meal_level_food_covariates,
+                max_meals_per_timestep = self.max_meals_per_timestep
             )
         )
                 
@@ -869,7 +898,7 @@ if __name__ == "__main__":
     validation_percentage = 0.2
     test_percentage = 0.2
 
-    use_meal_level_food_covariates = True
+    use_meal_level_food_covariates = False
     
     use_microbiome_embeddings = True
     
@@ -937,11 +966,11 @@ if __name__ == "__main__":
                                             target_columns = ["val"],                                                                                    
                                             group_by_columns = ["timeseries_block_id"],
 
-                                            is_food_anchored = True, # When False, its the standard sliding window timeseries, but when True, every timeseries will have a food intake row at the last item of the context window
-                                            sliding_window_stride = None, # This has to change everytime is_food_anchored is changed
+                                            is_food_anchored = False, # When False, its the standard sliding window timeseries, but when True, every timeseries will have a food intake row at the last item of the context window
+                                            sliding_window_stride = 1, # This has to change everytime is_food_anchored is changed
 
                                             min_encoder_length = 8 * 4, # 8 hours with 4 timepoints per hour
-                                            max_encoder_length = 8 * 4, # 12 hours with 4 timepoints per hour
+                                            max_encoder_length = False , # 12 hours with 4 timepoints per hour. Use False to disable randomization
                                             
                                             prediction_length = 2 * 4, # 2 hours with 4 timepoints per hour
                                             
@@ -998,11 +1027,11 @@ if __name__ == "__main__":
     ppgr_collate_fn([training_dataset[0], training_dataset[1], training_dataset[2]])
     
     # Example: Iterate through one batch
-    # for batch in tqdm(train_loader):
-    #     # Now batch is a dictionary where variable-length sequences have been padded.
-    #     # print("x_temporal_cat shape:", batch["x_temporal_cat"].shape)
-    #     # print("relative_time_idx shape:", batch.get("relative_time_idx", None))
-    #     # Process your batch...
-    #     breakpoint()
-    #     pass
+    for batch in tqdm(train_loader):
+        # Now batch is a dictionary where variable-length sequences have been padded.
+        # print("x_temporal_cat shape:", batch["x_temporal_cat"].shape)
+        # print("relative_time_idx shape:", batch.get("relative_time_idx", None))
+        # Process your batch...
+        # breakpoint()
+        pass
 

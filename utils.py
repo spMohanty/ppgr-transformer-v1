@@ -193,13 +193,27 @@ def ppgr_collate_fn(batch):
     """
     collated = {}
             
+            
+    batch_size = len(batch)
+    
     # Get lengths of the individual timeseries in the batch
     encoder_lengths = torch.tensor([item["encoder_length"] for item in batch])
     prediction_lengths = torch.tensor([item["prediction_length"] for item in batch])
             
     # Calculate the maximum length of the timeseries in the batch
     max_encoder_len = max(encoder_lengths)
-    max_prediction_len = max(prediction_lengths)        
+    max_prediction_len = max(prediction_lengths)
+
+    if batch[0]["metadata"]["use_meal_level_food_covariates"]:    
+        # Get the number of dishes recorded for each timestep in the batch element
+        encoder_dish_tensors_recorded = torch.stack([item["x_dish_tensors_recorded"] for item in batch])
+        prediction_dish_tensors_recorded = torch.stack([item["y_dish_tensors_recorded"] for item in batch])
+        
+        max_encoder_dish_tensors_recorded = torch.max(encoder_dish_tensors_recorded)
+        max_prediction_dish_tensors_recorded = torch.max(prediction_dish_tensors_recorded)
+    
+    MEAL_PADDING_VALUE = 0 # Padding the meals with 0 for consistency
+    TEMPORAL_PADDING_VALUE = 1991 # as we are not supporting variable encoder and prediction lengths, we should not see this value anywhere
     
     # Create encoder mask (left padding)
     # Shape: [batch_size, max_encoder_len]
@@ -215,23 +229,73 @@ def ppgr_collate_fn(batch):
             collated[key] = batch[0][key] # the metadata is the same for all items in the batch
             continue
         
-        if isinstance(batch[0][key], torch.Tensor):
+        if isinstance(batch[0][key], torch.Tensor):            
             if key.startswith("x_"):
-                # These are the encoder variables (by naming convention)
                 
-                collated[key] = pad_sequence(
-                    [batch[_idx][key] for _idx in range(len(batch))], batch_first=True, padding_side="left")
+                # If meal level data is provided, first pad them to the max number of dishes recorded for this timestep
+                if batch[0][key].is_nested:
+                    # Get the max number of dishes recorded for this timestep
+                    # All this shenenigans only to handle the granual meal level data                    
+                    if key == "x_food_cat":
+                        num_features = len(batch[0]["metadata"]["food_categoricals"])
+                    elif key == "x_food_real":
+                        num_features = len(batch[0]["metadata"]["food_reals"])
+                    else:
+                        raise ValueError(f"Key {key} not supported for meal level padding.")
+                    
+                    batch_wise_padded_tensors = []
+                    for _idx in range(batch_size):
+                        # Padd the meal data for this batch (while considering the batch wise max number of dishes recorded)
+                        
+                        # NOTE: Variable encoder lengths are not supported yet !!
+                        padded_tensor = torch.nested.to_padded_tensor(
+                            batch[_idx][key],
+                            padding=MEAL_PADDING_VALUE,
+                            output_size = (max_encoder_len, max_encoder_dish_tensors_recorded, num_features)
+                        ) # T, num_dishes, num_features
+                        batch_wise_padded_tensors.append(padded_tensor)
+                        
+                    collated[key] = torch.stack(batch_wise_padded_tensors)
+                else:
+                    # These are the encoder variables (by naming convention)    
+                    collated[key] = pad_sequence(
+                        [batch[_idx][key] for _idx in range(len(batch))], batch_first=True, padding_side="left", padding_value=TEMPORAL_PADDING_VALUE)                    
             elif key.startswith("y_"):
-                # These are the prediction window variables (by naming convention)
-                collated[key] = pad_sequence(
-                    [batch[_idx][key] for _idx in range(len(batch))], batch_first=True, padding_side="right")
+                if batch[0][key].is_nested:
+                    # Get the max number of dishes recorded for this timestep
+                    # All this shenenigans only to handle the granual meal level data                    
+                    if key == "y_food_cat":
+                        num_features = len(batch[0]["metadata"]["food_categoricals"])
+                    elif key == "y_food_real":
+                        num_features = len(batch[0]["metadata"]["food_reals"])
+                    else:
+                        raise ValueError(f"Key {key} not supported for meal level padding.")
+                    
+                    batch_wise_padded_tensors = []
+                    for _idx in range(batch_size):
+                        # Padd the meal data for this batch (while considering the batch wise max number of dishes recorded)
+                        
+                        # NOTE: Variable encoder lengths are not supported yet !!
+                        padded_tensor = torch.nested.to_padded_tensor(
+                            batch[_idx][key],
+                            padding=MEAL_PADDING_VALUE,
+                            output_size = (max_prediction_len, max_prediction_dish_tensors_recorded, num_features)
+                        ) # T, num_dishes, num_features
+                        batch_wise_padded_tensors.append(padded_tensor)
+                        
+                    collated[key] = torch.stack(batch_wise_padded_tensors)
+                else:
+                    # These are the prediction window variables (by naming convention)
+                    # NOTE: This next step is redundant, as we are currently not supporting variable encoder and prediction lengths
+                    collated[key] = pad_sequence(
+                        [batch[_idx][key] for _idx in range(len(batch))], batch_first=True, padding_side="right", padding_value=TEMPORAL_PADDING_VALUE)
             else:
                 # These are the other variables, that should not need padding by default and a simple stacking should do the trick
                 collated[key] = torch.stack([batch[_idx][key] for _idx in range(len(batch))])
         else:
             # raise Error unless y_food_cat or y_food_real, as they might be suppressed 
             # when future food information is not allowed
-            if key not in ["y_food_cat", "y_food_real"]:
+            if key not in ["y_food_cat", "y_food_real", "x_dish_tensors_recorded", "y_dish_tensors_recorded"]:
                 raise ValueError(f"Key {key} is not a tensor")
     
     # Add masks to the collated dictionary
@@ -242,5 +306,4 @@ def ppgr_collate_fn(batch):
     collated["encoder_length"] = encoder_lengths
     collated["prediction_length"] = prediction_lengths
     
-    breakpoint()
     return collated
