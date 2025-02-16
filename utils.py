@@ -218,6 +218,7 @@ def ppgr_collate_fn(batch):
         if isinstance(batch[0][key], torch.Tensor):
             if key.startswith("x_"):
                 # These are the encoder variables (by naming convention)
+                
                 collated[key] = pad_sequence(
                     [batch[_idx][key] for _idx in range(len(batch))], batch_first=True, padding_side="left")
             elif key.startswith("y_"):
@@ -230,9 +231,6 @@ def ppgr_collate_fn(batch):
         else:
             # raise Error unless y_food_cat or y_food_real, as they might be suppressed 
             # when future food information is not allowed
-            
-            # TODO: Handle the case of x_food_cat and x_food_real and also y_food_cat and y_food_real being sequences of individual dish tensors
-            
             if key not in ["y_food_cat", "y_food_real"]:
                 raise ValueError(f"Key {key} is not a tensor")
     
@@ -244,4 +242,5 @@ def ppgr_collate_fn(batch):
     collated["encoder_length"] = encoder_lengths
     collated["prediction_length"] = prediction_lengths
     
+    breakpoint()
     return collated

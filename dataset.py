@@ -381,7 +381,7 @@ class PPGRTimeSeriesDataset(Dataset):
             # Iterate over the whole timeseries block            
             for row_idx in range(block_start, block_end + 1, self.sliding_window_stride):
                 # 1. Identify the start and end of the context and prediction window
-                slice_start = row_idx - self.min_encoder_length
+                slice_start = row_idx - self.min_encoder_length + 1
                 slice_end = row_idx + self.prediction_length
                 
                 # 2. Ignore the fringe points where the slice is not fully within the block
@@ -435,7 +435,7 @@ class PPGRTimeSeriesDataset(Dataset):
             # 7. Iterate over all the food intake rows
             for row_idx, _ in food_intake_rows.iterrows():
                 # 8. For each food intake row, identify the start and end of the context and prediction window
-                slice_start = row_idx - self.min_encoder_length
+                slice_start = row_idx - self.min_encoder_length + 1 # row_idx is the food anchor, and we want the encoder slice to end with it
                 slice_end = row_idx + self.prediction_length
                 
                 # 9. Store slice start, and slice end to be retrieved later in __getitem__
@@ -502,29 +502,73 @@ class PPGRTimeSeriesDataset(Dataset):
         ).item()
         
         # Calculate slice start based on randomly sampled encoder length
-        slice_start = slice_anchor_row_idx - encoder_length        
+        slice_start = slice_anchor_row_idx - encoder_length + 1
         slice_end = slice_metadata.slice_end
         
         return slice_start, slice_end, encoder_length
 
-    def _get_dish_tensors_for_this_slice(self, slice_start: int, slice_end: int):
+    def _get_dish_tensors_for_this_slice(self, slice_start: int, slice_end: int, max_dishes_per_row: int=11):
         """
-        This function returns the dish tensors for the current slice
+        This function returns the dish tensors for the current slice, with a special start/empty token
+        at the beginning of each timestep's sequence.
+        
+        Args:
+            slice_start (int): Starting index of the slice (inclusive)
+            slice_end (int): Ending index of the slice (inclusive)
+            max_dishes_per_row (int): Maximum number of dishes to include per row (including start token)
+                (in practice, every row will have an extra "start tensor" as well)
+        
+        Returns:
+            Tuple of lists containing categorical and real tensors for dishes
         """
         
         # For all the rows in the current slice, gather the dish_idxs
         dish_tensors_cat_for_this_slice = []
         dish_tensors_real_for_this_slice = []
         
-        num_food_covariates = len(self.food_categorical_col_idx) + len(self.food_real_col_idx)
-        for slice_row_idx in range(slice_start, slice_end+1):                
-            dish_idxs_for_this_row = self.ppgr_df_row_idx_to_dishes_df_idxs.get(slice_row_idx, torch.tensor([], dtype=torch.int32).to(self.device))
-            dish_tensors_for_this_row = self.dishes_df_scaled_tensor[dish_idxs_for_this_row]
-            dish_tensors_cat_for_this_slice.append(dish_tensors_for_this_row[:, self.food_categorical_col_idx])
-            dish_tensors_real_for_this_slice.append(dish_tensors_for_this_row[:, self.food_real_col_idx])
+        # Get dimensions for start/empty token tensor creation
+        num_cat_features = len(self.food_categorical_col_idx)
+        num_real_features = len(self.food_real_col_idx)
+        
+        # Create start/empty token tensors (using -100 to distinguish from regular -1 padding)
+        start_cat_tensor = torch.full((1, num_cat_features), -100, dtype=torch.int32, device=self.device)
+        start_real_tensor = torch.full((1, num_real_features), -100, dtype=torch.float32, device=self.device)
+        
+        # TODO: Setup sensible values for the start token
+        
+        dish_tensors_recorded = []
+        # Use range(start, end + 1) to make end inclusive
+        for slice_row_idx in range(slice_start, slice_end + 1):
+            dish_idxs_for_this_row = self.ppgr_df_row_idx_to_dishes_df_idxs.get(slice_row_idx, None)
             
-        return dish_tensors_cat_for_this_slice, dish_tensors_real_for_this_slice
-    
+            if dish_idxs_for_this_row is None or len(dish_idxs_for_this_row) == 0:
+                # If no dishes, just use the start token
+                dish_tensors_cat_for_this_slice.append(start_cat_tensor)
+                dish_tensors_real_for_this_slice.append(start_real_tensor)
+                
+                dish_tensors_recorded.append(1) # adding 1 as we have a start token
+            else:
+                # If dishes exist, concatenate start token with dish tensors
+                dish_tensors_for_this_row = self.dishes_df_scaled_tensor[dish_idxs_for_this_row]
+                
+                # Only use up to max_dishes_per_row (to leave room for start token)
+                cat_tensor = torch.cat([
+                    start_cat_tensor,
+                    dish_tensors_for_this_row[:max_dishes_per_row, self.food_categorical_col_idx]
+                ], dim=0)
+                real_tensor = torch.cat([
+                    start_real_tensor,
+                    dish_tensors_for_this_row[:max_dishes_per_row, self.food_real_col_idx]
+                ], dim=0)
+                
+                dish_tensors_cat_for_this_slice.append(cat_tensor)
+                dish_tensors_real_for_this_slice.append(real_tensor)
+                
+                # Update the max number of dishes observed
+                dish_tensors_recorded.append(len(dish_idxs_for_this_row))
+        
+        return dish_tensors_cat_for_this_slice, dish_tensors_real_for_this_slice, dish_tensors_recorded
+
     def __getitem__(self, idx):
         slice_metadata = self.timeseries_slices_indices[idx]
         
@@ -534,7 +578,7 @@ class PPGRTimeSeriesDataset(Dataset):
         prediction_length = slice_end - slice_anchor 
         
         # Get the slice from the dataframe
-        data_slice_tensor = self.df_scaled_tensor[slice_start:slice_end, :].clone() # [T, C] where T is the number of rows in the slice and C is the number of all relevant columns
+        data_slice_tensor = self.df_scaled_tensor[slice_start:slice_end+1, :].clone() # [T, C] where T is the number of rows in the slice and C is the number of all relevant columns
                 
         # Calculate slices for encoder and prediction window
         data_slice_encoder_tensor = data_slice_tensor[:encoder_length, :]
@@ -560,9 +604,17 @@ class PPGRTimeSeriesDataset(Dataset):
         # Food Static Covariates
         if self.use_meal_level_food_covariates:
             # Gather the food covariates for the current slice            
-            x_food_cat, x_food_real = self._get_dish_tensors_for_this_slice(slice_start, slice_anchor)            
+            x_food_cat, x_food_real, x_dish_tensors_recorded = self._get_dish_tensors_for_this_slice(slice_start, slice_anchor)
+            
+            # x_dish_tensors_recorded is a list of the number of dish tensors recorded for each row in the slice
+            # we can use this to reconstruct the structure of the food covariates later
+            
+            breakpoint()
+            # Pad the food covariates to the same length
+            x_food_cat = pad_sequence(x_food_cat, batch_first=True, padding_side="left", padding_value=-1).view(encoder_length, -1)
+            x_food_real = pad_sequence(x_food_real, batch_first=True, padding_side="left", padding_value=-1).view(encoder_length, -1)
             # Note: IMPORTANT!! - The sequence length will vary by design for each slice
-            # and the type here will be a list of tensors, instead of a full fleged batch            
+            # and hence we are padding to the same length 
         else:    
             # Gather the dish_idxs for the current slice            
             x_food_cat = data_slice_encoder_tensor[:, self.food_categorical_col_idx]
@@ -593,6 +645,10 @@ class PPGRTimeSeriesDataset(Dataset):
             if self.use_meal_level_food_covariates:
                 # When we want meal level data
                 y_food_cat, y_food_real = self._get_dish_tensors_for_this_slice(slice_anchor, slice_end)
+                
+                # Padd the sequences to the same length
+                y_food_cat = pad_sequence(y_food_cat, batch_first=True, padding_side="right", padding_value=-1).view(prediction_length, -1)
+                y_food_real = pad_sequence(y_food_real, batch_first=True, padding_side="right", padding_value=-1).view(prediction_length, -1)                
             else:
                 # standard aggregated food covariates
                 y_food_cat = data_slice_prediction_window_tensor[:, self.food_categorical_col_idx]
@@ -885,7 +941,7 @@ if __name__ == "__main__":
                                             sliding_window_stride = None, # This has to change everytime is_food_anchored is changed
 
                                             min_encoder_length = 8 * 4, # 8 hours with 4 timepoints per hour
-                                            max_encoder_length = 12 * 4, # 12 hours with 4 timepoints per hour
+                                            max_encoder_length = 8 * 4, # 12 hours with 4 timepoints per hour
                                             
                                             prediction_length = 2 * 4, # 2 hours with 4 timepoints per hour
                                             
@@ -937,7 +993,9 @@ if __name__ == "__main__":
         collate_fn=ppgr_collate_fn
     )
     
-    print(training_dataset[0])
+    # print(training_dataset[0])
+
+    ppgr_collate_fn([training_dataset[0], training_dataset[1], training_dataset[2]])
     
     # Example: Iterate through one batch
     # for batch in tqdm(train_loader):
@@ -945,5 +1003,6 @@ if __name__ == "__main__":
     #     # print("x_temporal_cat shape:", batch["x_temporal_cat"].shape)
     #     # print("relative_time_idx shape:", batch.get("relative_time_idx", None))
     #     # Process your batch...
+    #     breakpoint()
     #     pass
 
