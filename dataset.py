@@ -24,8 +24,9 @@ import torch.nn.functional as F
 import p_tqdm
 
 import numpy as np
-
-
+import hashlib
+import os
+import logging
 
 def split_timeseries_df_based_on_food_intake_rows(
     df: pd.DataFrame,
@@ -1039,6 +1040,297 @@ class PPGRToMealGlucoseWrapper(Dataset):
                 future_meal_macros.float(),     # [T_pred, max_meals, num_nutrients]
                 future_glucose.float(),         # [T_pred]
                 target_scales)         # [2]
+
+
+# -----------------------------
+# Dummy Example Dataset (only if needed)
+# -----------------------------
+class DummyMealGlucoseDataset(Dataset):
+    def __init__(
+        self,
+        num_sequences=1000,
+        past_seq_length=20,
+        forecast_horizon=4,
+        num_foods=100,
+        max_meals=11,
+        macro_dim=5,
+    ):
+        super().__init__()
+        self.num_sequences = num_sequences
+        self.past_seq_length = past_seq_length
+        self.forecast_horizon = forecast_horizon
+        self.max_meals = max_meals
+        self.macro_dim = macro_dim
+        self.num_foods = num_foods
+        self.data = []
+        for _ in range(num_sequences):
+            past_glucose = torch.rand(past_seq_length)
+            future_glucose = torch.rand(forecast_horizon)
+
+            past_meal_ids = torch.zeros(past_seq_length, max_meals, dtype=torch.long)
+            past_meal_macros = torch.zeros(
+                past_seq_length, max_meals, macro_dim, dtype=torch.float
+            )
+            for t in range(past_seq_length):
+                num_meals = random.randint(0, 3)
+                num_meals = min(num_meals, max_meals)
+                for k in range(num_meals):
+                    food_id = random.randint(1, num_foods - 1)
+                    macros = torch.rand(macro_dim)
+                    past_meal_ids[t, k] = food_id
+                    past_meal_macros[t, k] = macros
+
+            future_meal_ids = torch.zeros(forecast_horizon, max_meals, dtype=torch.long)
+            future_meal_macros = torch.zeros(
+                forecast_horizon, max_meals, macro_dim, dtype=torch.float
+            )
+            for t in range(forecast_horizon):
+                num_meals = random.randint(0, 3)
+                num_meals = min(num_meals, max_meals)
+                for k in range(num_meals):
+                    food_id = random.randint(1, num_foods - 1)
+                    macros = torch.rand(macro_dim)
+                    future_meal_ids[t, k] = food_id
+                    future_meal_macros[t, k] = macros
+
+            self.data.append(
+                (
+                    past_glucose,
+                    past_meal_ids,
+                    past_meal_macros,
+                    future_meal_ids,
+                    future_meal_macros,
+                    future_glucose,
+                )
+            )
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+
+
+# -----------------------------------------------------------------------------
+# NEW create_cached_dataset function that caches all splits + encoders/scalers
+# -----------------------------------------------------------------------------
+def create_cached_dataset(
+    dataset_version,
+    debug_mode,
+    validation_percentage,
+    test_percentage,
+    min_encoder_length,
+    prediction_length,
+    is_food_anchored,
+    sliding_window_stride,
+    use_meal_level_food_covariates,
+    use_microbiome_embeddings,
+    group_by_columns,
+    temporal_categoricals,
+    temporal_reals,
+    user_static_categoricals,
+    user_static_reals,
+    food_categoricals,
+    food_reals,
+    targets,
+    cache_dir,
+    use_cache=True,
+):
+    """
+    Create or load a cached dataset containing training, validation, and test splits,
+    along with their scalers/encoders. If a matching cache file is found and use_cache
+    is True, we use the cached result.
+
+    This version uses torch.save and torch.load for dataset caching.
+    """
+    # Local imports for your pipeline
+    from dataset import PPGRTimeSeriesDataset, PPGRToMealGlucoseWrapper, split_timeseries_df_based_on_food_intake_rows
+    from utils import load_dataframe, enforce_column_types, setup_scalers_and_encoders
+
+    # 1) Define config that influences final dataset creation
+    config = {
+        "dataset_version": dataset_version,
+        "debug_mode": debug_mode,
+        "validation_percentage": validation_percentage,
+        "test_percentage": test_percentage,
+        "min_encoder_length": min_encoder_length,
+        "prediction_length": prediction_length,
+        "is_food_anchored": is_food_anchored,
+        "sliding_window_stride": sliding_window_stride,
+        "use_meal_level_food_covariates": use_meal_level_food_covariates,
+        "use_microbiome_embeddings": use_microbiome_embeddings,
+        "group_by_columns": group_by_columns,
+        "temporal_categoricals": temporal_categoricals,
+        "temporal_reals": temporal_reals,
+        "user_static_categoricals": user_static_categoricals,
+        "user_static_reals": user_static_reals,
+        "food_categoricals": food_categoricals,
+        "food_reals": food_reals,
+        "targets": targets,
+    }
+
+    # 2) Compute a unique hash from the config
+    import pickle  # Only used for hashing the config; caching itself is now handled by torch.save
+    config_bytes = pickle.dumps(config)
+    config_hash = hashlib.md5(config_bytes).hexdigest()
+    cache_file = os.path.join(cache_dir, f"{config_hash}_all_splits.pt")  # Updated extension to .pt
+
+    # 3) If cache exists and caching is enabled, load & return immediately using torch.load
+    if use_cache and os.path.exists(cache_file):
+        logging.info(f"[CACHE-HIT] Loading pipeline from: {cache_file}")
+        cached_data = torch.load(cache_file, weights_only=False)
+        return (
+            cached_data["training_dataset"],
+            cached_data["validation_dataset"],
+            cached_data["test_dataset"],
+            cached_data["categorical_encoders"],
+            cached_data["continuous_scalers"],
+        )
+
+    # 4) Otherwise, proceed to load & build everything
+    logging.info("[CACHE-MISS] Building dataset from scratch...")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # Load base dataframes
+    ppgr_df, users_demographics_df, dishes_df, microbiome_embeddings_df = load_dataframe(
+        dataset_version, debug_mode
+    )
+
+    # Split the dataframes
+    (training_df, validation_df, test_df) = split_timeseries_df_based_on_food_intake_rows(
+        ppgr_df,
+        validation_percentage=validation_percentage,
+        test_percentage=test_percentage,
+    )
+
+    # Columns to enforce
+    main_df_scaled_all_categorical_columns = (
+        user_static_categoricals + food_categoricals + temporal_categoricals
+    )
+    main_df_scaled_all_real_columns = (
+        user_static_reals + food_reals + temporal_reals + targets
+    )
+
+    # Enforce types
+    ppgr_df, users_demographics_df, dishes_df = enforce_column_types(
+        ppgr_df,
+        users_demographics_df,
+        dishes_df,
+        main_df_scaled_all_categorical_columns,
+        main_df_scaled_all_real_columns,
+    )
+
+    # Fit encoders/scalers on training data
+    categorical_encoders, continuous_scalers = setup_scalers_and_encoders(
+        ppgr_df=ppgr_df,
+        training_df=training_df,
+        users_demographics_df=users_demographics_df,
+        dishes_df=dishes_df,
+        categorical_columns=main_df_scaled_all_categorical_columns,
+        real_columns=main_df_scaled_all_real_columns,
+        use_meal_level_food_covariates=use_meal_level_food_covariates,
+    )
+
+    # Build PPGRTimeSeriesDataset for each split
+    training_dataset = PPGRTimeSeriesDataset(
+        ppgr_df=training_df,
+        user_demographics_df=users_demographics_df,
+        dishes_df=dishes_df,
+        time_idx="read_at",
+        target_columns=targets,
+        group_by_columns=group_by_columns,
+        is_food_anchored=is_food_anchored,
+        sliding_window_stride=sliding_window_stride,
+        min_encoder_length=min_encoder_length,
+        prediction_length=prediction_length,
+        use_food_covariates_from_prediction_window=True,
+        use_meal_level_food_covariates=use_meal_level_food_covariates,
+        use_microbiome_embeddings=use_microbiome_embeddings,
+        microbiome_embeddings_df=microbiome_embeddings_df,
+        temporal_categoricals=temporal_categoricals,
+        temporal_reals=temporal_reals,
+        user_static_categoricals=user_static_categoricals,
+        user_static_reals=user_static_reals,
+        food_categoricals=food_categoricals,
+        food_reals=food_reals,
+        categorical_encoders=categorical_encoders,
+        continuous_scalers=continuous_scalers,
+    )
+
+    validation_dataset = PPGRTimeSeriesDataset(
+        ppgr_df=validation_df,
+        user_demographics_df=users_demographics_df,
+        dishes_df=dishes_df,
+        time_idx="read_at",
+        target_columns=targets,
+        group_by_columns=group_by_columns,
+        is_food_anchored=is_food_anchored,
+        sliding_window_stride=sliding_window_stride,
+        min_encoder_length=min_encoder_length,
+        prediction_length=prediction_length,
+        use_food_covariates_from_prediction_window=True,
+        use_meal_level_food_covariates=use_meal_level_food_covariates,
+        use_microbiome_embeddings=use_microbiome_embeddings,
+        microbiome_embeddings_df=microbiome_embeddings_df,
+        temporal_categoricals=temporal_categoricals,
+        temporal_reals=temporal_reals,
+        user_static_categoricals=user_static_categoricals,
+        user_static_reals=user_static_reals,
+        food_categoricals=food_categoricals,
+        food_reals=food_reals,
+        categorical_encoders=categorical_encoders,
+        continuous_scalers=continuous_scalers,
+    )
+
+    test_dataset = PPGRTimeSeriesDataset(
+        ppgr_df=test_df,
+        user_demographics_df=users_demographics_df,
+        dishes_df=dishes_df,
+        time_idx="read_at",
+        target_columns=targets,
+        group_by_columns=group_by_columns,
+        is_food_anchored=is_food_anchored,
+        sliding_window_stride=sliding_window_stride,
+        min_encoder_length=min_encoder_length,
+        prediction_length=prediction_length,
+        use_food_covariates_from_prediction_window=True,
+        use_meal_level_food_covariates=use_meal_level_food_covariates,
+        use_microbiome_embeddings=use_microbiome_embeddings,
+        microbiome_embeddings_df=microbiome_embeddings_df,
+        temporal_categoricals=temporal_categoricals,
+        temporal_reals=temporal_reals,
+        user_static_categoricals=user_static_categoricals,
+        user_static_reals=user_static_reals,
+        food_categoricals=food_categoricals,
+        food_reals=food_reals,
+        categorical_encoders=categorical_encoders,
+        continuous_scalers=continuous_scalers,
+    )
+
+    wrapped_training_dataset = PPGRToMealGlucoseWrapper(training_dataset)
+    wrapped_validation_dataset = PPGRToMealGlucoseWrapper(validation_dataset)
+    wrapped_test_dataset = PPGRToMealGlucoseWrapper(test_dataset)
+
+    # Pack everything to cache using torch.save
+    cache_dict = {
+        "training_dataset": wrapped_training_dataset,
+        "validation_dataset": wrapped_validation_dataset,
+        "test_dataset": wrapped_test_dataset,
+        "categorical_encoders": categorical_encoders,
+        "continuous_scalers": continuous_scalers,
+    }
+    torch.save(cache_dict, cache_file)
+    logging.info(f"Dataset pipeline built and saved to cache: {cache_file}")
+    return (
+        wrapped_training_dataset,
+        wrapped_validation_dataset,
+        wrapped_test_dataset,
+        categorical_encoders,
+        continuous_scalers,
+    )
+
+
 
 if __name__ == "__main__":
 
