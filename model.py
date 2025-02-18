@@ -197,6 +197,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         enc_layers: int = 1,
         residual_pred: bool = True,
         num_quantiles: int = 7,
+        loss_iAUC_weight: float = 1,  # New hyperparameter for iAUC loss weight
     ):
         super(MealGlucoseForecastModel, self).__init__()
         self.food_embed_dim = food_embed_dim
@@ -207,6 +208,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.forecast_horizon = forecast_horizon
         self.residual_pred = residual_pred
         self.num_quantiles = num_quantiles
+        self.loss_iAUC_weight = loss_iAUC_weight  # Store the iAUC loss weight
 
         self.meal_encoder = MealEncoder(
             food_embed_dim, hidden_dim, num_foods, macro_dim, max_meals, num_heads, num_layers=enc_layers
@@ -311,17 +313,28 @@ class MealGlucoseForecastModel(pl.LightningModule):
             future_glucose * target_scales[:, 1].unsqueeze(1) + target_scales[:, 0].unsqueeze(1)
         )
 
-        # Compute Quantile Loss across all quantiles
+        # Compute the baseline quantile loss.
         q_loss = quantile_loss(preds, future_glucose_unscaled, self.quantiles)
         self.log("train_quantile_loss", q_loss, on_step=True, on_epoch=True, prog_bar=True)
 
-        # RMSE using the median forecast (index 3)
+        # Compute the median forecast (assumed to be at index 3 for 7 quantiles).
         median_pred = preds[:, :, 3]
         rmse = torch.sqrt(F.mse_loss(median_pred, future_glucose_unscaled))
         self.log("train_rmse", rmse, on_step=False, on_epoch=True, prog_bar=True)
 
-        logging.debug(f"Training quantile loss: {q_loss.item()}")
-        return q_loss
+        # --- New: Compute iAUC Loss ---
+        # The compute_iAUC function returns the iAUC for the median forecast and the true future values.
+        pred_iAUC, true_iAUC = compute_iAUC(median_pred, future_glucose, past_glucose, target_scales)
+        iAUC_loss = F.mse_loss(pred_iAUC, true_iAUC)
+        
+        weighted_iAUC_loss = self.loss_iAUC_weight * iAUC_loss
+        self.log("train_iAUC_loss", weighted_iAUC_loss, on_step=True, on_epoch=True, prog_bar=True)
+
+        # Combine the losses: quantile loss plus weighted iAUC loss.
+        total_loss = q_loss + weighted_iAUC_loss
+        self.log("train_total_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True)
+        logging.debug(f"Total training loss (quantile + iAUC): {total_loss.item()}")
+        return total_loss
 
     def validation_step(self, batch, batch_idx):
         logging.debug(f"Validation step: batch_idx {batch_idx}")
@@ -999,6 +1012,7 @@ def main(debug, no_cache, precision):
         enc_layers=enc_layers,
         residual_pred=residual_pred,
         num_quantiles=7,
+        loss_iAUC_weight=0.01,
     )
 
     ############################################################################
@@ -1102,6 +1116,33 @@ def quantile_loss(predictions, targets, quantiles):
     # For each quantile q, loss = max(q*(error), (q-1)*(error))
     losses = torch.max((quantiles - 1) * errors, quantiles * errors)
     return losses.mean()
+
+
+def compute_iAUC(median_pred, future_glucose, past_glucose, target_scales):
+    """
+    Compute the integrated Area Under the Curve (iAUC) for the median forecast predictions and the ground truth.
+
+    Parameters:
+    - median_pred: Tensor of shape [B, forecast_horizon], representing the median forecast.
+    - future_glucose: Tensor of shape [B, forecast_horizon], representing the future observed glucose values.
+    - past_glucose: Tensor of shape [B, T], representing the historical glucose values.
+    - target_scales: Tensor of shape [B, 2] containing the (offset, scale) for unscaling.
+    
+    Returns:
+    - pred_iAUC: Tensor of shape [B], the integrated area under the curve for the predictions.
+    - true_iAUC: Tensor of shape [B], the integrated area under the curve for the ground truth.
+    """
+    past_glucose_unscaled = unscale_tensor(past_glucose, target_scales)  # [B, T]
+    future_glucose_unscaled = (
+        future_glucose * target_scales[:, 1].unsqueeze(1) + target_scales[:, 0].unsqueeze(1)
+    )
+    # The baseline is defined as the mean of the last two values of the unscaled past glucose.
+    baseline = past_glucose_unscaled[:, -2:].mean(dim=1)  # shape: [B]
+    pred_diff = median_pred - baseline.unsqueeze(1)
+    true_diff = future_glucose_unscaled - baseline.unsqueeze(1)
+    pred_iAUC = torch.trapz(torch.clamp(pred_diff, min=0), dx=1, dim=1)
+    true_iAUC = torch.trapz(torch.clamp(true_diff, min=0), dx=1, dim=1)
+    return pred_iAUC, true_iAUC
 
 
 if __name__ == "__main__":
