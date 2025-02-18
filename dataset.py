@@ -1013,7 +1013,7 @@ class PPGRToMealGlucoseWrapper(Dataset):
         past_meal_ids = self.pad_or_truncate(past_meal_ids, self.max_meals, dim=1)
         
         # For the meal macros, assume columns 2:5 hold the desired macronutrients.
-        past_meal_macros = x_food_real[:, :, 2:5].float()  # shape: [T_enc, N, 3]
+        past_meal_macros = x_food_real[:, :, :].float()  # shape: [T_enc, N, num_nutrients]
         past_meal_macros = self.pad_or_truncate(past_meal_macros, self.max_meals, dim=1)
         
         # ---------------------------
@@ -1026,7 +1026,7 @@ class PPGRToMealGlucoseWrapper(Dataset):
         future_meal_ids = y_food_cat[:, :, 1].long()  # shape: [T_pred, N]
         future_meal_ids = self.pad_or_truncate(future_meal_ids, self.max_meals, dim=1)
         
-        future_meal_macros = y_food_real[:, :, 2:5].float()  # shape: [T_pred, N, 3]
+        future_meal_macros = y_food_real[:, :, :].float()  # shape: [T_pred, N, num_nutrients]
         future_meal_macros = self.pad_or_truncate(future_meal_macros, self.max_meals, dim=1)
         
         target_scales = item["target_scales"]
@@ -1034,9 +1034,9 @@ class PPGRToMealGlucoseWrapper(Dataset):
         # Return the 6-tuple.
         return (past_glucose.float(),           # [T_enc]
                 past_meal_ids,          # [T_enc, max_meals]
-                past_meal_macros.float(),       # [T_enc, max_meals, 3]
+                past_meal_macros.float(),       # [T_enc, max_meals, num_nutrients]
                 future_meal_ids,        # [T_pred, max_meals]
-                future_meal_macros.float(),     # [T_pred, max_meals, 3]
+                future_meal_macros.float(),     # [T_pred, max_meals, num_nutrients]
                 future_glucose.float(),         # [T_pred]
                 target_scales)         # [2]
 
