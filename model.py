@@ -270,7 +270,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         )  # [B, hidden_dim*2]
         
         # Compute the forecast in full precision (FP32) regardless of training precision.
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             final_rep_fp32 = final_rep.float()
             pred_future = self.forecast_mlp(final_rep_fp32)  # [B, forecast_horizon*num_quantiles]
             # Reshape to [B, forecast_horizon, num_quantiles]
@@ -942,8 +942,8 @@ def main(debug, no_cache, precision):
     glucose_seq_len = min_encoder_length
     forecast_horizon = prediction_length
     
-    food_embed_dim = 32
-    hidden_dim = 256
+    food_embed_dim = 64
+    hidden_dim = 128
     
     num_heads = 4
     enc_layers = 4
