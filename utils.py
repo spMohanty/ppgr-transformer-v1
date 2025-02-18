@@ -313,3 +313,46 @@ def ppgr_collate_fn(batch):
     collated["prediction_length"] = prediction_lengths
     
     return collated
+
+def scale_tensor(tensor, scales):
+    """
+    Scale a tensor using provided scale factors.
+    
+    Args:
+        tensor (torch.Tensor): The input tensor (e.g., in original scale).
+        scales (torch.Tensor): Tensor of scale factors. Assumed to have shape 
+            [B, 2] or extra dims that can be collapsed. scales[:, 0] is the mean,
+            scales[:, 1] is the std.
+            
+    Returns:
+        torch.Tensor: The normalized tensor.
+    
+    Normalization formula: normalized = (original - mean) / std
+    """
+    if scales.dim() > 2:
+        scales = scales.view(scales.size(0), -1)
+    mean = scales[:, 0].unsqueeze(1)
+    std = scales[:, 1].unsqueeze(1)
+    return (tensor - mean) / std
+
+
+def unscale_tensor(tensor, scales):
+    """
+    Unscale a tensor using provided scale factors.
+    
+    Args:
+        tensor (torch.Tensor): The normalized tensor.
+        scales (torch.Tensor): Tensor of scale factors. Assumed to have shape 
+            [B, 2] or extra dims that can be collapsed. scales[:, 0] is the mean,
+            scales[:, 1] is the std.
+            
+    Returns:
+        torch.Tensor: The tensor transformed back to the original scale.
+    
+    Unscaling formula: original = normalized * std + mean
+    """
+    if scales.dim() > 2:
+        scales = scales.view(scales.size(0), -1)
+    mean = scales[:, 0].unsqueeze(1)
+    std = scales[:, 1].unsqueeze(1)
+    return tensor * std + mean 

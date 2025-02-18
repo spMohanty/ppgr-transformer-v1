@@ -917,10 +917,6 @@ class PPGRTimeSeriesDataset(Dataset):
         return obj
 
 
-import torch
-from torch.utils.data import Dataset
-import torch.nn.functional as F
-
 class PPGRToMealGlucoseWrapper(Dataset):
     """
     A wrapper that converts a PPGRTimeSeriesDataset sample (returning a dictionary)
@@ -1033,14 +1029,16 @@ class PPGRToMealGlucoseWrapper(Dataset):
         future_meal_macros = y_food_real[:, :, 2:5].float()  # shape: [T_pred, N, 3]
         future_meal_macros = self.pad_or_truncate(future_meal_macros, self.max_meals, dim=1)
         
+        target_scales = item["target_scales"]
+        
         # Return the 6-tuple.
-        return (past_glucose,           # [T_enc]
+        return (past_glucose.float(),           # [T_enc]
                 past_meal_ids,          # [T_enc, max_meals]
-                past_meal_macros,       # [T_enc, max_meals, 3]
+                past_meal_macros.float(),       # [T_enc, max_meals, 3]
                 future_meal_ids,        # [T_pred, max_meals]
-                future_meal_macros,     # [T_pred, max_meals, 3]
-                future_glucose)         # [T_pred]
-
+                future_meal_macros.float(),     # [T_pred, max_meals, 3]
+                future_glucose.float(),         # [T_pred]
+                target_scales)         # [2]
 
 if __name__ == "__main__":
 
