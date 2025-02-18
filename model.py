@@ -15,7 +15,7 @@ from utils import unscale_tensor
 # Global logging configuration
 # -----------------------------------------------------------------------------
 # Set this flag to False to disable detailed debug logging.
-VERBOSE_LOGGING = True
+VERBOSE_LOGGING = False
 
 logging.basicConfig(
     level=logging.DEBUG if VERBOSE_LOGGING else logging.INFO,
@@ -26,19 +26,34 @@ logging.basicConfig(
 # -----------------------------------------------------------------------------
 # Utility Logging Function
 # -----------------------------------------------------------------------------
-def log_tensor_stats(name, tensor):
-    """Utility to log basic statistics of a tensor.
-       Logs only when VERBOSE_LOGGING is True.
+def log_tensor_stats(name, tensor, step=None):
+    """
+    Logs basic statistics of a tensor—including a histogram—to WandB.
+    This function uses wandb.Histogram to render the distribution.
+    Pass a training/logging step if available.
     """
     if not VERBOSE_LOGGING:
         return
+
+    # Check for NaNs.
     if torch.isnan(tensor).any():
         logging.error(f"{name} has NaNs! (shape={tensor.shape})")
-    else:
-        mean_val = tensor.mean().item()
-        std_val = tensor.std().item()
-        nan_count = torch.isnan(tensor).sum().item()
-        logging.debug(f"{name}: shape={tensor.shape}, mean={mean_val:.6f}, std={std_val:.6f}, nans={nan_count}")
+        wandb.log({f"{name}_error": f"NaNs found in tensor {name}"}, step=step)
+        return
+
+    # Compute summary statistics.
+    mean_val = tensor.mean().item()
+    std_val = tensor.std().item()
+    nan_count = torch.isnan(tensor).sum().item()
+    logging.debug(f"{name}: shape={tensor.shape}, mean={mean_val:.6f}, std={std_val:.6f}, nans={nan_count}")
+
+    # Log a histogram and scalar metrics to WandB.
+    wandb.log({
+        f"{name}/histogram": wandb.Histogram(tensor.detach().cpu().numpy()),
+        f"{name}/mean": mean_val,
+        f"{name}/std": std_val,
+        f"{name}/nan_count": nan_count,
+    }, step=step)
 
 # -----------------------------
 # Model Components with Debug Logs
@@ -159,45 +174,30 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.example_forecasts = None
 
     def forward(self, past_glucose, past_meal_ids, past_meal_macros, future_meal_ids, future_meal_macros, target_scales, return_attn=False):
-        logging.debug("MealGlucoseForecastModel: --- Forward Pass Start ---")
-        log_tensor_stats("Input past_glucose", past_glucose)
-        log_tensor_stats("Input past_meal_ids", past_meal_ids.float())
-        log_tensor_stats("Input past_meal_macros", past_meal_macros)
+        logging.debug("MealGlucoseForecastModel: --- Forward Pass Start ---")                        
         
         glucose_enc = self.glucose_encoder(past_glucose)  # [B, T, embed_dim]
         past_meal_enc = self.meal_encoder(past_meal_ids, past_meal_macros)  # [B, T, embed_dim]
-        
-        log_tensor_stats("Glucose encoder final", glucose_enc)
-        log_tensor_stats("Past meal encoder final", past_meal_enc)
-        
-        future_meal_enc = self.future_meal_encoder(future_meal_ids, future_meal_macros)  # [B, forecast_horizon, embed_dim]
-        log_tensor_stats("Future meal encoder", future_meal_enc)
+        future_meal_enc = self.future_meal_encoder(future_meal_ids, future_meal_macros)  # [B, forecast_horizon, embed_dim]        
         
         # Cross-attention: let glucose queries attend to past meal embeddings
-        attn_output, attn_weights = self.cross_attn(query=glucose_enc, key=past_meal_enc, value=past_meal_enc, need_weights=True)
-        log_tensor_stats("Attention output", attn_output)
-        log_tensor_stats("Attention weights", attn_weights)
+        attn_output, attn_weights = self.cross_attn(query=glucose_enc, key=past_meal_enc, value=past_meal_enc, need_weights=True)                
         
-        combined_glucose = attn_output + glucose_enc  # [B, T, embed_dim]
-        log_tensor_stats("Combined glucose", combined_glucose)
+        combined_glucose = attn_output + glucose_enc  # [B, T, embed_dim]        
         self.last_attn_weights = attn_weights
         
         # Use last timestep of combined past glucose and last timestep of future meal encoding
-        final_rep = torch.cat([combined_glucose[:, -1, :], future_meal_enc[:, -1, :]], dim=-1)  # [B, embed_dim*2]
-        log_tensor_stats("Final representation", final_rep)
+        final_rep = torch.cat([combined_glucose[:, -1, :], future_meal_enc[:, -1, :]], dim=-1)  # [B, embed_dim*2]        
         
-        pred_future = self.forecast_mlp(final_rep)  # [B, forecast_horizon]
-        log_tensor_stats("Forecast MLP output", pred_future)
+        pred_future = self.forecast_mlp(final_rep)  # [B, forecast_horizon]        
         
         # Apply residual addition if necessary
         if self.residual_pred:
             last_val = past_glucose[:, -1].unsqueeze(1)
-            pred_future = pred_future + last_val
-            log_tensor_stats("Residual forecast", pred_future)
+            pred_future = pred_future + last_val            
         
         # Un-scale the output predictions using the standard helper
-        pred_future = unscale_tensor(pred_future, target_scales)
-        log_tensor_stats("Unscaled Forecast", pred_future)
+        pred_future = unscale_tensor(pred_future, target_scales)        
         
         logging.debug("MealGlucoseForecastModel: --- Forward Pass End ---")
         if return_attn:
@@ -216,7 +216,6 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # -- UN-SCALE THE GROUND-TRUTH TARGET --
         future_glucose_unscaled = future_glucose * target_scales[:, 1].unsqueeze(1) + target_scales[:, 0].unsqueeze(1)
-        
         val_loss = F.mse_loss(preds, future_glucose_unscaled)
         self.log('val_loss', val_loss, on_step=False, on_epoch=True)
         logging.debug(f"Validation loss: {val_loss.item()}")
@@ -227,10 +226,11 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Store forecast examples from the first batch to visualize fixed datapoints.
         if batch_idx == 0:
             self.example_forecasts = {
-                "past": past_glucose_unscaled.detach().cpu(),  # Now using unscaled past glucose
-                "pred": preds.detach().cpu(),     # already unscaled from forward()
-                "truth": future_glucose_unscaled.detach().cpu(),
-                "future_meal_ids": future_meal_ids.detach().cpu(),
+                "past": past_glucose_unscaled.detach().cpu(),  # Historical (context) glucose
+                "pred": preds.detach().cpu(),                  # Predicted forecast
+                "truth": future_glucose_unscaled.detach().cpu(), # Ground-truth forecast
+                "future_meal_ids": future_meal_ids.detach().cpu(),  # Future meal information
+                "past_meal_ids": past_meal_ids.detach().cpu(),      # <-- NEW: Historical meal info for context window plotting
             }
         return val_loss
 
@@ -252,39 +252,55 @@ class MealGlucoseForecastModel(pl.LightningModule):
             pred = forecasts["pred"]                # shape: [B, forecast_horizon]
             truth = forecasts["truth"]              # shape: [B, forecast_horizon]
             future_meal_ids = forecasts["future_meal_ids"]  # shape: [B, forecast_horizon, max_meals]
+            past_meal_ids = forecasts.get("past_meal_ids")  # shape: [B, T_context, max_meals]
             num_examples = min(4, past.size(0))
             fig, axs = plt.subplots(num_examples, 1, figsize=(12, 4 * num_examples))
             if num_examples == 1:
                 axs = [axs]
             for i in range(num_examples):
-                past_i = past[i].numpy()   # Historical context [T_context,]
+                past_i = past[i].numpy()   # Historical glucose (context) [T_context,]
                 pred_i = pred[i].numpy()   # Forecast prediction [T_forecast,]
                 truth_i = truth[i].numpy() # Ground truth for forecast [T_forecast,]
-                meals_i = future_meal_ids[i].numpy()  # [T_forecast, max_meals]
+                meals_i = future_meal_ids[i].numpy()  # Future meal events [T_forecast, max_meals]
                 T_context = past_i.shape[0]
                 T_forecast = pred_i.shape[0]
-                total_t = T_context + T_forecast
-
+                # Create x-axis indices:
+                # Historical: from -(T_context-1) to 0
+                # Forecast: from 1 to T_forecast
+                x_hist = list(range(-T_context + 1, 1))
+                x_forecast = list(range(1, T_forecast + 1))
+                
                 ax = axs[i]
                 # Plot historical glucose values.
-                ax.plot(range(T_context), past_i, marker='o', label='Historical')
-                # Plot ground truth forecast and predictions on the forecast region.
-                forecast_timesteps = list(range(T_context, total_t))
-                ax.plot(forecast_timesteps, truth_i, marker='o', label='Ground Truth Forecast')
-                ax.plot(forecast_timesteps, pred_i, marker='o', label='Prediction Forecast')
+                ax.plot(x_hist, past_i, marker='o', label='Historical Glucose')
                 
-                # For forecast timesteps, mark meal consumption events.
-                meal_label_added = False
-                for t in range(T_forecast):
+                # Plot markers for historical meal consumption if available.
+                if past_meal_ids is not None:
+                    past_meals_i = past_meal_ids[i].numpy()  # shape: [T_context, max_meals]
+                    meal_label_added_hist = False
+                    for j, x_coord in enumerate(x_hist):
+                        if (past_meals_i[j] != 0).any():
+                            if not meal_label_added_hist:
+                                ax.axvline(x=x_coord, color='green', linestyle='--', alpha=0.7, label='Historical Meal Consumption')
+                                meal_label_added_hist = True
+                            else:
+                                ax.axvline(x=x_coord, color='green', linestyle='--', alpha=0.7)
+                
+                # Plot ground truth and forecast predictions in the future window.
+                ax.plot(x_forecast, truth_i, marker='o', label='Ground Truth Forecast')
+                ax.plot(x_forecast, pred_i, marker='o', label='Prediction Forecast')
+                
+                # Plot markers for forecast meal consumption.
+                meal_label_added_forecast = False
+                for t, x_coord in enumerate(x_forecast):
                     if (meals_i[t] != 0).any():
-                        x_coord = T_context + t
-                        if not meal_label_added:
-                            ax.axvline(x=x_coord, color='red', linestyle='--', alpha=0.7, label='Meal Consumption')
-                            meal_label_added = True
+                        if not meal_label_added_forecast:
+                            ax.axvline(x=x_coord, color='red', linestyle='--', alpha=0.7, label='Forecast Meal Consumption')
+                            meal_label_added_forecast = True
                         else:
                             ax.axvline(x=x_coord, color='red', linestyle='--', alpha=0.7)
                 
-                ax.set_xlabel("Timestep")
+                ax.set_xlabel("Relative Timestep")
                 ax.set_ylabel("Glucose Level")
                 ax.set_title(f"Forecast Example {i}")
                 ax.legend(fontsize='small')
@@ -327,6 +343,12 @@ class MealGlucoseForecastModel(pl.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=1e-3)
+
+    def on_train_epoch_end(self):
+        # Log each parameter's distribution once per epoch.
+        for name, param in self.named_parameters():
+            # Use the current epoch as the logging step.
+            log_tensor_stats(f"Parameter/{name}", param, step=self.current_epoch)
 
 # -----------------------------
 # Dummy Dataset
@@ -392,7 +414,7 @@ if __name__ == '__main__':
     
     logging.info("Starting main block.")
     dataset_version = "v0.4"
-    debug_mode = True
+    debug_mode = False
 
     min_encoder_length = 8 * 4 # 8 hours with 4 timepoints per hour
     prediction_length = 2 * 4 # 2 hours with 4 timepoints per hour
