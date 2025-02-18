@@ -15,6 +15,8 @@ import os
 import pickle
 import hashlib
 import warnings
+from pytorch_lightning.callbacks import RichModelSummary, RichProgressBar
+from pytorch_lightning import Trainer
 
 warnings.filterwarnings(
     "ignore",
@@ -69,7 +71,8 @@ def log_tensor_stats(name, tensor, step=None):
 class MealEncoder(nn.Module):
     def __init__(
         self,
-        embed_dim: int,
+        food_embed_dim: int,  # Dimension for raw food embeddings.
+        hidden_dim: int,      # Hidden dimension for the transformer and overall model.
         num_foods: int,
         macro_dim: int,
         max_meals: int = 11,
@@ -77,82 +80,70 @@ class MealEncoder(nn.Module):
         num_layers: int = 1,
     ):
         super(MealEncoder, self).__init__()
-        self.embed_dim = embed_dim
+        self.food_embed_dim = food_embed_dim
+        self.hidden_dim = hidden_dim
         self.max_meals = max_meals
         self.num_foods = num_foods
         self.macro_dim = macro_dim
 
-        self.food_emb = nn.Embedding(num_foods, embed_dim, padding_idx=0)
-        self.macro_proj = nn.Linear(macro_dim, embed_dim, bias=False)
-        self.pos_emb = nn.Embedding(max_meals, embed_dim)
+        # Food embeddings now have their own dimension.
+        self.food_emb = nn.Embedding(num_foods, food_embed_dim, padding_idx=0)
+        # Project food embeddings to the model's hidden dimension.
+        self.food_emb_proj = nn.Linear(food_embed_dim, hidden_dim)
 
-        self.start_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # Project macro features into the hidden space.
+        self.macro_proj = nn.Linear(macro_dim, hidden_dim, bias=False)
+        # Positional embeddings now use the hidden_dim.
+        self.pos_emb = nn.Embedding(max_meals, hidden_dim)
 
+        # The start token is also in the hidden space.
+        self.start_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+
+        # Transformer encoder layer expects d_model=hidden_dim.
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
+            d_model=hidden_dim,
             nhead=num_heads,
-            dim_feedforward=embed_dim * 2,
+            dim_feedforward=hidden_dim * 2,
             batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
     def forward(self, meal_ids: torch.LongTensor, meal_macros: torch.Tensor) -> torch.Tensor:
         B, T, M = meal_ids.size()
-        if VERBOSE_LOGGING:
-            logging.debug(
-                f"MealEncoder: Input meal_ids.shape: {meal_ids.shape}, "
-                f"meal_macros.shape: {meal_macros.shape}"
-            )
-
         meal_ids_flat = meal_ids.view(B * T, M)
         meal_macros_flat = meal_macros.view(B * T, M, -1)
 
-        meal_id_emb = self.food_emb(meal_ids_flat)  # [B*T, M, embed_dim]
-        meal_macro_emb = self.macro_proj(meal_macros_flat)  # [B*T, M, embed_dim]
-        meal_token_emb = meal_id_emb + meal_macro_emb       # [B*T, M, embed_dim]
+        # Get food embeddings and project them to the hidden dimension.
+        food_emb = self.food_emb(meal_ids_flat)          # [B*T, M, food_embed_dim]
+        food_emb = self.food_emb_proj(food_emb)            # [B*T, M, hidden_dim]
 
-        if VERBOSE_LOGGING:
-            logging.debug(
-                f"MealEncoder: meal_token_emb after summing embeddings: {meal_token_emb.shape}"
-            )
+        # Project macros to hidden_dim.
+        macro_emb = self.macro_proj(meal_macros_flat)       # [B*T, M, hidden_dim]
 
+        # Combine the food and macro embeddings.
+        meal_token_emb = food_emb + macro_emb               # [B*T, M, hidden_dim]
+
+        # Add positional embeddings.
         pos_indices = torch.arange(self.max_meals, device=meal_ids.device)
-        pos_enc = self.pos_emb(pos_indices).unsqueeze(0)  # [1, M, embed_dim]
-        meal_token_emb = meal_token_emb + pos_enc         # [B*T, M, embed_dim]
+        pos_enc = self.pos_emb(pos_indices).unsqueeze(0)      # [1, M, hidden_dim]
+        meal_token_emb = meal_token_emb + pos_enc
 
-        if VERBOSE_LOGGING:
-            logging.debug("MealEncoder: Added positional encoding.")
-
+        # Prepend a learnable start token.
         start_token_expanded = self.start_token.expand(B * T, -1, -1)
         meal_token_emb = torch.cat([start_token_expanded, meal_token_emb], dim=1)
 
-        if VERBOSE_LOGGING:
-            logging.debug(
-                f"MealEncoder: After prepending start token, shape: {meal_token_emb.shape}"
-            )
-
-        pad_mask = meal_ids_flat == 0  # [B*T, M]
+        # Create a padding mask (assuming 0 in meal_ids indicates padding).
+        pad_mask = meal_ids_flat == 0
         pad_mask = torch.cat(
             [torch.zeros(B * T, 1, device=pad_mask.device, dtype=torch.bool), pad_mask],
             dim=1,
         )
 
-        meal_attn_out = self.encoder(
-            meal_token_emb, src_key_padding_mask=pad_mask
-        )  # [B*T, 1+M, embed_dim]
-
-        if VERBOSE_LOGGING:
-            logging.debug(
-                f"MealEncoder: Transformer encoder output shape: {meal_attn_out.shape}"
-            )
-
-        meal_timestep_emb = meal_attn_out[:, 0, :]  # [B*T, embed_dim]
-        meal_timestep_emb = meal_timestep_emb.view(B, T, self.embed_dim)
-
-        if VERBOSE_LOGGING:
-            logging.debug(
-                f"MealEncoder: Final meal timestep embedding shape: {meal_timestep_emb.shape}"
-            )
+        # Pass through the transformer encoder.
+        meal_attn_out = self.encoder(meal_token_emb, src_key_padding_mask=pad_mask)
+        # Return the embedding corresponding to the start token as the timestep embedding.
+        meal_timestep_emb = meal_attn_out[:, 0, :]  # [B*T, hidden_dim]
+        meal_timestep_emb = meal_timestep_emb.view(B, T, self.hidden_dim)
         return meal_timestep_emb
 
 
@@ -179,54 +170,54 @@ class GlucoseEncoder(nn.Module):
             logging.debug(f"GlucoseEncoder: Input glucose_seq shape: {glucose_seq.shape}")
         x = glucose_seq.unsqueeze(-1)  # [B, T, 1]
         x = self.glucose_proj(x)       # [B, T, embed_dim]
-        log_tensor_stats("Glucose projection", x)
+        # log_tensor_stats("Glucose projection", x)
 
         pos_indices = torch.arange(T, device=glucose_seq.device)
         pos_enc = self.pos_emb(pos_indices).unsqueeze(0)  # [1, T, embed_dim]
         x = x + pos_enc
-        log_tensor_stats("Glucose with pos enc", x)
+        # log_tensor_stats("Glucose with pos enc", x)
 
         x = self.encoder(x)
-        log_tensor_stats("Glucose encoder output", x)
+        # log_tensor_stats("Glucose encoder output", x)
         return x
 
 
 class MealGlucoseForecastModel(pl.LightningModule):
     def __init__(
         self,
-        embed_dim=32,
-        num_foods=100,
-        macro_dim=5,
-        max_meals=11,
-        glucose_seq_len=20,
-        forecast_horizon=4,
-        num_heads=4,
-        enc_layers=1,
-        residual_pred=True,
+        food_embed_dim: int,
+        hidden_dim: int,
+        num_foods: int,
+        macro_dim: int,
+        max_meals: int = 11,
+        glucose_seq_len: int = 20,
+        forecast_horizon: int = 4,
+        num_heads: int = 4,
+        enc_layers: int = 1,
+        residual_pred: bool = True,
     ):
         super(MealGlucoseForecastModel, self).__init__()
-        self.embed_dim = embed_dim
+        self.food_embed_dim = food_embed_dim
+        self.hidden_dim = hidden_dim
+        self.max_meals = max_meals
         self.num_foods = num_foods
+        self.macro_dim = macro_dim
         self.forecast_horizon = forecast_horizon
         self.residual_pred = residual_pred
 
         self.meal_encoder = MealEncoder(
-            embed_dim, num_foods, macro_dim, max_meals, num_heads, num_layers=enc_layers
+            food_embed_dim, hidden_dim, num_foods, macro_dim, max_meals, num_heads, num_layers=enc_layers
         )
         self.glucose_encoder = GlucoseEncoder(
-            embed_dim, num_heads, num_layers=enc_layers, max_seq_len=glucose_seq_len
-        )
-        self.future_meal_encoder = MealEncoder(
-            embed_dim, num_foods, macro_dim, max_meals, num_heads, num_layers=enc_layers
+            hidden_dim, num_heads, enc_layers, glucose_seq_len
         )
 
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=embed_dim, num_heads=num_heads, batch_first=True
+            embed_dim=hidden_dim, num_heads=num_heads, batch_first=True
         )
 
-        hidden_dim = embed_dim * 2
         self.forecast_mlp = nn.Sequential(
-            nn.Linear(embed_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, forecast_horizon),
         )
@@ -246,34 +237,37 @@ class MealGlucoseForecastModel(pl.LightningModule):
     ):
         logging.debug("MealGlucoseForecastModel: --- Forward Pass Start ---")
 
-        glucose_enc = self.glucose_encoder(past_glucose)  # [B, T, embed_dim]
+        glucose_enc = self.glucose_encoder(past_glucose)  # [B, T, hidden_dim]
         past_meal_enc = self.meal_encoder(
             past_meal_ids, past_meal_macros
-        )  # [B, T, embed_dim]
-        future_meal_enc = self.future_meal_encoder(
+        )  # [B, T, hidden_dim]
+        future_meal_enc = self.meal_encoder(
             future_meal_ids, future_meal_macros
-        )  # [B, forecast_horizon, embed_dim]
+        )  # [B, forecast_horizon, hidden_dim]
+
+        # Combine past and future meal encodings for cross attention
+        self.past_meal_len = past_meal_enc.size(1)
+        self.future_meal_len = future_meal_enc.size(1)
+        meal_enc_combined = torch.cat([past_meal_enc, future_meal_enc], dim=1)
 
         attn_output, attn_weights = self.cross_attn(
-            query=glucose_enc, key=past_meal_enc, value=past_meal_enc, need_weights=True
+            query=glucose_enc, key=meal_enc_combined, value=meal_enc_combined, need_weights=True
         )
 
-        combined_glucose = attn_output + glucose_enc  # [B, T, embed_dim]
+        combined_glucose = attn_output + glucose_enc  # [B, T, hidden_dim]
         self.last_attn_weights = attn_weights
 
         final_rep = torch.cat(
             [combined_glucose[:, -1, :], future_meal_enc[:, -1, :]], dim=-1
-        )  # [B, embed_dim*2]
-
+        )  # [B, hidden_dim*2]
+        
         pred_future = self.forecast_mlp(final_rep)  # [B, forecast_horizon]
 
         if self.residual_pred:
             last_val = past_glucose[:, -1].unsqueeze(1)
             pred_future = pred_future + last_val
 
-        # Unscale the output predictions using the provided helper
         pred_future = unscale_tensor(pred_future, target_scales)
-
         logging.debug("MealGlucoseForecastModel: --- Forward Pass End ---")
         if return_attn:
             return pred_future, past_meal_enc, attn_weights
@@ -301,13 +295,14 @@ class MealGlucoseForecastModel(pl.LightningModule):
             future_meal_ids,
             future_meal_macros,
             target_scales,
+            return_attn=True,
         )
 
         future_glucose_unscaled = (
             future_glucose * target_scales[:, 1].unsqueeze(1)
             + target_scales[:, 0].unsqueeze(1)
         )
-        val_loss = F.mse_loss(preds, future_glucose_unscaled)
+        val_loss = F.mse_loss(preds[0], future_glucose_unscaled)  # preds is a tuple now
         self.log("val_loss", val_loss, on_step=False, on_epoch=True)
 
         val_rmse = torch.sqrt(val_loss)
@@ -318,7 +313,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         past_glucose_unscaled = unscale_tensor(past_glucose, target_scales)
         baseline = past_glucose_unscaled[:, -2:].mean(dim=1)  # shape: [B]
 
-        pred_diff = preds - baseline.unsqueeze(1)  # [B, T_forecast]
+        pred_diff = preds[0] - baseline.unsqueeze(1)  # [B, T_forecast]
         true_diff = future_glucose_unscaled - baseline.unsqueeze(1)  # [B, T_forecast]
 
         pred_iAUC = torch.trapz(torch.clamp(pred_diff, min=0), dx=1, dim=1)  # [B]
@@ -334,14 +329,17 @@ class MealGlucoseForecastModel(pl.LightningModule):
             }
         )
 
+        # Store forecast examples and the attention weights **from this batch**
         if batch_idx == 0:
             self.example_forecasts = {
                 "past": past_glucose_unscaled.detach().cpu(),
-                "pred": preds.detach().cpu(),
+                "pred": preds[0].detach().cpu(),
                 "truth": future_glucose_unscaled.detach().cpu(),
                 "future_meal_ids": future_meal_ids.detach().cpu(),
                 "past_meal_ids": past_meal_ids.detach().cpu(),
             }
+            # Save the attention weights from the same batch
+            self.example_attn_weights = preds[2].detach().cpu()
 
         return {"val_loss": val_loss, "pred_iAUC": pred_iAUC, "true_iAUC": true_iAUC}
 
@@ -350,7 +348,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             return
         outputs = self.val_outputs
 
-        # ----- Plot Forecast Examples -----
+        # ----- Plot Forecast Examples with Attention Heatmaps -----
         if self.example_forecasts is not None:
             forecasts = self.example_forecasts
             past = forecasts["past"]
@@ -359,32 +357,44 @@ class MealGlucoseForecastModel(pl.LightningModule):
             future_meal_ids = forecasts["future_meal_ids"]
             past_meal_ids = forecasts.get("past_meal_ids")
             num_examples = min(4, past.size(0))
+            
+            # Use fixed indices that are sampled once and re-used across epochs
+            if not hasattr(self, "fixed_forecast_indices"):
+                self.fixed_forecast_indices = random.sample(list(range(past.size(0))), num_examples)
+            sampled_indices = self.fixed_forecast_indices
 
-            fig, axs = plt.subplots(num_examples, 1, figsize=(12, 4 * num_examples))
+            # Create a figure with two columns:
+            # left: time series forecast; right: corresponding attention heatmap.
+            fig, axs = plt.subplots(num_examples, 2, figsize=(14, 4 * num_examples))
             if num_examples == 1:
                 axs = [axs]
+            
+            for i, idx in enumerate(sampled_indices):
+                # -- Left Plot: Forecast Time Series --
+                ax_ts = axs[i][0]
+                past_i = past[idx].numpy()
+                pred_i = pred[idx].numpy()
+                truth_i = truth[idx].numpy()
+                meals_i = future_meal_ids[idx].numpy()
+                if past_meal_ids is not None:
+                    past_meals_i = past_meal_ids[idx].numpy()
 
-            for i in range(num_examples):
-                past_i = past[i].numpy()
-                pred_i = pred[i].numpy()
-                truth_i = truth[i].numpy()
-                meals_i = future_meal_ids[i].numpy()
                 T_context = past_i.shape[0]
                 T_forecast = pred_i.shape[0]
 
                 x_hist = list(range(-T_context + 1, 1))
                 x_forecast = list(range(1, T_forecast + 1))
 
-                ax = axs[i]
-                ax.plot(x_hist, past_i, marker="o", label="Historical Glucose")
+                # Plot historical glucose
+                ax_ts.plot(x_hist, past_i, marker="o", label="Historical Glucose")
 
+                # Add vertical lines for historical meal consumption 
                 if past_meal_ids is not None:
-                    past_meals_i = past_meal_ids[i].numpy()
                     meal_label_added_hist = False
                     for j, x_coord in enumerate(x_hist):
                         if (past_meals_i[j] != 0).any():
                             if not meal_label_added_hist:
-                                ax.axvline(
+                                ax_ts.axvline(
                                     x=x_coord,
                                     color="green",
                                     linestyle="--",
@@ -393,50 +403,93 @@ class MealGlucoseForecastModel(pl.LightningModule):
                                 )
                                 meal_label_added_hist = True
                             else:
-                                ax.axvline(
+                                ax_ts.axvline(
                                     x=x_coord, color="green", linestyle="--", alpha=0.7
                                 )
 
-                ax.plot(x_forecast, truth_i, marker="o", label="Ground Truth Forecast")
-                ax.plot(x_forecast, pred_i, marker="o", label="Prediction Forecast")
+                # Plot ground truth and prediction for forecast
+                ax_ts.plot(x_forecast, truth_i, marker="o", label="Ground Truth Forecast")
+                ax_ts.plot(x_forecast, pred_i, marker="o", label="Prediction Forecast")
 
+                # Add vertical lines for future meal consumption
                 meal_label_added_forecast = False
                 for t, x_coord in enumerate(x_forecast):
                     if (meals_i[t] != 0).any():
                         if not meal_label_added_forecast:
-                            ax.axvline(
+                            ax_ts.axvline(
                                 x=x_coord,
                                 color="red",
                                 linestyle="--",
                                 alpha=0.7,
-                                label="Forecast Meal Consumption",
+                                label="Future Meal Consumption",
                             )
                             meal_label_added_forecast = True
                         else:
-                            ax.axvline(
+                            ax_ts.axvline(
                                 x=x_coord, color="red", linestyle="--", alpha=0.7
                             )
 
-                ax.set_xlabel("Relative Timestep")
-                ax.set_ylabel("Glucose Level")
-                ax.set_title(f"Forecast Example {i}")
-                ax.legend(fontsize="small")
+                ax_ts.set_xlabel("Relative Timestep")
+                ax_ts.set_ylabel("Glucose Level")
+                ax_ts.set_title(f"Forecast Example {i} (Dataset Index: {idx})")
+                ax_ts.legend(fontsize="small")
+
+                # -- Right Plot: Attention Heatmap --
+                ax_attn = axs[i][1]
+                # Retrieve the corresponding attention weights for the selected sample.
+                # self.last_attn_weights shape assumed: [B, T_glucose, T_meals]
+                # Here we pick the sample 'idx'. (If you wish, you might also average across heads.)
+                attn = self.example_attn_weights[idx].numpy()
+                # Get dimensions to label axes:
+                T_glucose, T_meals = attn.shape
+
+                # For the meal (key) axis, we combine past and future.
+                # We assume that during the forward pass, the combined meal encoding is nothing but a concatenation 
+                # of past and future meal encodings.
+                past_len = self.past_meal_len      # historical meals count
+                future_len = self.future_meal_len  # forecast meals count
+                key_tick_labels = [i - (past_len - 1) for i in range(past_len)] + [i + 1 for i in range(future_len)]
+                ax_attn.set_xticks(range(len(key_tick_labels)))
+                ax_attn.set_xticklabels(key_tick_labels, rotation=90, fontsize=8)
+
+                # For the glucose (query) axis, using the same labels as in the time series forecast.
+                query_tick_labels = list(range(-T_glucose + 1, 1))
+                ax_attn.set_yticks(range(T_glucose))
+                ax_attn.set_yticklabels(query_tick_labels, fontsize=8)
+                im = ax_attn.imshow(attn, aspect="auto", cmap="viridis")
+                ax_attn.set_xlabel("Meal Timestep")
+                ax_attn.set_ylabel("Glucose Timestep")
+                ax_attn.set_title(f"Attention Weights (Sample {idx})")
+                fig.colorbar(im, ax=ax_attn)
+
             fig.tight_layout()
             self.logger.experiment.log(
-                {"forecast_examples": wandb.Image(fig), "global_step": self.global_step}
+                {"forecast_samples": wandb.Image(fig), "global_step": self.global_step}
             )
             plt.close(fig)
+
             self.example_forecasts = None
 
-        # ----- Plot the Attention Heatmap -----
-        if self.last_attn_weights is not None:
-            attn = self.last_attn_weights[0].detach().cpu().numpy()
+        # ----- (Existing overall attention heatmap and scatter plot code follows) -----
+        if self.example_attn_weights is not None:
+            attn = self.example_attn_weights[0]
             fig, ax = plt.subplots(figsize=(8, 6))
-            cax = ax.imshow(attn, aspect="auto", cmap="viridis")
-            fig.colorbar(cax, ax=ax)
-            ax.set_xlabel("Past Meal Timestep")
-            ax.set_ylabel("Glucose Timestep")
+            past_len = self.past_meal_len
+            future_len = self.future_meal_len
+            past_tick_labels = [i - (past_len - 1) for i in range(past_len)]
+            future_tick_labels = [i + 1 for i in range(future_len)]
+            key_tick_labels = past_tick_labels + future_tick_labels
+            ax.set_xticks(range(len(key_tick_labels)))
+            ax.set_xticklabels(key_tick_labels, rotation=90, fontsize=8)
+            T_context = attn.shape[0]
+            query_tick_labels = list(range(-T_context + 1, 1))
+            ax.set_yticks(range(T_context))
+            ax.set_yticklabels(query_tick_labels, fontsize=8)
+            im = ax.imshow(attn, aspect="auto", cmap="viridis")
+            ax.set_xlabel("Meal Timestep")
+            ax.set_ylabel("Glucose Timestep (historical context)")
             ax.set_title("Cross-Attention Weights\n(Glucose Queries vs. Meal Keys)")
+            fig.colorbar(im, ax=ax)
             fig.tight_layout()
             self.logger.experiment.log(
                 {"attention_weights": wandb.Image(fig), "global_step": self.global_step}
@@ -472,9 +525,19 @@ class MealGlucoseForecastModel(pl.LightningModule):
         ax.set_xlabel("Real iAUC")
         ax.set_ylabel("Predicted iAUC")
         ax.set_title("Predicted vs. Real iAUC")
+        iAUC_corr_value = iAUC_corr.item()
+        ax.text(
+            0.05, 0.95,
+            f"iAUC Corr: {iAUC_corr_value:.3f}",
+            transform=ax.transAxes,
+            fontsize=12,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8)
+        )
         fig.tight_layout()
-
-        self.logger.experiment.log({"iAUC_scatter": wandb.Image(fig), "global_step": self.global_step})
+        self.logger.experiment.log(
+            {"iAUC_scatter": wandb.Image(fig), "global_step": self.global_step}
+        )
         plt.close(fig)
 
         self.val_outputs.clear()
@@ -518,9 +581,14 @@ class MealGlucoseForecastModel(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=1e-3)
+        return torch.optim.AdamW(self.parameters(), lr=1e-4, weight_decay=1e-5)
 
     def on_train_epoch_end(self):
+        # Explicitly log the meal encoder's parameters to WandB
+        for name, param in self.meal_encoder.named_parameters():
+            log_tensor_stats(f"MealEncoder/{name}", param, step=self.current_epoch)
+        
+        # Optionally, if you also want to log all parameters (including glucose encoder's etc.):
         for name, param in self.named_parameters():
             log_tensor_stats(f"Parameter/{name}", param, step=self.current_epoch)
 
@@ -661,7 +729,7 @@ def create_cached_dataset(
     # 3) If cache exists and caching is enabled, load & return immediately using torch.load
     if use_cache and os.path.exists(cache_file):
         logging.info(f"[CACHE-HIT] Loading pipeline from: {cache_file}")
-        cached_data = torch.load(cache_file)
+        cached_data = torch.load(cache_file, weights_only=False)
         return (
             cached_data["training_dataset"],
             cached_data["validation_dataset"],
@@ -892,9 +960,12 @@ def main(debug, no_cache):
 
     glucose_seq_len = min_encoder_length
     forecast_horizon = prediction_length
-    embedding_dim = 256
+    
+    food_embed_dim = 32
+    hidden_dim = 256    
+    
     num_heads = 4
-    enc_layers = 2
+    enc_layers = 4
     residual_pred = False
     batch_size = 1024
     max_epochs = 30
@@ -905,9 +976,9 @@ def main(debug, no_cache):
 
     cache_dir = "/scratch/mohanty/food/ppgr-v1/datasets-cache"
 
-    # -------------------------------------------------------------------------
+    ############################################################################
     # Use the new caching function with the no_cache flag
-    # -------------------------------------------------------------------------
+    ############################################################################
     (
         training_dataset,
         validation_dataset,
@@ -949,7 +1020,8 @@ def main(debug, no_cache):
     # Model Initialization
     ############################################################################
     model = MealGlucoseForecastModel(
-        embed_dim=embedding_dim,
+        food_embed_dim=food_embed_dim,
+        hidden_dim=hidden_dim,
         num_foods=training_dataset.num_foods,
         macro_dim=training_dataset.num_nutrients,
         max_meals=training_dataset.max_meals,
@@ -967,7 +1039,8 @@ def main(debug, no_cache):
         project=wandb_project,
         name=wandb_run_name,
         config={
-            "embed_dim": embedding_dim,
+            "food_embed_dim": food_embed_dim,
+            "hidden_dim": hidden_dim,
             "num_foods": training_dataset.num_foods,
             "macro_dim": training_dataset.num_nutrients,
             "max_meals": training_dataset.max_meals,
@@ -981,9 +1054,29 @@ def main(debug, no_cache):
     )
     logging.info("WandB Logger initialized.")
 
-    trainer = pl.Trainer(max_epochs=max_epochs, enable_checkpointing=False, logger=wandb_logger)
+    rich_model_summary = RichModelSummary(max_depth=2)
+    rich_progress_bar = RichProgressBar()
+
+    callbacks = [
+        rich_model_summary,
+        rich_progress_bar,
+    ]
+
+    profiler = "simple"
+    
+    trainer = pl.Trainer(
+        profiler=profiler,
+        max_epochs=max_epochs,
+        enable_checkpointing=False,
+        logger=wandb_logger,
+        callbacks=callbacks,
+    )
     logging.info("Starting training.")
-    trainer.fit(model, train_loader, val_loader)
+    trainer.fit(
+        model,
+        train_loader,
+        val_loader,
+    )
     logging.info("Training complete.")
 
     ############################################################################
