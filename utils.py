@@ -336,23 +336,29 @@ def scale_tensor(tensor, scales):
     return (tensor - mean) / std
 
 
-def unscale_tensor(tensor, scales):
+def unscale_tensor(tensor, target_scales):
     """
-    Unscale a tensor using provided scale factors.
+    Unscale a tensor using provided target scales.
     
-    Args:
-        tensor (torch.Tensor): The normalized tensor.
-        scales (torch.Tensor): Tensor of scale factors. Assumed to have shape 
-            [B, 2] or extra dims that can be collapsed. scales[:, 0] is the mean,
-            scales[:, 1] is the std.
-            
-    Returns:
-        torch.Tensor: The tensor transformed back to the original scale.
+    Applies the transformation:
+        unscaled = tensor * std + mean
+    where target_scales is expected to be of shape [B, 2] holding [mean, std] per sample.
     
-    Unscaling formula: original = normalized * std + mean
+    If 'tensor' has extra dimensions (e.g. shape [B, T, Q] or [B, T]),
+    the target_scales are reshaped to enable broadcasting.
+    
+    If target_scales is provided with only one column, the function assumes std=1.
     """
-    if scales.dim() > 2:
-        scales = scales.view(scales.size(0), -1)
-    mean = scales[:, 0].unsqueeze(1)
-    std = scales[:, 1].unsqueeze(1)
+    if target_scales.dim() == 2:
+        if target_scales.size(1) == 1:
+            extra_dims = [1] * (tensor.dim() - 1)
+            mean = target_scales[:, 0].view(-1, *extra_dims)
+            std = torch.ones_like(mean)
+        else:
+            extra_dims = [1] * (tensor.dim() - 1)
+            mean = target_scales[:, 0].view(-1, *extra_dims)
+            std = target_scales[:, 1].view(-1, *extra_dims)
+    else:
+        mean = target_scales[:, 0]
+        std = target_scales[:, 1]
     return tensor * std + mean 
