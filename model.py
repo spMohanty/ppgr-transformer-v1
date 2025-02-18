@@ -261,11 +261,13 @@ class MealGlucoseForecastModel(pl.LightningModule):
             [combined_glucose[:, -1, :], future_meal_enc[:, -1, :]], dim=-1
         )  # [B, hidden_dim*2]
         
-        pred_future = self.forecast_mlp(final_rep)  # [B, forecast_horizon]
-
-        if self.residual_pred:
-            last_val = past_glucose[:, -1].unsqueeze(1)
-            pred_future = pred_future + last_val
+        # Compute the forecast in full precision (FP32) regardless of training precision.
+        with torch.cuda.amp.autocast(enabled=False):
+            final_rep_fp32 = final_rep.float()
+            pred_future = self.forecast_mlp(final_rep_fp32)  # [B, forecast_horizon]
+            if self.residual_pred:
+                last_val = past_glucose[:, -1].unsqueeze(1).float()
+                pred_future = pred_future + last_val
 
         pred_future = unscale_tensor(pred_future, target_scales)
         logging.debug("MealGlucoseForecastModel: --- Forward Pass End ---")
@@ -884,16 +886,18 @@ def create_cached_dataset(
 @click.command()
 @click.option("--debug/--no-debug", default=False, help="Enable debug logging.")
 @click.option("--no-cache", is_flag=True, default=False, help="Ignore cached datasets and rebuild dataset from scratch.")
-def main(debug, no_cache):
+@click.option("--precision", type=click.Choice(["32", "bf16"]), default="bf16", help="Training precision: bf16 or 32")
+def main(debug, no_cache, precision):
     """
     Main entry point of the script.
     Pass --debug to enable detailed logging.
     Pass --no-cache to ignore any cached datasets.
+    Pass --precision to set training precision (bf16 or 32).
     """
     global VERBOSE_LOGGING
     VERBOSE_LOGGING = debug
     logging.getLogger().setLevel(logging.DEBUG if debug else logging.INFO)
-    logging.info(f"Starting main block with debug={debug}, no_cache={no_cache}.")
+    logging.info(f"Starting main block with debug={debug}, no_cache={no_cache}, precision={precision}.")
 
     ############################################################################
     # Hyperparameters & Configurations
@@ -905,8 +909,8 @@ def main(debug, no_cache):
     validation_percentage = 0.2
     test_percentage = 0.2
 
-    is_food_anchored = True
-    sliding_window_stride = None
+    is_food_anchored = False
+    sliding_window_stride = 1
     use_meal_level_food_covariates = True
     use_microbiome_embeddings = True
     group_by_columns = ["timeseries_block_id"]
@@ -1049,6 +1053,7 @@ def main(debug, no_cache):
             "batch_size": batch_size,
             "optimizer_lr": optimizer_lr,
             "verbose_logging": VERBOSE_LOGGING,
+            "precision": precision,
         },
         log_model=True,
     )
@@ -1064,12 +1069,17 @@ def main(debug, no_cache):
 
     profiler = "simple"
     
+    # Convert the precision flag into a format accepted by the Trainer.
+    # Trainer expects an int for 32-bit training or "bf16" for bf16 training.
+    precision_value = int(precision) if precision == "32" else "bf16"
+
     trainer = pl.Trainer(
         profiler=profiler,
         max_epochs=max_epochs,
         enable_checkpointing=False,
         logger=wandb_logger,
         callbacks=callbacks,
+        precision=precision_value,
     )
     logging.info("Starting training.")
     trainer.fit(
