@@ -962,11 +962,11 @@ def main(debug, no_cache):
     forecast_horizon = prediction_length
     
     food_embed_dim = 32
-    hidden_dim = 256    
+    hidden_dim = 256
     
     num_heads = 4
     enc_layers = 4
-    residual_pred = False
+    residual_pred = True
     batch_size = 1024
     max_epochs = 30
     optimizer_lr = 1e-4
