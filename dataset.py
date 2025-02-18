@@ -15,16 +15,16 @@ from utils import load_dataframe, enforce_column_types, setup_scalers_and_encode
 from pytorch_forecasting.data.encoders import (
     NaNLabelEncoder,
 )
-
+import torch
+from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 
 import p_tqdm
 
 import numpy as np
 
-import torch
-from torch.utils.data import Dataset
 
 
 def split_timeseries_df_based_on_food_intake_rows(
@@ -42,6 +42,8 @@ def split_timeseries_df_based_on_food_intake_rows(
     
     training_percentage = 1 - validation_percentage - test_percentage
     
+    df["read_at"] = pd.to_datetime(df["read_at"])
+    
     # sort dataframe by user_id and read_at to ensure that the data is in the correct order
     df = df.sort_values(by=["user_id", "read_at"]).reset_index(drop=True)
     
@@ -49,6 +51,9 @@ def split_timeseries_df_based_on_food_intake_rows(
         # Get indices where food intake occurred
         food_intake_indices = group[group["food_intake_row"] == 1].index.tolist()
         n_samples = len(food_intake_indices)
+        
+        if n_samples == 0:
+            continue
         
         # Calculate split points (in terms of the food intake rows)
         train_end = int(training_percentage * n_samples)
@@ -70,8 +75,12 @@ def split_timeseries_df_based_on_food_intake_rows(
         
         # Add checks to ensure that the validation data is later than the training data
         # and test data is later than validation data
-        assert validation_data_slices["read_at"].max() > training_data_slices["read_at"].max()
-        assert test_data_slices["read_at"].max() > validation_data_slices["read_at"].max()
+        try:
+            assert validation_data_slices["read_at"].max() > training_data_slices["read_at"].max()
+            assert test_data_slices["read_at"].max() > validation_data_slices["read_at"].max()
+        except Exception as e:
+            print(f"Error: {e}")
+            breakpoint()
         
         # Add the splits to their respective lists
         if not training_data_slices.empty:
@@ -230,9 +239,10 @@ class PPGRTimeSeriesDataset(Dataset):
         self.prepare_cross_index_of_ppgr_df_and_dishes_df()
     
     def merge_ppgr_and_user_demographics(self):
+        logger.debug("Merging ppgr_df and user_demographics_df")
         self.ppgr_df = self.ppgr_df.merge(self.user_demographics_df, on="user_id", how="left")
         self.ppgr_df = self.ppgr_df.sort_values(by=self.group_by_columns + [self.time_idx]).reset_index(drop=True)
-        
+        logger.debug("ppgr_df and user_demographics_df merged")
     
     def prepare_all_dataset_columns(self):
         
@@ -353,8 +363,10 @@ class PPGRTimeSeriesDataset(Dataset):
         and that the data is already normalized
         """
         self.microbiome_embeddings_df = self.microbiome_embeddings_df.sort_index() # Note: user_id is the index of the microbiome embeddings dataframe
-        assert set(self.ppgr_df["user_id"].astype(int).unique()) == set(self.microbiome_embeddings_df.index), "All user_ids in the ppgr_df must be present in the microbiome_embeddings_df, and vice versa"
+        # assert set(self.ppgr_df["user_id"].astype(int).unique()) == set(self.microbiome_embeddings_df.index), "All user_ids in the ppgr_df must be present in the microbiome_embeddings_df, and vice versa"
         
+        assert set(self.ppgr_df["user_id"].astype(int).unique()) - set(self.microbiome_embeddings_df.index) == set(), "All user_ids in the ppgr_df must have a microbiome embedding in the microbiome_embeddings_df, and vice versa"
+
         self.microbiome_tensor = torch.tensor(self.microbiome_embeddings_df.to_numpy()).to(self.device)
         self.user_id_to_microbiome_idx = {user_id: idx for idx, user_id in enumerate(self.microbiome_embeddings_df.index)}
         
@@ -594,6 +606,17 @@ class PPGRTimeSeriesDataset(Dataset):
         
         return dish_tensors_cat_for_this_slice, dish_tensors_real_for_this_slice, dish_tensors_recorded
 
+
+    def get_item_from_df(self, idx: int):
+        slice_metadata = self.timeseries_slices_indices[idx]
+        
+        slice_start, slice_end, encoder_length = self._get_slice_start_and_end(slice_metadata) # Takes care of randomizing the encoder length between min and max encoder lengths
+        slice_anchor = slice_metadata.anchor_row_idx
+        prediction_length = slice_end - slice_anchor 
+        
+        return self.ppgr_df.iloc[slice_start:slice_end+1][self.main_df_all_columns]
+        
+    
     def __getitem__(self, idx):
         slice_metadata = self.timeseries_slices_indices[idx]
         
@@ -613,7 +636,6 @@ class PPGRTimeSeriesDataset(Dataset):
         assert data_slice_encoder_tensor.shape[0] == encoder_length
         assert data_slice_prediction_window_tensor.shape[0] == prediction_length
         
-
         ############################################################
         # Gather Encoder Variables: 
         ############################################################        
@@ -680,8 +702,8 @@ class PPGRTimeSeriesDataset(Dataset):
         target_scales = self.target_scales # mean, std : This can be varying later if we want to normalize by user_id or other columns
 
         if self.use_meal_level_food_covariates:
-            x_dish_tensors_recorded = torch.tensor(x_dish_tensors_recorded, dtype=torch.int32).to(self.device), # [N]
-            y_dish_tensors_recorded = torch.tensor(y_dish_tensors_recorded, dtype=torch.int32).to(self.device), # [N']
+            x_dish_tensors_recorded = torch.tensor(x_dish_tensors_recorded, dtype=torch.int32).to(self.device) # [N]
+            y_dish_tensors_recorded = torch.tensor(y_dish_tensors_recorded, dtype=torch.int32).to(self.device) # [N']
         else:
             x_dish_tensors_recorded = None
             y_dish_tensors_recorded = None
@@ -727,7 +749,10 @@ class PPGRTimeSeriesDataset(Dataset):
             
             encoder_length = torch.tensor(encoder_length, dtype=torch.int32).to(self.device), # scalar 
             prediction_length = torch.tensor(prediction_length, dtype=torch.int32).to(self.device),    # converting to tensor so that the collate function doesnt need special cases.        
-                        
+            
+            
+            data_index = torch.tensor(idx, dtype=torch.int32).to(self.device), # scalar
+            
             # Metadata about the slice
             metadata = dict(
                 categorical_encoders = self.categorical_encoders,
@@ -770,6 +795,11 @@ class PPGRTimeSeriesDataset(Dataset):
 
         # Gather the column names and the encoder dict
         columns, encoder_dict = column_mapping[column_type]
+        
+        
+        # Handle the case of nested tensors
+        if values.is_nested:
+            raise Exception("Inverse Transform in case of meal level food covariates is not implemented yet.")
         
         # Check that the values are 2D tensor and handle empty tensor case
         assert len(values.shape) == 2
@@ -887,18 +917,147 @@ class PPGRTimeSeriesDataset(Dataset):
         return obj
 
 
+import torch
+from torch.utils.data import Dataset
+import torch.nn.functional as F
+
+class PPGRToMealGlucoseWrapper(Dataset):
+    """
+    A wrapper that converts a PPGRTimeSeriesDataset sample (returning a dictionary)
+    into the 6-tuple expected by the MealGlucoseForecastModel:
+    
+      (past_glucose, past_meal_ids, past_meal_macros, future_meal_ids, future_meal_macros, future_glucose)
+    
+    Additionally, it estimates:
+      - The maximum number of meals per timestep (`max_meals`)
+      - The total number of food IDs (`num_foods`), using the categorical encoder for "food_id"
+      - The number of nutrient dimensions (`num_nutrients`) from the underlying dataset's `food_reals` list.
+      
+    Assumptions:
+      - The PPGR sample uses meal-level food covariates.
+      - In the food categorical tensor, column index 1 holds the food ID.
+      - In the food real tensor, columns 2:5 (i.e. indices 2,3,4) are used for macronutrients.
+        (You can change these slices as needed, but `num_nutrients` will be derived from the full list
+         available in `ppgr_dataset.food_reals`.)
+    """
+    def __init__(self, ppgr_dataset: Dataset, max_meals: int = None, num_foods: int = None):
+        """
+        Args:
+            ppgr_dataset (Dataset): An instance of PPGRTimeSeriesDataset.
+            max_meals (int, optional): Maximum number of meals per timestep. If None, the wrapper
+                                       will use ppgr_dataset.max_meals_per_timestep if available;
+                                       otherwise, it defaults to 11.
+            num_foods (int, optional): Total number of distinct food IDs. If None, the wrapper will
+                                       attempt to extract it from ppgr_dataset.categorical_encoders["food_id"].
+        """
+        self.ppgr_dataset = ppgr_dataset
+        
+        # Determine max_meals from the dataset attribute if not explicitly provided
+        if max_meals is None:
+            if hasattr(ppgr_dataset, "max_meals_per_timestep"):
+                self.max_meals = ppgr_dataset.max_meals_per_timestep
+            else:
+                self.max_meals = 11  # default fallback
+        else:
+            self.max_meals = max_meals
+
+        # Determine num_foods from the food_id encoder if available
+        if num_foods is None:
+            if hasattr(ppgr_dataset, "categorical_encoders") and "food_id" in ppgr_dataset.categorical_encoders:
+                food_encoder = ppgr_dataset.categorical_encoders["food_id"]
+                # +1 for padding (assumed index 0)
+                self.num_foods = len(food_encoder.classes_) + 1
+            else:
+                self.num_foods = None
+        else:
+            self.num_foods = num_foods
+
+        # Determine the number of nutrient dimensions from the dataset's food_reals list.
+        if hasattr(ppgr_dataset, "food_reals"):
+            self.num_nutrients = len(ppgr_dataset.food_reals)
+        else:
+            self.num_nutrients = None
+
+    def __len__(self):
+        return len(self.ppgr_dataset)
+
+    def pad_or_truncate(self, x: torch.Tensor, target_size: int, dim: int = 1):
+        """
+        Pad (with zeros) or truncate the tensor along the specified dimension so that its size equals target_size.
+        """
+        current = x.size(dim)
+        if current == target_size:
+            return x
+        elif current < target_size:
+            pad_size = [0] * (2 * x.dim())
+            # Pad at the end along the specified dimension
+            pad_size[2 * (x.dim() - dim - 1)] = target_size - current
+            return F.pad(x, pad=pad_size, mode='constant', value=0)
+        else:
+            slices = [slice(None)] * x.dim()
+            slices[dim] = slice(0, target_size)
+            return x[tuple(slices)]
+        
+    def __getitem__(self, idx):
+        # Retrieve the original PPGR sample (a dict)
+        item = self.ppgr_dataset[idx]
+        
+        # ---------------------------
+        # Past (encoder) side:
+        # ---------------------------
+        # Past glucose: assume "x_real_target" has shape [T_enc, 1] → squeeze last dimension.
+        past_glucose = item["x_real_target"].squeeze(-1)  # shape: [T_enc]
+        
+        # Convert nested meal-level tensors to padded dense tensors.
+        x_food_cat = torch.nested.to_padded_tensor(item["x_food_cat"], padding=0)
+        x_food_real = torch.nested.to_padded_tensor(item["x_food_real"], padding=0)
+        
+        # Assume the food ID is stored in column index 1.
+        past_meal_ids = x_food_cat[:, :, 1].long()  # shape: [T_enc, N]
+        past_meal_ids = self.pad_or_truncate(past_meal_ids, self.max_meals, dim=1)
+        
+        # For the meal macros, assume columns 2:5 hold the desired macronutrients.
+        past_meal_macros = x_food_real[:, :, 2:5].float()  # shape: [T_enc, N, 3]
+        past_meal_macros = self.pad_or_truncate(past_meal_macros, self.max_meals, dim=1)
+        
+        # ---------------------------
+        # Future (prediction) side:
+        # ---------------------------
+        future_glucose = item["y_real_target"].squeeze(-1)  # shape: [T_pred]
+        y_food_cat = torch.nested.to_padded_tensor(item["y_food_cat"], padding=0)
+        y_food_real = torch.nested.to_padded_tensor(item["y_food_real"], padding=0)
+        
+        future_meal_ids = y_food_cat[:, :, 1].long()  # shape: [T_pred, N]
+        future_meal_ids = self.pad_or_truncate(future_meal_ids, self.max_meals, dim=1)
+        
+        future_meal_macros = y_food_real[:, :, 2:5].float()  # shape: [T_pred, N, 3]
+        future_meal_macros = self.pad_or_truncate(future_meal_macros, self.max_meals, dim=1)
+        
+        # Return the 6-tuple.
+        return (past_glucose,           # [T_enc]
+                past_meal_ids,          # [T_enc, max_meals]
+                past_meal_macros,       # [T_enc, max_meals, 3]
+                future_meal_ids,        # [T_pred, max_meals]
+                future_meal_macros,     # [T_pred, max_meals, 3]
+                future_glucose)         # [T_pred]
+
 
 if __name__ == "__main__":
 
     dataset_version = "v0.4"
     debug_mode = True
 
-    max_encoder_length = 48*4
-    max_prediction_length = 2*4
+    min_encoder_length = 8 * 4 # 8 hours with 4 timepoints per hour
+    prediction_length = 2 * 4 # 2 hours with 4 timepoints per hour
+    
     validation_percentage = 0.2
     test_percentage = 0.2
 
-    use_meal_level_food_covariates = False
+
+    is_food_anchored = True # When False, its the standard sliding window timeseries, but when True, every timeseries will have a food intake row at the last item of the context window
+    sliding_window_stride = None # This has to change everytime is_food_anchored is changed
+    
+    use_meal_level_food_covariates = True
     
     use_microbiome_embeddings = True
     
@@ -966,13 +1125,11 @@ if __name__ == "__main__":
                                             target_columns = ["val"],                                                                                    
                                             group_by_columns = ["timeseries_block_id"],
 
-                                            is_food_anchored = False, # When False, its the standard sliding window timeseries, but when True, every timeseries will have a food intake row at the last item of the context window
-                                            sliding_window_stride = 1, # This has to change everytime is_food_anchored is changed
+                                            is_food_anchored = is_food_anchored, # When False, its the standard sliding window timeseries, but when True, every timeseries will have a food intake row at the last item of the context window
+                                            sliding_window_stride = sliding_window_stride, # This has to change everytime is_food_anchored is changed
 
-                                            min_encoder_length = 8 * 4, # 8 hours with 4 timepoints per hour
-                                            max_encoder_length = False , # 12 hours with 4 timepoints per hour. Use False to disable randomization
-                                            
-                                            prediction_length = 2 * 4, # 2 hours with 4 timepoints per hour
+                                            min_encoder_length = min_encoder_length, # 8 hours with 4 timepoints per hour
+                                            prediction_length = prediction_length, # 2 hours with 4 timepoints per hour
                                             
                                             use_food_covariates_from_prediction_window = True,
                                             
@@ -997,9 +1154,25 @@ if __name__ == "__main__":
     print(f"Length of training dataset: {len(training_dataset)}")
 
     
-    # data = training_dataset[0]
-
-    # aggregated_df, encoder_df, decoder_df = training_dataset.inverse_transform_item(data)
+    # for k in range(5):
+    #     print("-"*50)
+    #     print(f"Data point {k}")
+    #     print("-"*50)
+    #     data = training_dataset[k]
+    #     print(data)
+    #     print(training_dataset.get_item_from_df(k))
+    #     break
+    #     # aggregated_df, encoder_df, decoder_df = training_dataset.inverse_transform_item(data)
+    #     # print("=="*100)
+    #     # print(encoder_df)
+    #     # print("=="*100)
+    #     # print(decoder_df)
+        
+    
+    
+    
+    
+    
     # display(encoder_df)
     # display(decoder_df)
 
@@ -1014,24 +1187,30 @@ if __name__ == "__main__":
             
     
     
-    train_loader = DataLoader(
-        training_dataset,   # your PPGRTimeSeriesDataset instance
-        batch_size=512,
-        shuffle=True,
-        num_workers=1, # When using the data directly on GPU, ensure num_workers is 1
-        collate_fn=ppgr_collate_fn
-    )
+    # train_loader = DataLoader(
+    #     training_dataset,   # your PPGRTimeSeriesDataset instance
+    #     batch_size=512,
+    #     shuffle=True,
+    #     num_workers=1, # When using the data directly on GPU, ensure num_workers is 1
+    #     collate_fn=ppgr_collate_fn
+    # )
     
-    # print(training_dataset[0])
+    # # print(training_dataset[0])
 
-    ppgr_collate_fn([training_dataset[0], training_dataset[1], training_dataset[2]])
+    # # ppgr_collate_fn([training_dataset[0], training_dataset[1], training_dataset[2]])
     
-    # Example: Iterate through one batch
-    for batch in tqdm(train_loader):
-        # Now batch is a dictionary where variable-length sequences have been padded.
-        # print("x_temporal_cat shape:", batch["x_temporal_cat"].shape)
-        # print("relative_time_idx shape:", batch.get("relative_time_idx", None))
-        # Process your batch...
-        # breakpoint()
-        pass
+    # # Example: Iterate through one batch
+    # for batch in tqdm(train_loader):
+    #     # Now batch is a dictionary where variable-length sequences have been padded.
+    #     # print("x_temporal_cat shape:", batch["x_temporal_cat"].shape)
+    #     # print("relative_time_idx shape:", batch.get("relative_time_idx", None))
+    #     # Process your batch...
+    #     # breakpoint()
+    #     breakpoint()
+    #     pass
 
+
+
+
+    wrapped_dataset = PPGRToMealGlucoseWrapper(training_dataset)
+    breakpoint()

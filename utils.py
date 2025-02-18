@@ -27,6 +27,7 @@ def load_dataframe(dataset_version: str, debug_mode: bool) -> tuple[pd.DataFrame
     Load processed CSV files for the PPGR, user demographics data, microbiome embeddings, granular food intake data.
     User IDs are converted to strings, and ppgr_df is sorted by user_id, timeseries_block_id, and read_at.
     """
+    logger.info(f"Loading dataframe for dataset version {dataset_version}")
     prefix = "debug-" if debug_mode else ""
     subdir = "debug/" if debug_mode else ""
 
@@ -75,6 +76,7 @@ def enforce_column_types(
     Ensure that each column in categorical_columns is cast to str and each column in real_columns to float.
     If a column exists in both dataframes, it will be cast in both.
     """
+    logger.info("Enforcing column types")
     for col in categorical_columns:
         casted = False
         if col in ppgr_df.columns:
@@ -109,6 +111,7 @@ def get_all_dishes_in_df(df: pd.DataFrame) -> list[str]:
     """
     Get all the dishes in the dataframe.
     """
+    logger.info("Getting all dishes in dataframe")
     dish_candidates = df["dish_id"].dropna().unique()
     dish_ids = []
     for dish_candidate_row in dish_candidates:
@@ -134,10 +137,12 @@ def setup_scalers_and_encoders(
     The categorical encoders (NaNLabelEncoder) are fit on the full dataset while the continuous scalers 
     (StandardScaler) are fit only on the training set to avoid data leakage.
     """
+    logger.info("Setting up scalers and encoders")
     # Initialize and fit categorical encoders
     categorical_encoders: dict[str, NaNLabelEncoder] = {}
         
     for col in categorical_columns:
+        logger.info(f"Setting up categorical encoder for column {col}")
         encoder = NaNLabelEncoder(add_nan=True, warn=True)
         if col in ppgr_df.columns:
             # In case of food columns, check if we want to use the granular food data or the aggregated food data
@@ -163,6 +168,7 @@ def setup_scalers_and_encoders(
     
     continuous_scalers: dict[str, StandardScaler] = {}
     for col in real_columns:
+        logger.info(f"Setting up continuous scaler for column {col}")
         if col in training_df.columns:
             # In case of food columns, check if we want to use the granular food data or the aggregated food data
             if col.startswith("food__") and use_meal_level_food_covariates:
@@ -204,7 +210,7 @@ def ppgr_collate_fn(batch):
     max_encoder_len = max(encoder_lengths)
     max_prediction_len = max(prediction_lengths)
 
-    if batch[0]["metadata"]["use_meal_level_food_covariates"]:    
+    if batch[0]["metadata"]["use_meal_level_food_covariates"]:
         # Get the number of dishes recorded for each timestep in the batch element
         encoder_dish_tensors_recorded = torch.stack([item["x_dish_tensors_recorded"] for item in batch])
         prediction_dish_tensors_recorded = torch.stack([item["y_dish_tensors_recorded"] for item in batch])
