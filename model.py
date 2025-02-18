@@ -193,6 +193,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         max_meals: int = 11,
         glucose_seq_len: int = 20,
         forecast_horizon: int = 4,
+        eval_window: int = None,  # New parameter for evaluation window length.
         num_heads: int = 4,
         enc_layers: int = 1,
         residual_pred: bool = True,
@@ -200,15 +201,18 @@ class MealGlucoseForecastModel(pl.LightningModule):
         loss_iAUC_weight: float = 1,  # New hyperparameter for iAUC loss weight
     ):
         super(MealGlucoseForecastModel, self).__init__()
+        self.forecast_horizon = forecast_horizon
+        # If eval_window isn't provided, use the full forecast duration.
+        self.eval_window = eval_window if eval_window is not None else forecast_horizon
+
         self.food_embed_dim = food_embed_dim
         self.hidden_dim = hidden_dim
         self.max_meals = max_meals
         self.num_foods = num_foods
         self.macro_dim = macro_dim
-        self.forecast_horizon = forecast_horizon
         self.residual_pred = residual_pred
         self.num_quantiles = num_quantiles
-        self.loss_iAUC_weight = loss_iAUC_weight  # Store the iAUC loss weight
+        self.loss_iAUC_weight = loss_iAUC_weight
 
         self.meal_encoder = MealEncoder(
             food_embed_dim, hidden_dim, num_foods, macro_dim, max_meals, num_heads, num_layers=enc_layers
@@ -221,7 +225,6 @@ class MealGlucoseForecastModel(pl.LightningModule):
             embed_dim=hidden_dim, num_heads=num_heads, batch_first=True
         )
 
-        # Now output forecast_horizon * num_quantiles values; later we reshape.
         self.forecast_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
@@ -318,13 +321,12 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.log("train_quantile_loss", q_loss, on_step=True, on_epoch=True, prog_bar=True)
 
         # Compute the median forecast (assumed to be at index 3 for 7 quantiles).
-        median_pred = preds[:, :, 3]
-        rmse = torch.sqrt(F.mse_loss(median_pred, future_glucose_unscaled))
-        self.log("train_rmse", rmse, on_step=False, on_epoch=True, prog_bar=True)
+        median_pred = preds[:, :, 3]  # shape: [B, forecast_horizon]
 
-        # --- New: Compute iAUC Loss ---
-        # The compute_iAUC function returns the iAUC for the median forecast and the true future values.
-        pred_iAUC, true_iAUC = compute_iAUC(median_pred, future_glucose, past_glucose, target_scales)
+        # Compute iAUC using only the evaluation window (first self.eval_window timesteps).
+        pred_iAUC, true_iAUC = compute_iAUC(
+            median_pred, future_glucose, past_glucose, target_scales, eval_window=self.eval_window
+        )
         iAUC_loss = F.mse_loss(pred_iAUC, true_iAUC)
         
         weighted_iAUC_loss = self.loss_iAUC_weight * iAUC_loss
@@ -361,21 +363,30 @@ class MealGlucoseForecastModel(pl.LightningModule):
             return_attn=True,
         )
         # preds[0] shape: [B, forecast_horizon, num_quantiles]
-        median_pred = preds[0][:, :, 3]
+        median_pred = preds[0][:, :, 3]  # shape: [B, forecast_horizon]
+
+        # Unscale future glucose values.
         future_glucose_unscaled = (
             future_glucose * target_scales[:, 1].unsqueeze(1) + target_scales[:, 0].unsqueeze(1)
         )
+
+        # Evaluate only over the evaluation window.
+        past_glucose_unscaled = unscale_tensor(past_glucose, target_scales)
+        baseline = past_glucose_unscaled[:, -2:].mean(dim=1)  # shape: [B]
+
+        # Slice the predicted and true glucose values to the evaluation window.
+        median_pred_eval = median_pred[:, :self.eval_window]
+        future_glucose_unscaled_eval = future_glucose_unscaled[:, :self.eval_window]
+
         val_q_loss = quantile_loss(preds[0], future_glucose_unscaled, self.quantiles)
-        val_rmse = torch.sqrt(F.mse_loss(median_pred, future_glucose_unscaled))
+        val_rmse = torch.sqrt(F.mse_loss(median_pred_eval, future_glucose_unscaled_eval))
         self.log("val_quantile_loss", val_q_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val_rmse", val_rmse, on_step=False, on_epoch=True, prog_bar=True)
         logging.debug(f"Validation quantile loss: {val_q_loss.item()}")
 
-        # --- iAUC Calculation using median forecast ---
-        past_glucose_unscaled = unscale_tensor(past_glucose, target_scales)
-        baseline = past_glucose_unscaled[:, -2:].mean(dim=1)  # shape: [B]
-        pred_diff = median_pred - baseline.unsqueeze(1)  # [B, T_forecast]
-        true_diff = future_glucose_unscaled - baseline.unsqueeze(1)  # [B, T_forecast]
+        # --- iAUC Calculation using median forecast over the evaluation window ---
+        pred_diff = median_pred_eval - baseline.unsqueeze(1)  # [B, eval_window]
+        true_diff = future_glucose_unscaled_eval - baseline.unsqueeze(1)  # [B, eval_window]
         pred_iAUC = torch.trapz(torch.clamp(pred_diff, min=0), dx=1, dim=1)  # [B]
         true_iAUC = torch.trapz(torch.clamp(true_diff, min=0), dx=1, dim=1)  # [B]
 
@@ -881,8 +892,10 @@ def main(debug, no_cache, precision):
     ############################################################################
     dataset_version = "v0.4"
     debug_mode = debug
-    min_encoder_length = 8 * 4
-    prediction_length = 2 * 4
+    min_encoder_length = 12 * 4
+    prediction_length = 12 * 4
+    eval_window = 2 * 4
+
     validation_percentage = 0.2
     test_percentage = 0.2
 
@@ -942,8 +955,8 @@ def main(debug, no_cache, precision):
     glucose_seq_len = min_encoder_length
     forecast_horizon = prediction_length
     
-    food_embed_dim = 64
-    hidden_dim = 128
+    food_embed_dim = 128
+    hidden_dim = 256
     
     num_heads = 4
     enc_layers = 4
@@ -1008,6 +1021,7 @@ def main(debug, no_cache, precision):
         max_meals=training_dataset.max_meals,
         glucose_seq_len=glucose_seq_len,
         forecast_horizon=forecast_horizon,
+        eval_window=eval_window,
         num_heads=num_heads,
         enc_layers=enc_layers,
         residual_pred=residual_pred,
@@ -1029,6 +1043,7 @@ def main(debug, no_cache, precision):
             "max_meals": training_dataset.max_meals,
             "glucose_seq_len": glucose_seq_len,
             "forecast_horizon": forecast_horizon,
+            "eval_window": eval_window,
             "batch_size": batch_size,
             "optimizer_lr": optimizer_lr,
             "verbose_logging": VERBOSE_LOGGING,
@@ -1118,7 +1133,7 @@ def quantile_loss(predictions, targets, quantiles):
     return losses.mean()
 
 
-def compute_iAUC(median_pred, future_glucose, past_glucose, target_scales):
+def compute_iAUC(median_pred, future_glucose, past_glucose, target_scales, eval_window=None):
     """
     Compute the integrated Area Under the Curve (iAUC) for the median forecast predictions and the ground truth.
 
@@ -1127,21 +1142,26 @@ def compute_iAUC(median_pred, future_glucose, past_glucose, target_scales):
     - future_glucose: Tensor of shape [B, forecast_horizon], representing the future observed glucose values.
     - past_glucose: Tensor of shape [B, T], representing the historical glucose values.
     - target_scales: Tensor of shape [B, 2] containing the (offset, scale) for unscaling.
+    - eval_window: Optional int. If provided, only the first eval_window timesteps of the forecast are used.
     
     Returns:
-    - pred_iAUC: Tensor of shape [B], the integrated area under the curve for the predictions.
-    - true_iAUC: Tensor of shape [B], the integrated area under the curve for the ground truth.
+    - pred_iAUC: Tensor of shape [B], the integrated area under the curve for the predictions over the eval window.
+    - true_iAUC: Tensor of shape [B], the integrated area under the curve for the ground truth over the eval window.
     """
     past_glucose_unscaled = unscale_tensor(past_glucose, target_scales)  # [B, T]
     future_glucose_unscaled = (
         future_glucose * target_scales[:, 1].unsqueeze(1) + target_scales[:, 0].unsqueeze(1)
     )
+    if eval_window is not None:
+        median_pred = median_pred[:, :eval_window]
+        future_glucose_unscaled = future_glucose_unscaled[:, :eval_window]
+
     # The baseline is defined as the mean of the last two values of the unscaled past glucose.
     baseline = past_glucose_unscaled[:, -2:].mean(dim=1)  # shape: [B]
     pred_diff = median_pred - baseline.unsqueeze(1)
     true_diff = future_glucose_unscaled - baseline.unsqueeze(1)
-    pred_iAUC = torch.trapz(torch.clamp(pred_diff, min=0), dx=1, dim=1)
-    true_iAUC = torch.trapz(torch.clamp(true_diff, min=0), dx=1, dim=1)
+    pred_iAUC = torch.trapz(torch.clamp(pred_diff, min=0), dx=1, dim=1)  # [B]
+    true_iAUC = torch.trapz(torch.clamp(true_diff, min=0), dx=1, dim=1)  # [B]
     return pred_iAUC, true_iAUC
 
 

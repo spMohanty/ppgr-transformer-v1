@@ -338,27 +338,29 @@ def scale_tensor(tensor, scales):
 
 def unscale_tensor(tensor, target_scales):
     """
-    Unscale a tensor using provided target scales.
+    Unscale the given tensor using target_scales.
     
-    Applies the transformation:
-        unscaled = tensor * std + mean
-    where target_scales is expected to be of shape [B, 2] holding [mean, std] per sample.
+    If target_scales has two columns, the first column is treated as the offset and
+    the second as the scaling factor. If it only has one column, we assume that it's
+    the scaling factor and the offset is zero.
     
-    If 'tensor' has extra dimensions (e.g. shape [B, T, Q] or [B, T]),
-    the target_scales are reshaped to enable broadcasting.
+    tensor: A torch.Tensor to be unscaled.
+    target_scales: A torch.Tensor of shape [B, 1] or [B, 2].
     
-    If target_scales is provided with only one column, the function assumes std=1.
+    Returns:
+        The unscaled tensor.
     """
-    if target_scales.dim() == 2:
-        if target_scales.size(1) == 1:
-            extra_dims = [1] * (tensor.dim() - 1)
-            mean = target_scales[:, 0].view(-1, *extra_dims)
-            std = torch.ones_like(mean)
-        else:
-            extra_dims = [1] * (tensor.dim() - 1)
-            mean = target_scales[:, 0].view(-1, *extra_dims)
-            std = target_scales[:, 1].view(-1, *extra_dims)
+    if target_scales.size(1) == 1:
+        # Only a scaling factor is provided; assume offset=0.
+        offset = torch.zeros_like(target_scales)
+        scale = target_scales
     else:
-        mean = target_scales[:, 0]
-        std = target_scales[:, 1]
-    return tensor * std + mean 
+        offset = target_scales[:, 0]
+        scale = target_scales[:, 1]
+
+    # Ensure offset and scale are broadcastable with tensor.
+    # For example, if tensor is [B, T, ...], we want offset and scale to be [B, 1, ...]
+    for _ in range(tensor.ndim - 1):
+        offset = offset.unsqueeze(-1)
+        scale = scale.unsqueeze(-1)
+    return tensor * scale + offset 
