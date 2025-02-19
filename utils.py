@@ -9,6 +9,10 @@ from pytorch_forecasting.data.encoders import (
     NaNLabelEncoder,
     TorchNormalizer,
 )
+import ast
+
+from tqdm import tqdm
+tqdm.pandas()
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -48,11 +52,16 @@ def load_dataframe(dataset_version: str, debug_mode: bool) -> tuple[pd.DataFrame
         f"{prefix}dishes-data-{dataset_version}.csv"
     )
     
+    food_embeddings_path = (
+        f"data/processed/{dataset_version}/{subdir}"
+        f"{prefix}food-embeddings-{dataset_version}.pkl.gz"
+    )
+    
     ppgr_df = pd.read_csv(ppgr_path)
     users_demographics_df = pd.read_csv(demographics_path)
     microbiome_embeddings_df = pd.read_csv(microbiome_embeddings_path).set_index("user_id")
     dishes_df = pd.read_csv(dishes_path).reset_index(drop=True)
-    
+    food_embeddings_df = pd.read_pickle(food_embeddings_path) 
     
     # Convert user_id to string in both dataframes
     ppgr_df["user_id"] = ppgr_df["user_id"].astype(str)
@@ -62,7 +71,7 @@ def load_dataframe(dataset_version: str, debug_mode: bool) -> tuple[pd.DataFrame
     ppgr_df.sort_values(by=["user_id", "timeseries_block_id", "read_at"], inplace=True)
     logger.info(f"Loaded dataframe with {len(ppgr_df)} rows from {ppgr_path}")
     
-    return ppgr_df, users_demographics_df, dishes_df, microbiome_embeddings_df
+    return ppgr_df, users_demographics_df, dishes_df, microbiome_embeddings_df, food_embeddings_df
 
 
 def enforce_column_types(
