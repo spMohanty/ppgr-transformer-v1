@@ -6,6 +6,7 @@ import hashlib
 import logging
 import warnings
 import math
+import datetime
 
 from dataclasses import dataclass, asdict
 
@@ -41,126 +42,7 @@ from tqdm import tqdm
 from utils import create_click_options
 from plot_helpers import plot_meal_self_attention, plot_forecast_examples, plot_iAUC_scatter, plot_meal_self_attention
 
-# -----------------------------------------------------------------------------
-# Experiment Configuration
-# -----------------------------------------------------------------------------
-@dataclass
-class ExperimentConfig:
-    # Dataset / caching settings
-    dataset_version: str = "v0.5"
-    cache_dir: str = "/scratch/mohanty/food/ppgr-v1/datasets-cache"
-    use_cache: bool = True
-    debug_mode: bool = False
-    dataloader_num_workers: int = 7  # Added configurable dataloader_num_workers parameter
-
-    # Data splitting & sequence parameters
-    min_encoder_length: int = 8 * 4    # e.g., 8hrs * 4
-    prediction_length: int = 4 * 4     # e.g.,  4hrs * 4
-    eval_window: int = 2 * 4            # e.g., 2hrs * 4
-    validation_percentage: float = 0.1
-    test_percentage: float = 0.1
-    
-    
-    # Aggregation
-    patch_size: int = 1 * 4 # 1 hour patch size
-    patch_stride: int = 1  # 15 min stride
-    
-    meal_aggregator_type: str = "set"
-
-    # Data options
-    is_food_anchored: bool = True
-    sliding_window_stride: int = None
-    use_meal_level_food_covariates: bool = True
-    use_bootstraped_food_embeddings: bool = True
-    use_microbiome_embeddings: bool = True
-    group_by_columns: list = None
-
-    # Feature lists (users, food, temporal)
-    user_static_categoricals: list = None
-    user_static_reals: list = None
-    food_categoricals: list = None
-    food_reals: list = None
-    temporal_categoricals: list = None
-    temporal_reals: list = None
-    targets: list = None
-
-    # Model hyperparameters
-    food_embed_dim: int = 2048 # the number of dimensions from the pre-trained embeddings to use
-    food_embed_adapter_dim: int = 64 # the number of dimensions to project the food embeddings to for visualization purposes
-    hidden_dim: int = 256
-    num_heads: int = 4
-    transformer_encoder_layers: int = 2
-    transformer_decoder_layers: int = 2
-    residual_pred: bool = False
-    num_quantiles: int = 7
-    loss_iauc_weight: float = 0.00
-
-    # New dropout hyperparameters
-    dropout_rate: float = 0.1          # Used for projections, cross-attention, forecast MLP, etc.
-    transformer_dropout: float = 0.1   # Used within Transformer layers
-
-    # Training hyperparameters
-    batch_size: int = 1024 * 2
-    max_epochs: int = 50
-    optimizer_lr: float = 1e-4
-    weight_decay: float = 1e-5
-    gradient_clip_val: float = 0.1  # Added gradient clipping parameter
-
-    # WandB logging
-    wandb_project: str = "meal-representations-learning-v0"
-    wandb_run_name: str = "MealGlucoseForecastModel_Run"
-
-    # Precision
-    precision: str = "bf16"
-
-    # Batch size for projecting food embeddings when logging
-    food_embedding_projection_batch_size: int = 1024 * 4
-
-    # Plots (default: plots enabled)
-    disable_plots: bool = False
-
-    def __post_init__(self):
-        # Set default lists if not provided.
-        if self.group_by_columns is None:
-            self.group_by_columns = ["timeseries_block_id"]
-        if self.user_static_categoricals is None:
-            self.user_static_categoricals = [
-                "user_id", "user__edu_degree", "user__income",
-                "user__household_desc", "user__job_status", "user__smoking",
-                "user__health_state", "user__physical_activities_frequency",
-            ]
-        if self.user_static_reals is None:
-            self.user_static_reals = [
-                "user__age", "user__weight", "user__height",
-                "user__bmi", "user__general_hunger_level",
-                "user__morning_hunger_level", "user__mid_hunger_level",
-                "user__evening_hunger_level",
-            ]
-        if self.use_meal_level_food_covariates:
-            self.food_categoricals = ["food__food_group_cname", "food_id"]
-        else:
-            self.food_categoricals = [
-                "food__vegetables_fruits",
-                "food__grains_potatoes_pulses",
-                "food__unclassified",
-                "food__non_alcoholic_beverages",
-                "food__dairy_products_meat_fish_eggs_tofu",
-                "food__sweets_salty_snacks_alcohol",
-                "food__oils_fats_nuts",
-            ]
-        if self.food_reals is None:
-            self.food_reals = [
-                "food__eaten_quantity_in_gram", "food__energy_kcal_eaten",
-                "food__carb_eaten", "food__fat_eaten",
-                "food__protein_eaten", "food__fiber_eaten",
-                "food__alcohol_eaten",
-            ]
-        if self.temporal_categoricals is None:
-            self.temporal_categoricals = ["loc_eaten_dow", "loc_eaten_dow_type", "loc_eaten_season"]
-        if self.temporal_reals is None:
-            self.temporal_reals = ["loc_eaten_hour"]
-        if self.targets is None:
-            self.targets = ["val"]
+from config import ExperimentConfig, generate_experiment_name
 
 # -----------------------------------------------------------------------------
 #   - "TransformerEncoderLayerWithAttn" for single self-attention + feedforward
@@ -555,40 +437,8 @@ class MealEncoder(nn.Module):
             self.food_emb.weight.requires_grad = False  # Freeze the food id embeddings        
 
 # -----------------------------------------------------------------------------
-# Glucose Encoder (dropout configurable)
+# Glucose Encoder
 # -----------------------------------------------------------------------------
-class GlucoseEncoder(nn.Module):
-    def __init__(
-        self, embed_dim: int, num_heads: int = 4, num_layers: int = 1, max_seq_len: int = 100, dropout_rate: float = 0.2
-    ):
-        super(GlucoseEncoder, self).__init__()
-        self.embed_dim = embed_dim
-        self.glucose_proj = nn.Linear(1, embed_dim)
-        self.pos_emb = nn.Embedding(max_seq_len, embed_dim)
-        self.dropout = nn.Dropout(dropout_rate)
-
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=embed_dim * 2,
-            dropout=0.1,  # you can also use transformer_dropout if desired
-            batch_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-
-    def forward(self, glucose_seq: torch.Tensor) -> torch.Tensor:
-        glucose_seq = glucose_seq.to(next(self.parameters()).dtype)
-        B, T = glucose_seq.size()
-        x = glucose_seq.unsqueeze(-1)
-        x = self.glucose_proj(x)
-        x = self.dropout(x)  # dropout after projection
-        pos_indices = torch.arange(T, device=glucose_seq.device)
-        pos_enc = self.pos_emb(pos_indices).unsqueeze(0)
-        x = x + pos_enc
-        x = self.encoder(x)
-        return x
-
-
 class PatchedGlucoseEncoder(nn.Module):
     def __init__(
         self, embed_dim: int, patch_size: int, patch_stride: int, num_heads: int = 4, num_layers: int = 1, max_seq_len: int = 100, dropout_rate: float = 0.2
@@ -598,17 +448,10 @@ class PatchedGlucoseEncoder(nn.Module):
         self.patch_size = patch_size
         self.patch_stride = patch_stride
 
-        # For patch embedding:
-        # If using a simple linear projection: (patch_size) -> (embed_dim)
+        # Simple linear projection from each patch to embed_dim
         self.patch_proj = nn.Linear(patch_size, embed_dim)
 
-        # The maximum number of patches you could get is roughly max_seq_len / patch_size
-        # so create enough positional embeddings for that many patches.
-        max_num_patches = (max_seq_len - patch_size) // patch_stride + 1
-        self.pos_emb = nn.Embedding(max_num_patches, embed_dim)
-
-
-        # You can use a TransformerEncoder or your custom TransformerEncoderWithAttn
+        # Encoder Layer
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -616,11 +459,12 @@ class PatchedGlucoseEncoder(nn.Module):
             dropout=dropout_rate,
             batch_first=True,
         )
+        # Encoder
         self.transformer = nn.TransformerEncoder(
             encoder_layer,
             num_layers=num_layers
         )
-        
+        # Dropout
         self.dropout = nn.Dropout(dropout_rate)
 
     def forward(self, glucose_seq: torch.Tensor) -> torch.Tensor:
@@ -632,9 +476,11 @@ class PatchedGlucoseEncoder(nn.Module):
         # for overlapping patches, you'd do a more advanced fold/unfold or 1D strided approach
         # but let's do the simplest approach first:
         patch_list = []
+        patch_indices = [] # we need to send it back to the main model (for adding positional embeddings)
         for start in range(0, T - self.patch_size + 1, self.patch_stride):
             patch = glucose_seq[:, start:start + self.patch_size]  # shape (B, patch_size)
             patch_list.append(patch.unsqueeze(1))  # shape => (B, 1, patch_size)
+            patch_indices.append(start) # lets just use the index of the first element of the patch
         
         if len(patch_list) == 0:
             # Edge case: if T < patch_size. Might need a fallback or zero-padding
@@ -642,6 +488,7 @@ class PatchedGlucoseEncoder(nn.Module):
             patch_list = [F.pad(glucose_seq, (0, self.patch_size - T))[:, None, :]]
         
         patches = torch.cat(patch_list, dim=1)  # shape => (B, N_patches, patch_size)
+        
         # 2) Project each patch into embed_dim
         # We can flatten or keep it as is for linear layer
         # shape => (B*N_patches, patch_size)
@@ -652,17 +499,11 @@ class PatchedGlucoseEncoder(nn.Module):
         patch_emb = self.patch_proj(patches)  # (B*N_patches, embed_dim)
         patch_emb = self.dropout(patch_emb)
         patch_emb = patch_emb.view(B_np, N_patches, -1)  # => (B, N_patches, embed_dim)
-
-        # 3) Add positional embedding
-        # pos_indices => [0..N_patches-1]
-        pos_indices = torch.arange(N_patches, device=glucose_seq.device)
-        pos_enc = self.pos_emb(pos_indices).unsqueeze(0)  # shape (1, N_patches, embed_dim)
-        patch_emb = patch_emb + pos_enc
         
-        # 4) Run Transformer on patches
+        # Transformer on patches
         patch_emb = self.transformer(patch_emb)  # => (B, N_patches, embed_dim)
         
-        return patch_emb
+        return patch_emb, torch.tensor(patch_indices, device=patch_emb.device)
 
 # -----------------------------------------------------------------------------
 # MealGlucoseForecastModel with configurable dropout parameters
@@ -716,7 +557,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.food_embedding_projection_batch_size = food_embedding_projection_batch_size
         self.disable_plots = disable_plots
         
-        # 1) Meal Encoder (transformer-based)
+        # 1) Meal Encoder
         self.meal_encoder = MealEncoder(
             food_embed_dim, food_embed_adapter_dim, hidden_dim,
             num_foods, macro_dim, max_meals,
@@ -739,7 +580,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             dropout_rate=dropout_rate
         )
 
-        # 3) Transformer Decoder (unified style)
+        # 3) Transformer Decoder
         dec_layer = TransformerDecoderLayerWithAttn(
             d_model=hidden_dim,
             nhead=num_heads,
@@ -762,9 +603,9 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Register the quantiles as a buffer
         self.register_buffer("quantiles", torch.linspace(0.05, 0.95, steps=self.num_quantiles))
         
-        # time-based positional embedding for the meal time dimension
-        max_meal_time = glucose_seq_len + forecast_horizon + 20  # or some safe upper bound
-        self.meal_time_emb = nn.Embedding(max_meal_time, hidden_dim)
+        # global time-based positional embedding
+        max_time = glucose_seq_len + forecast_horizon + 2000  # a safe upper bound
+        self.time_emb = nn.Embedding(max_time, hidden_dim)
         
 
     def forward(
@@ -783,10 +624,19 @@ class MealGlucoseForecastModel(pl.LightningModule):
         or a tuple if return_attn=True: 
           (pred_future, past_meal_enc, attn_past, future_meal_enc, attn_future, meal_self_attn_past, meal_self_attn_future)
         """
-        # 1) Encode glucose
-        glucose_enc = self.glucose_encoder(past_glucose)  # [B, G_patches, hidden_dim]
-
-        # 2) Encode past & future meals (optionally returning meal self-attn)
+        device = past_glucose.device
+        B = past_glucose.size(0)
+        
+        # 1) Encode glucose => shape [B, G_patches, hidden_dim]
+        glucose_enc, patch_indices = self.glucose_encoder(past_glucose)
+        n_glucose_patches = glucose_enc.size(1)  # how many patches
+        
+        # glucose_enc => [B, n_glucose_patches, hidden_dim]
+        # We'll broadcast the patch_indices shape => [B, n_patches], do the same embed
+        glucose_enc = glucose_enc + self.time_emb(patch_indices) # Postional Embedding
+        
+        
+        # 2) Encode past & future meals => [B, T_pastMeal, hidden_dim], [B, T_futureMeal, hidden_dim]
         if return_meal_self_attn:
             past_meal_enc, meal_self_attn_past = self.meal_encoder(
                 past_meal_ids, past_meal_macros, return_self_attn=True
@@ -799,31 +649,60 @@ class MealGlucoseForecastModel(pl.LightningModule):
             future_meal_enc = self.meal_encoder(future_meal_ids, future_meal_macros)
             meal_self_attn_past = None
             meal_self_attn_future = None
-            
-        # 2.5)  Add positional embeddings across the time dimension
-        device = past_meal_enc.device
-        B, T_past = past_meal_enc.shape[:2]
-        t_past_idx = torch.arange(T_past, device=device).unsqueeze(0).expand(B, -1)  # [B, T_past]
-        time_emb_past = self.meal_time_emb(t_past_idx)  # [B, T_past, hidden_dim]
-        past_meal_enc = past_meal_enc + time_emb_past
 
-        Bf, T_future = future_meal_enc.shape[:2]
-        t_future_idx = torch.arange(T_future, device=device).unsqueeze(0).expand(Bf, -1)  # [B, T_future]
-        time_emb_future = self.meal_time_emb(t_future_idx)  # [B, T_future, hidden_dim]
-        future_meal_enc = future_meal_enc + time_emb_future
+        T_past = past_meal_enc.size(1)
+        T_future = future_meal_enc.size(1)
+
+        # 3) Build time indices for each block
+        # We'll place them contiguously in time:
+        #   Past meals:    t in [0 ... T_past-1]
+        #   Future meals:  t in [T_past ... T_past+T_future-1]
+        #   Glucose patch: t in [T_past+T_future ... T_past+T_future + n_glucose_patches - 1]
+        #   (We won't add the queries here; see below.)
+
+        # a) Past meal time
+        past_indices = torch.arange(T_past, device=device).unsqueeze(0).expand(B, -1)
+        # b) Future meal time
+        future_indices = torch.arange(T_future, device=device).unsqueeze(0).expand(B, -1) + T_past
         
 
-        # 3) Combine them in a single "memory" sequence
-        #    memory: [B, T_mem, hidden_dim], where T_mem = T_pastMeal + T_futureMeal + G_patches
+        # Add time embeddings
+        # shape => [B, T_past, hidden_dim]
+        past_meal_enc = past_meal_enc + self.time_emb(past_indices)
+        future_meal_enc = future_meal_enc + self.time_emb(future_indices)
+
+
+        ########################################################################
+        ## MEMORY
+        ########################################################################
+        
+        # 4) Combine them in a single "memory" => shape [B, (T_past + T_future + G_patches), hidden_dim]
         memory = torch.cat([past_meal_enc, future_meal_enc, glucose_enc], dim=1)
 
-        B = past_glucose.size(0)
-        device = memory.device
-        # Prepare queries for each forecast horizon
-        t_future_idx = torch.arange(self.forecast_horizon, device=device).unsqueeze(0).expand(B, -1)
-        query_emb = self.future_time_queries(t_future_idx)  # [B, T_future, hidden_dim]
+        # 5) Prepare queries for each forecast horizon step
+        # Instead of self.future_time_queries, let's also unify them with the same time_emb
+        # But if you prefer, you can still keep future_time_queries. 
+        # For full unification, we can do:
+        #   queries at time [T_past+T_future + G_patches ... T_past+T_future + G_patches + forecast_horizon - 1]
 
-        # 4) Decode, optionally capturing cross-attn from the last layer
+
+        # So t_future_idx in [0..forecast_horizon-1], but let's offset it:
+        t_future_indices = torch.arange(self.forecast_horizon, device=device).unsqueeze(0).expand(B, -1)
+        t_fufure_global_indices = t_future_indices + T_past
+
+        # Now we can build queries from scratch:
+        # shape => [B, forecast_horizon, hidden_dim]
+        query_emb = self.future_time_queries.weight[t_future_indices]  # or gather
+        # or we can do something like:
+        # query_emb = torch.zeros(B, self.forecast_horizon, self.hidden_dim, device=device)
+        # query_emb += self.time_emb(t_future_idx)
+        # etc., depending on how you prefer.
+
+        # If you want to add the same time_emb to the existing future_time_queries:
+        query_emb = self.future_time_queries(t_future_indices)  # [B, T_future, hidden_dim]
+        query_emb = query_emb + self.time_emb(t_fufure_global_indices)
+
+        # 6) Decode
         if return_attn:
             decoder_output, cross_attn = self.decoder(
                 tgt=query_emb,
@@ -837,41 +716,39 @@ class MealGlucoseForecastModel(pl.LightningModule):
                 return_attn=False
             )
 
-        # cross_attn: [B, T_future, T_mem] if return_attn=True
+        # cross_attn => [B, T_future, T_mem]
 
-        # Slice out "past" vs. "future" from cross_attn
+        # 7) Slice out cross-attn for past vs future
         attn_past = None
         attn_future = None
         if cross_attn is not None:
             past_len = past_meal_enc.shape[1]
             future_len = future_meal_enc.shape[1]
-            # We can ignore the portion that corresponds to glucose_enc if we just want "meals"
-            # memory = [past (0..past_len-1), future (past_len..past_len+future_len-1), glucose]
-            attn_past = cross_attn[:, :, :past_len]  # [B, T_future, past_len]
+            # memory = [past(0..past_len-1), future(past_len..past_len+future_len-1), glucose(...)]
+            attn_past = cross_attn[:, :, :past_len]  # => [B, T_future, past_len]
             attn_future = cross_attn[:, :, past_len : past_len + future_len]
 
-        # 5) Final projection => [B, T_future, num_quantiles]
+        # 8) Final projection => [B, T_future, num_quantiles]
         pred_future = self.forecast_linear(decoder_output)
 
-        # Optionally add last known glucose as a baseline
+        # Residual
         if self.residual_pred:
-            # last_val => shape [B, 1, 1]
             last_val = past_glucose[:, -1].unsqueeze(1).unsqueeze(-1)
             pred_future = pred_future + last_val
 
         # Unscale
-        pred_future = unscale_tensor(pred_future, target_scales)  # [B, T_future, num_quantiles]
+        pred_future = unscale_tensor(pred_future, target_scales)
 
-        # Return
         if return_attn:
             return (
-                pred_future,           # [B, T_future, Q]
-                past_meal_enc, attn_past,      # e.g. shape [B, T_future, past_len]
-                future_meal_enc, attn_future,  # e.g. shape [B, T_future, future_len]
+                pred_future,
+                past_meal_enc, attn_past,
+                future_meal_enc, attn_future,
                 meal_self_attn_past, meal_self_attn_future
             )
         else:
             return pred_future
+
 
     def _compute_forecast_metrics(self, past_glucose, future_glucose, target_scales, preds):
         if isinstance(preds, tuple):
@@ -894,12 +771,15 @@ class MealGlucoseForecastModel(pl.LightningModule):
         weighted_iAUC_loss = self.loss_iauc_weight * iAUC_loss
         total_loss = q_loss + weighted_iAUC_loss
         return {
-            "q_loss": q_loss,
-            "rmse": rmse,
+            "metrics": {
+                "q_loss": q_loss,
+                "rmse": rmse,
+                "iAUC_loss": iAUC_loss,
+                "weighted_iAUC_loss": weighted_iAUC_loss,
+                "total_loss": total_loss,
+            },
             "pred_iAUC": pred_iAUC,
-            "true_iAUC": true_iAUC,
-            "iAUC_loss": weighted_iAUC_loss,
-            "total_loss": total_loss,
+            "true_iAUC": true_iAUC,        
         }
 
     def training_step(self, batch, batch_idx):
@@ -918,11 +798,10 @@ class MealGlucoseForecastModel(pl.LightningModule):
             return_meal_self_attn=False,
         )
         metrics = self._compute_forecast_metrics(past_glucose, future_glucose, target_scales, preds)
-        self.log("train_quantile_loss", metrics["q_loss"], on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train_rmse", metrics["rmse"], on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train_iAUC_loss", metrics["iAUC_loss"], on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train_total_loss", metrics["total_loss"], on_step=True, on_epoch=True, prog_bar=True)
-        return metrics["total_loss"]
+        for _key in metrics["metrics"]:
+            self.log(f"train_{_key}", metrics["metrics"][_key], on_step=True, on_epoch=True, prog_bar=True)
+            
+        return metrics["metrics"]["total_loss"]
 
     def validation_step(self, batch, batch_idx):
         (past_glucose, past_meal_ids, past_meal_macros,
@@ -940,12 +819,13 @@ class MealGlucoseForecastModel(pl.LightningModule):
             return_meal_self_attn=True,
         )
         metrics = self._compute_forecast_metrics(past_glucose, future_glucose, target_scales, preds)
-        self.log("val_quantile_loss", metrics["q_loss"], on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val_rmse", metrics["rmse"], on_step=False, on_epoch=True, prog_bar=True)
+        for _key in metrics["metrics"]:
+            self.log(f"val_{_key}", metrics["metrics"][_key], on_step=False, on_epoch=True, prog_bar=True)
+
         if not hasattr(self, "val_outputs"):
             self.val_outputs = []
         self.val_outputs.append({
-            "val_quantile_loss": metrics["q_loss"],
+            "val_quantile_loss": metrics["metrics"]["q_loss"],
             "pred_iAUC": metrics["pred_iAUC"],
             "true_iAUC": metrics["true_iAUC"],
         })
@@ -963,7 +843,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             self.example_meal_self_attn_past = meal_self_attn_past # do not detach, as plotting functions needs to do some more processing
             self.example_meal_self_attn_future = meal_self_attn_future # do not detach, as plotting functions needs to do some more processing
         return {
-            "val_quantile_loss": metrics["q_loss"],
+            "val_quantile_loss": metrics["metrics"]["q_loss"],
             "pred_iAUC": metrics["pred_iAUC"],
             "true_iAUC": metrics["true_iAUC"],
         }
@@ -1152,6 +1032,8 @@ def get_trainer(config: ExperimentConfig, callbacks):
     )
     return trainer
 
+
+
 # -----------------------------------------------------------------------------
 # Main Training & Evaluation Entry Point
 # -----------------------------------------------------------------------------
@@ -1160,7 +1042,13 @@ def get_trainer(config: ExperimentConfig, callbacks):
 def main(**kwargs):
     logging.getLogger().setLevel(logging.DEBUG if kwargs["debug_mode"] else logging.INFO)
     config = ExperimentConfig(**kwargs)
-
+    
+    # Generate experiment name based on modified parameters
+    experiment_name = generate_experiment_name(config, kwargs)
+    config.wandb_run_name = experiment_name
+    
+    logger.info(f"Starting experiment: {experiment_name}")
+    
     if config.debug_mode:
         config.dataloader_num_workers = 1  # for debugging
 
@@ -1209,10 +1097,14 @@ def main(**kwargs):
     callbacks = [rich_model_summary, rich_progress_bar]
     trainer = get_trainer(config, callbacks)
     logging.info("Starting training.")
-    trainer.fit(model, train_loader, val_loader)
-    logging.info("Training complete.")
+    
     device = torch.device("cpu")
     model.to(device)
+    
+    trainer.fit(model, train_loader, val_loader)
+    logging.info("Training complete.")
+    # device = torch.device("cpu")
+    # model.to(device)
     model.eval()
     with torch.no_grad():
         batch = next(iter(val_loader))

@@ -1,0 +1,173 @@
+from dataclasses import dataclass, asdict
+
+# -----------------------------------------------------------------------------
+# Experiment Configuration
+# -----------------------------------------------------------------------------
+@dataclass
+class ExperimentConfig:
+    # Dataset / caching settings
+    dataset_version: str = "v0.5"
+    cache_dir: str = "/scratch/mohanty/food/ppgr-v1/datasets-cache"
+    use_cache: bool = True
+    debug_mode: bool = False
+    dataloader_num_workers: int = 7  # Added configurable dataloader_num_workers parameter
+
+    # Data splitting & sequence parameters
+    min_encoder_length: int = 8 * 4    # e.g., 8hrs * 4
+    prediction_length: int = 4 * 4     # e.g.,  4hrs * 4
+    eval_window: int = 2 * 4            # e.g., 2hrs * 4
+    validation_percentage: float = 0.1
+    test_percentage: float = 0.1
+    
+    
+    # Aggregation
+    patch_size: int = 1 * 4 # 1 hour patch size
+    patch_stride: int = 1  # 15 min stride
+    
+    meal_aggregator_type: str = "set"
+
+    # Data options
+    is_food_anchored: bool = True
+    sliding_window_stride: int = None
+    use_meal_level_food_covariates: bool = True
+    use_bootstraped_food_embeddings: bool = True
+    use_microbiome_embeddings: bool = True
+    group_by_columns: list = None
+
+    # Feature lists (users, food, temporal)
+    user_static_categoricals: list = None
+    user_static_reals: list = None
+    food_categoricals: list = None
+    food_reals: list = None
+    temporal_categoricals: list = None
+    temporal_reals: list = None
+    targets: list = None
+
+    # Model hyperparameters
+    food_embed_dim: int = 2048 # the number of dimensions from the pre-trained embeddings to use
+    food_embed_adapter_dim: int = 64 # the number of dimensions to project the food embeddings to for visualization purposes
+    hidden_dim: int = 256
+    num_heads: int = 4
+    transformer_encoder_layers: int = 2
+    transformer_decoder_layers: int = 2
+    residual_pred: bool = False
+    num_quantiles: int = 7
+    loss_iauc_weight: float = 0.00
+
+    # New dropout hyperparameters
+    dropout_rate: float = 0.1          # Used for projections, cross-attention, forecast MLP, etc.
+    transformer_dropout: float = 0.1   # Used within Transformer layers
+
+    # Training hyperparameters
+    batch_size: int = 1024 * 2
+    max_epochs: int = 50
+    optimizer_lr: float = 1e-4
+    weight_decay: float = 1e-5
+    gradient_clip_val: float = 0.1  # Added gradient clipping parameter
+
+    # WandB logging
+    wandb_project: str = "meal-representations-learning-v0"
+    wandb_run_name: str = "MealGlucoseForecastModel_Run"
+
+    # Precision
+    precision: str = "bf16"
+
+    # Batch size for projecting food embeddings when logging
+    food_embedding_projection_batch_size: int = 1024 * 4
+
+    # Plots (default: plots enabled)
+    disable_plots: bool = False
+
+    def __post_init__(self):
+        # Set default lists if not provided.
+        if self.group_by_columns is None:
+            self.group_by_columns = ["timeseries_block_id"]
+        if self.user_static_categoricals is None:
+            self.user_static_categoricals = [
+                "user_id", "user__edu_degree", "user__income",
+                "user__household_desc", "user__job_status", "user__smoking",
+                "user__health_state", "user__physical_activities_frequency",
+            ]
+        if self.user_static_reals is None:
+            self.user_static_reals = [
+                "user__age", "user__weight", "user__height",
+                "user__bmi", "user__general_hunger_level",
+                "user__morning_hunger_level", "user__mid_hunger_level",
+                "user__evening_hunger_level",
+            ]
+        if self.use_meal_level_food_covariates:
+            self.food_categoricals = ["food__food_group_cname", "food_id"]
+        else:
+            self.food_categoricals = [
+                "food__vegetables_fruits",
+                "food__grains_potatoes_pulses",
+                "food__unclassified",
+                "food__non_alcoholic_beverages",
+                "food__dairy_products_meat_fish_eggs_tofu",
+                "food__sweets_salty_snacks_alcohol",
+                "food__oils_fats_nuts",
+            ]
+        if self.food_reals is None:
+            self.food_reals = [
+                "food__eaten_quantity_in_gram", "food__energy_kcal_eaten",
+                "food__carb_eaten", "food__fat_eaten",
+                "food__protein_eaten", "food__fiber_eaten",
+                "food__alcohol_eaten",
+            ]
+        if self.temporal_categoricals is None:
+            self.temporal_categoricals = ["loc_eaten_dow", "loc_eaten_dow_type", "loc_eaten_season"]
+        if self.temporal_reals is None:
+            self.temporal_reals = ["loc_eaten_hour"]
+        if self.targets is None:
+            self.targets = ["val"]
+            
+            
+def generate_experiment_name(config: ExperimentConfig, kwargs: dict) -> str:
+    """
+    Generate a meaningful experiment name based on modified parameters.
+    
+    Args:
+        config: The ExperimentConfig instance
+        kwargs: Dictionary of parameters passed via command line
+    """
+    # Get default config for comparison
+    default_config = ExperimentConfig()
+    
+    # List of important parameters to include in name
+    key_params = {
+        'min_encoder_length': 'enc',
+        'prediction_length': 'pred',
+        'patch_size': 'patch',
+        'patch_stride': 'stride',
+        'eval_window': 'eval',
+        'hidden_dim': 'h',
+        'num_heads': 'heads',
+        'transformer_encoder_layers': 'enc',
+        'transformer_decoder_layers': 'dec',
+        'meal_aggregator_type': 'meal',
+        'dropout_rate': 'drop',
+        'transformer_dropout': 'tdrop',
+        'batch_size': 'bs'
+    }
+    
+    # Build name components for modified parameters
+    name_parts = []
+    for param, shorthand in key_params.items():
+        if param in kwargs and getattr(config, param) != getattr(default_config, param):
+            value = getattr(config, param)
+            # Format numbers to remove trailing zeros
+            if isinstance(value, float):
+                value = f"{value:.3f}".rstrip('0').rstrip('.')
+            name_parts.append(f"{shorthand}{value}")
+    
+    # Create base name
+    if name_parts:
+        experiment_name = "ppgr_" + "_".join(name_parts)
+    else:
+        experiment_name = "ppgr_default"
+        
+    # Add timestamp for uniqueness
+    # timestamp = datetime.datetime.now().strftime("%m%d_%H%M")
+    # experiment_name = f"{experiment_name}_{timestamp}"
+    
+    return experiment_name
