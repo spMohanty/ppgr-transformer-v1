@@ -435,12 +435,11 @@ class PPGRTimeSeriesDataset(Dataset):
         custom_order = list(self.categorical_encoders["food_id"].classes_.keys())[1:] # skip the nan value
         custom_order = [int(x) for x in custom_order]
         unique_foods_df = self.food_embeddings_df.loc[custom_order]
+        
                 
-        # reconcile the name to use the available name in another language if its not available in english        
-        unique_foods_df['display_name'] = unique_foods_df['display_name_en'].fillna(unique_foods_df['display_name_fr']).fillna(unique_foods_df['display_name_de'])
-
         # Add a human readable list of food names for the model plotters to readily use
         self.food_names = ["UNKNOWN"] + unique_foods_df["display_name"].tolist() # Add UNKNOWN to represent the nan value as 0 index 
+        self.food_group_names = ["UNKNOWN"] + unique_foods_df["food_group_cname"].tolist()
             
     def get_food_id_embeddings_layer(self):
         """
@@ -1050,9 +1049,12 @@ class PPGRToMealGlucoseWrapper(Dataset):
         if hasattr(ppgr_dataset, "categorical_encoders") and "food_id" in ppgr_dataset.categorical_encoders:
             # +1 for padding (assumed index 0)
             self.food_names = self.ppgr_dataset.food_names
+            self.food_group_names = self.ppgr_dataset.food_group_names
             self.num_foods = len(self.food_names)
         else:
             self.num_foods = None
+            self.food_names = None
+            self.food_group_names = None
             
         # Determine the number of nutrient dimensions from the dataset's food_reals list.
         if hasattr(ppgr_dataset, "food_reals"):
@@ -1218,6 +1220,8 @@ def create_cached_dataset(
         "food_reals": food_reals,
         "targets": targets,
     }
+    
+    logger.info(f"Loading dataset with the following config: {config}")
 
     # 2) Compute a unique hash from the config
     import pickle  # Only used for hashing the config; caching itself is now handled by torch.save

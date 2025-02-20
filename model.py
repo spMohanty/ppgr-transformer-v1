@@ -78,7 +78,8 @@ class ExperimentConfig:
     targets: list = None
 
     # Model hyperparameters
-    food_embed_dim: int = 64 # If bootstrapping from pre-trained embeddings, this is treated as max-dimensions to use from them
+    food_embed_dim: int = 1024 # the number of dimensions from the pre-trained embeddings to use
+    food_embed_adapter_dim: int = 64 # the number of dimensions to project the food embeddings to for visualization purposes
     hidden_dim: int = 256
     num_heads: int = 4
     enc_layers: int = 2
@@ -211,6 +212,7 @@ class MealEncoder(nn.Module):
     def __init__(
         self,
         food_embed_dim: int,
+        food_embed_adapter_dim: int,
         hidden_dim: int,
         num_foods: int,
         macro_dim: int,
@@ -223,14 +225,15 @@ class MealEncoder(nn.Module):
     ):
         super(MealEncoder, self).__init__()
         self.food_embed_dim = food_embed_dim
+        self.food_embed_adapter_dim = food_embed_adapter_dim
         self.hidden_dim = hidden_dim
         self.max_meals = max_meals
         self.num_foods = num_foods
         self.macro_dim = macro_dim
                 
         self.food_emb = nn.Embedding(num_foods, food_embed_dim, padding_idx=0)
-        self.food_emb_adapter = nn.Linear(food_embed_dim, food_embed_dim) # A linear projection to make it easier to visualize
-        self.food_emb_proj = nn.Linear(food_embed_dim, hidden_dim)
+        self.food_emb_adapter = nn.Linear(food_embed_dim, food_embed_adapter_dim) # A linear projection to make it easier to visualize
+        self.food_emb_proj = nn.Linear(food_embed_adapter_dim, hidden_dim)
         self.macro_proj = nn.Linear(macro_dim, hidden_dim, bias=False)
         self.pos_emb = nn.Embedding(max_meals, hidden_dim)
         self.start_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
@@ -342,6 +345,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
     def __init__(
         self,
         food_embed_dim: int,
+        food_embed_adapter_dim: int,
         hidden_dim: int,
         num_foods: int,
         macro_dim: int,
@@ -366,6 +370,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.eval_window = eval_window if eval_window is not None else forecast_horizon
 
         self.food_embed_dim = food_embed_dim
+        self.food_embed_adapter_dim = food_embed_adapter_dim
         self.hidden_dim = hidden_dim
         self.max_meals = max_meals
         self.num_foods = num_foods
@@ -382,7 +387,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
 
         # Encoders with configurable dropout
         self.meal_encoder = MealEncoder(
-            food_embed_dim, hidden_dim, num_foods, macro_dim, max_meals,
+            food_embed_dim, food_embed_adapter_dim, hidden_dim, num_foods, macro_dim, max_meals,
             num_heads, enc_layers, dropout_rate=dropout_rate, transformer_dropout=transformer_dropout,
             bootstrap_food_id_embeddings=bootstrap_food_id_embeddings
         )
@@ -637,11 +642,12 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Retrieve food names from your dataset (assuming they are available as a list)
         dataset = self.trainer.val_dataloaders.dataset
         food_names = dataset.food_names  # a list of food names corresponding to each row
+        food_group_names = dataset.food_group_names  # a list of food group names corresponding to each row
         
         # Create a DataFrame with the projected embeddings and insert the food names as the first column
         food_embeddings_df = pd.DataFrame(projected_embeddings, columns=embedding_cols)
-        food_embeddings_df.insert(0, 'food_name', food_names)
-        
+        food_embeddings_df.insert(0, 'food_group_name', food_group_names) # becomes the second column 
+        food_embeddings_df.insert(0, 'food_name', food_names) # becomes the first column 
         # Log the DataFrame as a WandB Table
         self.logger.experiment.log({f"food_embeddings_{label}": wandb.Table(dataframe=food_embeddings_df)})
 
@@ -730,6 +736,7 @@ def get_trainer(config: ExperimentConfig, callbacks):
         name=config.wandb_run_name,
         config={
             "food_embed_dim": config.food_embed_dim,
+            "food_embed_adapter_dim": config.food_embed_adapter_dim,
             "hidden_dim": config.hidden_dim,
             "batch_size": config.batch_size,
             "optimizer_lr": config.optimizer_lr,
@@ -771,6 +778,7 @@ def main(**kwargs):
     
     model = MealGlucoseForecastModel(
         food_embed_dim=config.food_embed_dim,
+        food_embed_adapter_dim=config.food_embed_adapter_dim,
         hidden_dim=config.hidden_dim,
         num_foods=training_dataset.num_foods,
         macro_dim=training_dataset.num_nutrients,
