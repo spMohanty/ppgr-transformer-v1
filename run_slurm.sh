@@ -3,7 +3,7 @@
 #SBATCH --gpus=1
 #SBATCH --mem-per-gpu=32G
 #SBATCH --cpus-per-gpu=8
-#SBATCH --partition=l40s
+#SBATCH --partition=h100
 #SBATCH --time=12:00:00
 #SBATCH --output=logs/slurm/%j.out
 #SBATCH --error=logs/slurm/%j.err

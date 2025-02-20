@@ -7,7 +7,7 @@ import logging
 import warnings
 import math
 
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
 # Suppress the nested tensors prototype warning from PyTorch.
 warnings.filterwarnings(
@@ -82,7 +82,7 @@ class ExperimentConfig:
     targets: list = None
 
     # Model hyperparameters
-    food_embed_dim: int = 1024 # the number of dimensions from the pre-trained embeddings to use
+    food_embed_dim: int = 2048 # the number of dimensions from the pre-trained embeddings to use
     food_embed_adapter_dim: int = 64 # the number of dimensions to project the food embeddings to for visualization purposes
     hidden_dim: int = 256
     num_heads: int = 4
@@ -97,7 +97,7 @@ class ExperimentConfig:
 
     # Training hyperparameters
     batch_size: int = 1024 * 2
-    max_epochs: int = 10
+    max_epochs: int = 50
     optimizer_lr: float = 1e-4
     weight_decay: float = 1e-5
     gradient_clip_val: float = 0.1  # Added gradient clipping parameter
@@ -818,18 +818,11 @@ def get_dataloaders(config: ExperimentConfig):
     return train_loader, val_loader, training_dataset
 
 def get_trainer(config: ExperimentConfig, callbacks):
+    # Log the entire configuration to WandB by converting the dataclass to a dictionary.
     wandb_logger = WandbLogger(
         project=config.wandb_project,
         name=config.wandb_run_name,
-        config={
-            "food_embed_dim": config.food_embed_dim,
-            "food_embed_adapter_dim": config.food_embed_adapter_dim,
-            "hidden_dim": config.hidden_dim,
-            "batch_size": config.batch_size,
-            "optimizer_lr": config.optimizer_lr,
-            "precision": config.precision,
-            "debug": config.debug_mode,
-        },
+        config=asdict(config),  # Now logs the whole config
         log_model=True,
     )
     precision_value = int(config.precision) if config.precision == "32" else "bf16"
