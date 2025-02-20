@@ -59,6 +59,10 @@ class ExperimentConfig:
     eval_window: int = 2 * 4            # e.g., 2hrs * 4
     validation_percentage: float = 0.1
     test_percentage: float = 0.1
+    
+    patch_size: int = 1 * 4 # 1 hour patch size
+    patch_stride: int = 1  # 15 min stride
+    
 
     # Data options
     is_food_anchored: bool = True
@@ -338,6 +342,82 @@ class GlucoseEncoder(nn.Module):
         x = self.encoder(x)
         return x
 
+
+class PatchedGlucoseEncoder(nn.Module):
+    def __init__(
+        self, embed_dim: int, patch_size: int, patch_stride: int, num_heads: int = 4, num_layers: int = 1, max_seq_len: int = 100, dropout_rate: float = 0.2
+    ):
+        super(PatchedGlucoseEncoder, self).__init__()
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        self.patch_stride = patch_stride
+
+        # For patch embedding:
+        # If using a simple linear projection: (patch_size) -> (embed_dim)
+        self.patch_proj = nn.Linear(patch_size, embed_dim)
+
+        # The maximum number of patches you could get is roughly max_seq_len / patch_size
+        # so create enough positional embeddings for that many patches.
+        max_num_patches = (max_seq_len - patch_size) // patch_stride + 1
+        self.pos_emb = nn.Embedding(max_num_patches, embed_dim)
+
+
+        # You can use a TransformerEncoder or your custom TransformerEncoderWithAttn
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 2,
+            dropout=dropout_rate,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+        
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, glucose_seq: torch.Tensor) -> torch.Tensor:
+        glucose_seq = glucose_seq.to(next(self.parameters()).dtype)
+        B, T = glucose_seq.size()
+        
+        # 1) Patchify: if you want non-overlapping patches
+        # shape => (B, floor(T / patch_size), patch_size)
+        # for overlapping patches, you'd do a more advanced fold/unfold or 1D strided approach
+        # but let's do the simplest approach first:
+        patch_list = []
+        for start in range(0, T - self.patch_size + 1, self.patch_stride):
+            patch = glucose_seq[:, start:start + self.patch_size]  # shape (B, patch_size)
+            patch_list.append(patch.unsqueeze(1))  # shape => (B, 1, patch_size)
+        
+        if len(patch_list) == 0:
+            # Edge case: if T < patch_size. Might need a fallback or zero-padding
+            # Just an example fallback:
+            patch_list = [F.pad(glucose_seq, (0, self.patch_size - T))[:, None, :]]
+        
+        patches = torch.cat(patch_list, dim=1)  # shape => (B, N_patches, patch_size)
+        # 2) Project each patch into embed_dim
+        # We can flatten or keep it as is for linear layer
+        # shape => (B*N_patches, patch_size)
+        B_np, N_patches, _ = patches.shape
+        patches = patches.view(B_np * N_patches, self.patch_size)
+        
+        # linear projection
+        patch_emb = self.patch_proj(patches)  # (B*N_patches, embed_dim)
+        patch_emb = self.dropout(patch_emb)
+        patch_emb = patch_emb.view(B_np, N_patches, -1)  # => (B, N_patches, embed_dim)
+
+        # 3) Add positional embedding
+        # pos_indices => [0..N_patches-1]
+        pos_indices = torch.arange(N_patches, device=glucose_seq.device)
+        pos_enc = self.pos_emb(pos_indices).unsqueeze(0)  # shape (1, N_patches, embed_dim)
+        patch_emb = patch_emb + pos_enc
+        
+        # 4) Run Transformer on patches
+        patch_emb = self.transformer(patch_emb)  # => (B, N_patches, embed_dim)
+        
+        return patch_emb
+
 # -----------------------------------------------------------------------------
 # MealGlucoseForecastModel with configurable dropout parameters
 # -----------------------------------------------------------------------------
@@ -355,6 +435,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         eval_window: int = None,
         num_heads: int = 4,
         enc_layers: int = 1,
+        patch_size: int = 1 * 4,
+        patch_stride: int = 1,
         residual_pred: bool = True,
         num_quantiles: int = 7,
         loss_iauc_weight: float = 1,
@@ -375,6 +457,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.max_meals = max_meals
         self.num_foods = num_foods
         self.macro_dim = macro_dim
+                
         self.residual_pred = residual_pred
         self.num_quantiles = num_quantiles
         self.loss_iauc_weight = loss_iauc_weight
@@ -391,8 +474,11 @@ class MealGlucoseForecastModel(pl.LightningModule):
             num_heads, enc_layers, dropout_rate=dropout_rate, transformer_dropout=transformer_dropout,
             bootstrap_food_id_embeddings=bootstrap_food_id_embeddings
         )
-        self.glucose_encoder = GlucoseEncoder(
-            hidden_dim, num_heads, enc_layers, glucose_seq_len, dropout_rate=dropout_rate
+        # self.glucose_encoder = GlucoseEncoder(
+        #     hidden_dim, num_heads, enc_layers, glucose_seq_len, dropout_rate=dropout_rate
+        # )
+        self.glucose_encoder = PatchedGlucoseEncoder(
+            embed_dim=hidden_dim, patch_size=patch_size, patch_stride=patch_stride, num_heads=num_heads, num_layers=enc_layers, max_seq_len=glucose_seq_len, dropout_rate=dropout_rate
         )
 
         # Cross-Attention Modules with dropout set from transformer_dropout
@@ -430,7 +516,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         return_meal_self_attn: bool = False,
     ):
         logging.debug("MealGlucoseForecastModel: --- Forward Pass Start ---")
-        glucose_enc = self.glucose_encoder(past_glucose)  # [B, T_glucose, hidden_dim]
+        # glucose_enc = self.glucose_encoder(past_glucose)  # [B, T_glucose, hidden_dim]
+        glucose_enc = self.glucose_encoder(past_glucose) # PatchedGlucoseEncoder
 
         if return_meal_self_attn:
             past_meal_enc, meal_self_attn_past = self.meal_encoder(past_meal_ids, past_meal_macros, return_self_attn=True)
@@ -788,6 +875,8 @@ def main(**kwargs):
         eval_window=config.eval_window,
         num_heads=config.num_heads,
         enc_layers=config.enc_layers,
+        patch_size=config.patch_size,
+        patch_stride=config.patch_stride,
         residual_pred=config.residual_pred,
         num_quantiles=config.num_quantiles,
         loss_iauc_weight=config.loss_iauc_weight,
