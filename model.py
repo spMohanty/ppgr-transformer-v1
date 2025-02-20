@@ -390,6 +390,7 @@ class MealEncoder(nn.Module):
         num_layers: int = 1,
         dropout_rate: float = 0.2,
         transformer_dropout: float = 0.1,
+        aggregator_type: str = "set",  # Either "set" or "sum"
         bootstrap_food_id_embeddings: nn.Embedding = None
     ):
         super(MealEncoder, self).__init__()
@@ -399,94 +400,147 @@ class MealEncoder(nn.Module):
         self.max_meals = max_meals
         self.num_foods = num_foods
         self.macro_dim = macro_dim
-                
+        self.aggregator_type = aggregator_type.lower().strip()
+
+        # --------------------
+        #  Embedding Layers
+        # --------------------
         self.food_emb = nn.Embedding(num_foods, food_embed_dim, padding_idx=0)
         self.food_emb_adapter = nn.Linear(food_embed_dim, food_embed_adapter_dim) # A linear projection to make it easier to visualize
         self.food_emb_proj = nn.Linear(food_embed_adapter_dim, hidden_dim)
         self.macro_proj = nn.Linear(macro_dim, hidden_dim, bias=False)
-        self.pos_emb = nn.Embedding(max_meals, hidden_dim)
-        self.start_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
-        
-        self.bootstrap_food_id_embeddings(bootstrap_food_id_embeddings)
 
-        # Use the configurable dropout rate
+                
+        # Optional aggregator token to collect representations (only used in "set" mode).
+        self.start_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+
+        # Bootstrapping pre-trained food embeddings if provided
+        self.bootstrap_food_id_embeddings(bootstrap_food_id_embeddings)
+        
+        #  Dropout
         self.dropout = nn.Dropout(dropout_rate)
 
-        # Build an encoder stack
-        enc_layer = TransformerEncoderLayerWithAttn(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 2,
-            dropout=transformer_dropout,
-            activation="relu"
-        )
-        self.encoder = TransformerEncoderWithAttn(
-            enc_layer,
-            num_layers=num_layers,
-            norm=nn.LayerNorm(hidden_dim)
-        )
-    
-    def forward(self, meal_ids: torch.LongTensor, meal_macros: torch.Tensor, return_self_attn: bool = False):
-        B, T, M = meal_ids.size()
-        meal_ids_flat = meal_ids.view(B * T, M)
-        meal_macros_flat = meal_macros.view(B * T, M, -1)
-
-        # Food Embedding
-        food_emb = self.food_emb(meal_ids_flat)
-        food_emb = self.food_emb_adapter(food_emb)
-        food_emb = self.food_emb_proj(food_emb)
-        food_emb = self.dropout(food_emb)  # dropout on food embeddings
-
-        # Macro Embedding
-        macro_emb = self.macro_proj(meal_macros_flat)
-        macro_emb = self.dropout(macro_emb)  # dropout on macro embeddings
-
-        meal_token_emb = food_emb + macro_emb
-
-        # Positional Encoding
-        pos_indices = torch.arange(self.max_meals, device=meal_ids.device)
-        pos_enc = self.pos_emb(pos_indices).unsqueeze(0)
-        meal_token_emb = meal_token_emb + pos_enc
-        meal_token_emb = self.dropout(meal_token_emb)  # dropout after adding positional encoding
-        
-        # Insert start token at position 0
-        start_token_expanded = self.start_token.expand(B * T, -1, -1)
-        meal_token_emb = torch.cat([start_token_expanded, meal_token_emb], dim=1)
-
-        # Build a padding mask
-        pad_mask = (meal_ids_flat == 0)  # shape [B*T, M]
-        # Insert a zero column for the start token
-        zero_col = torch.zeros(B * T, 1, dtype=torch.bool, device=pad_mask.device)
-        pad_mask = torch.cat([zero_col, pad_mask], dim=1)  # [B*T, M+1]
-        
-    
-        if return_self_attn:
-            meal_attn_out, self_attn = self.encoder(
-                meal_token_emb,
-                src_key_padding_mask=pad_mask,
-                return_attn=True
+        #  Transformer stack (only for aggregator_type="set")
+        if self.aggregator_type == "set":
+            enc_layer = TransformerEncoderLayerWithAttn(
+                d_model=hidden_dim,
+                nhead=num_heads,
+                dim_feedforward=hidden_dim * 2,
+                dropout=transformer_dropout,
+                activation="relu"
+            )
+            self.encoder = TransformerEncoderWithAttn(
+                enc_layer,
+                num_layers=num_layers,
+                norm=nn.LayerNorm(hidden_dim)
             )
         else:
-            meal_attn_out = self.encoder(
-                meal_token_emb,
-                src_key_padding_mask=pad_mask,
-                return_attn=False
-            )
+            self.encoder = None  # No Transformer for aggregator_type="sum"
+            
+    
+    def forward(
+        self,
+        meal_ids: torch.LongTensor,
+        meal_macros: torch.Tensor,
+        return_self_attn: bool = False
+    ):
+        """
+        :param meal_ids:    (B, T, M)  with each M being item indices in that meal
+        :param meal_macros: (B, T, M, macro_dim)  macro features for each item
+        :param return_self_attn: If True, returns self-attention weights (only works in "set" mode).
+        :return: 
+          - meal_timestep_emb: (B, T, hidden_dim) aggregator encoding for each meal/time-step
+          - self_attn (if "set" mode and return_self_attn=True), else None
+        """
+        B, T, M = meal_ids.size()
+
+        # 1) Flatten out (B,T) -> (B*T) for item-level embeddings
+        meal_ids_flat = meal_ids.view(B * T, M)            # => (B*T, M)
+        meal_macros_flat = meal_macros.view(B * T, M, -1)  # => (B*T, M, macro_dim)
+
+        # 2) Embed items
+        food_emb = self.food_emb(meal_ids_flat)               # (B*T, M, food_embed_dim)
+        food_emb = self.food_emb_adapter(food_emb)            # (B*T, M, food_embed_adapter_dim)
+        food_emb = self.food_emb_proj(food_emb)               # (B*T, M, hidden_dim)
+        food_emb = self.dropout(food_emb)
+
+        macro_emb = self.macro_proj(meal_macros_flat)         # (B*T, M, hidden_dim)
+        macro_emb = self.dropout(macro_emb)
+
+        # Combine them
+        meal_token_emb = food_emb + macro_emb  # shape = (B*T, M, hidden_dim)
+
+        # -------------------------------------------------------------------
+        #  aggregator_type = "sum"
+        # -------------------------------------------------------------------
+        if self.aggregator_type == "sum":
+            # Permutation-invariant aggregator: sum (or mean) across items
+            # (B*T, M, hidden_dim) -> (B*T, hidden_dim)
+            # NOTE: You could do meal_token_emb.mean(dim=1) if you prefer averaging
+            meal_timestep_emb = meal_token_emb.sum(dim=1)
+            meal_timestep_emb = meal_timestep_emb.view(B, T, self.hidden_dim)
+            # No self-attn in sum mode
             self_attn = None
 
-        # Use the start token output as the "meal embedding" for each T
-        # meal_attn_out: [B*T, M+1, hidden_dim]
-        meal_timestep_emb = meal_attn_out[:, 0, :]  # [B*T, hidden_dim]
-        meal_timestep_emb = meal_timestep_emb.view(B, T, self.hidden_dim)
+            if return_self_attn:
+                # We don't have attention to return in sum mode
+                return meal_timestep_emb, None
+            else:
+                return meal_timestep_emb
 
-        if return_self_attn and self_attn is not None:
-            # self_attn shape: [B*T, (M+1), (M+1)]
-            # Reshape to [B, T, M+1, M+1]
-            b_t = B * T
-            self_attn = self_attn.view(B, T, self_attn.size(-2), self_attn.size(-1))
+        # -------------------------------------------------------------------
+        #  aggregator_type = "set"
+        # -------------------------------------------------------------------
+        elif self.aggregator_type == "set":
+            # We do a self-attention aggregator with a special start token
+            # *Without* adding any positional embeddings to keep it permutation-invariant
+            # (i.e. we skip meal_token_emb + pos_enc).
 
-            return meal_timestep_emb, self_attn
-        return meal_timestep_emb
+            # Insert aggregator token at position 0
+            start_token_expanded = self.start_token.expand(B * T, -1, -1)  # => (B*T, 1, hidden_dim)
+            meal_token_emb = torch.cat([start_token_expanded, meal_token_emb], dim=1)
+            # => shape (B*T, M+1, hidden_dim)
+
+            # Build a padding mask: treat item_id=0 as padding
+            pad_mask = (meal_ids_flat == 0)  # shape (B*T, M)
+            zero_col = torch.zeros(B * T, 1, dtype=torch.bool, device=pad_mask.device)
+            pad_mask = torch.cat([zero_col, pad_mask], dim=1)  # => (B*T, M+1)
+
+            if self.encoder is None:
+                raise ValueError(
+                    "aggregator_type='set' requires a defined self.encoder, but it is None."
+                )
+
+            # Forward pass through the Transformer
+            if return_self_attn:
+                meal_attn_out, self_attn = self.encoder(
+                    meal_token_emb,
+                    src_key_padding_mask=pad_mask,
+                    return_attn=True
+                )
+                # self_attn shape => (B*T, M+1, M+1)
+            else:
+                meal_attn_out = self.encoder(
+                    meal_token_emb,
+                    src_key_padding_mask=pad_mask,
+                    return_attn=False
+                )
+                self_attn = None
+
+            # Use the aggregator token's output as the "meal embedding"
+            meal_timestep_emb = meal_attn_out[:, 0, :]  # => (B*T, hidden_dim)
+            meal_timestep_emb = meal_timestep_emb.view(B, T, self.hidden_dim)
+
+            # If returning attention, reshape it for convenience:
+            # from (B*T, M+1, M+1) -> (B, T, M+1, M+1)
+            if return_self_attn and self_attn is not None:
+                self_attn = self_attn.view(B, T, self_attn.size(-2), self_attn.size(-1))
+                return meal_timestep_emb, self_attn
+            else:
+                return meal_timestep_emb
+
+        else:
+            raise ValueError(f"Invalid aggregator_type='{self.aggregator_type}'. Use 'set' or 'sum' only.")
 
     def bootstrap_food_id_embeddings(self, bootstrap_food_id_embeddings: nn.Embedding):
         # Bootstrap the food id embeddings to pre-computed ones
@@ -700,6 +754,11 @@ class MealGlucoseForecastModel(pl.LightningModule):
 
         # Register the quantiles as a buffer
         self.register_buffer("quantiles", torch.linspace(0.05, 0.95, steps=self.num_quantiles))
+        
+        # time-based positional embedding for the meal time dimension
+        max_meal_time = glucose_seq_len + forecast_horizon + 20  # or some safe upper bound
+        self.meal_time_emb = nn.Embedding(max_meal_time, hidden_dim)
+        
 
     def forward(
         self,
@@ -733,6 +792,19 @@ class MealGlucoseForecastModel(pl.LightningModule):
             future_meal_enc = self.meal_encoder(future_meal_ids, future_meal_macros)
             meal_self_attn_past = None
             meal_self_attn_future = None
+            
+        # 2.5)  Add positional embeddings across the time dimension
+        device = past_meal_enc.device
+        B, T_past = past_meal_enc.shape[:2]
+        t_past_idx = torch.arange(T_past, device=device).unsqueeze(0).expand(B, -1)  # [B, T_past]
+        time_emb_past = self.meal_time_emb(t_past_idx)  # [B, T_past, hidden_dim]
+        past_meal_enc = past_meal_enc + time_emb_past
+
+        Bf, T_future = future_meal_enc.shape[:2]
+        t_future_idx = torch.arange(T_future, device=device).unsqueeze(0).expand(Bf, -1)  # [B, T_future]
+        time_emb_future = self.meal_time_emb(t_future_idx)  # [B, T_future, hidden_dim]
+        future_meal_enc = future_meal_enc + time_emb_future
+        
 
         # 3) Combine them in a single "memory" sequence
         #    memory: [B, T_mem, hidden_dim], where T_mem = T_pastMeal + T_futureMeal + G_patches
