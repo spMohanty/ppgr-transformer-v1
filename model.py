@@ -60,9 +60,12 @@ class ExperimentConfig:
     validation_percentage: float = 0.1
     test_percentage: float = 0.1
     
+    
+    # Aggregation
     patch_size: int = 1 * 4 # 1 hour patch size
     patch_stride: int = 1  # 15 min stride
     
+    meal_aggregator_type: str = "set"
 
     # Data options
     is_food_anchored: bool = True
@@ -673,8 +676,11 @@ class MealGlucoseForecastModel(pl.LightningModule):
         num_foods: int,
         macro_dim: int,
         max_meals: int = 11,
+        meal_aggregator_type: str = "set",
+        
         glucose_seq_len: int = 20,
         forecast_horizon: int = 4,
+        
         eval_window: int = None,
         num_heads: int = 4,
         transformer_encoder_layers: int = 2,
@@ -718,7 +724,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
             num_layers=transformer_encoder_layers,
             dropout_rate=dropout_rate,
             transformer_dropout=transformer_dropout,
-            bootstrap_food_id_embeddings=bootstrap_food_id_embeddings
+            bootstrap_food_id_embeddings=bootstrap_food_id_embeddings,
+            aggregator_type=meal_aggregator_type
         )
 
         # 2) Glucose Encoder (patch-based)
@@ -1171,6 +1178,7 @@ def main(**kwargs):
         num_foods=training_dataset.num_foods,
         macro_dim=training_dataset.num_nutrients,
         max_meals=training_dataset.max_meals,
+        meal_aggregator_type=config.meal_aggregator_type,
         glucose_seq_len=config.min_encoder_length,
         forecast_horizon=config.prediction_length,
         eval_window=config.eval_window,
