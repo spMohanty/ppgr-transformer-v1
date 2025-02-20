@@ -86,7 +86,8 @@ class ExperimentConfig:
     food_embed_adapter_dim: int = 64 # the number of dimensions to project the food embeddings to for visualization purposes
     hidden_dim: int = 256
     num_heads: int = 4
-    enc_layers: int = 2
+    transformer_encoder_layers: int = 2
+    transformer_decoder_layers: int = 2
     residual_pred: bool = False
     num_quantiles: int = 7
     loss_iauc_weight: float = 0.00
@@ -111,6 +112,9 @@ class ExperimentConfig:
 
     # Batch size for projecting food embeddings when logging
     food_embedding_projection_batch_size: int = 1024 * 4
+
+    # Plots (default: plots enabled)
+    disable_plots: bool = False
 
     def __post_init__(self):
         # Set default lists if not provided.
@@ -156,58 +160,219 @@ class ExperimentConfig:
             self.targets = ["val"]
 
 # -----------------------------------------------------------------------------
-# Custom Transformer Encoder Classes (to return self-attention)
+#   - "TransformerEncoderLayerWithAttn" for single self-attention + feedforward
+#   - "TransformerEncoderWithAttn" to stack multiple layers and optionally return the last layer's attn
 # -----------------------------------------------------------------------------
 class TransformerEncoderLayerWithAttn(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1, activation="relu"):
-        super(TransformerEncoderLayerWithAttn, self).__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+    """
+    A single Transformer encoder layer with self-attention + feed-forward.
+    Returns (output, attn_weights) if return_attn=True on the last layer.
+    """
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu"):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True
+        )
         self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)  # dropout after activation
         self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.dropout_attn = nn.Dropout(dropout)
+        self.dropout_ffn = nn.Dropout(dropout)
+
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.activation = F.relu if activation == "relu" else F.gelu
+
+        # Activation function
+        self.activation_fn = F.relu if activation == "relu" else F.gelu
 
     def forward(self, src, src_mask=None, src_key_padding_mask=None, return_attn=False):
+        # 1) Self-Attention
         attn_output, attn_weights = self.self_attn(
             src, src, src,
             attn_mask=src_mask,
             key_padding_mask=src_key_padding_mask,
             need_weights=True
         )
-        src = src + self.dropout1(attn_output)
+        src = src + self.dropout_attn(attn_output)
         src = self.norm1(src)
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        src = src + self.dropout2(src2)
+
+        # 2) Feed-forward
+        ff = self.linear2(self.dropout_ffn(self.activation_fn(self.linear1(src))))
+        src = src + ff
         src = self.norm2(src)
+
         if return_attn:
             return src, attn_weights
-        else:
-            return src
+        return src
+
 
 class TransformerEncoderWithAttn(nn.Module):
+    """
+    Stacks multiple TransformerEncoderLayerWithAttn. 
+    If return_attn=True, returns the final layer's attn_weights.
+    """
     def __init__(self, encoder_layer, num_layers, norm=None):
-        super(TransformerEncoderWithAttn, self).__init__()
+        super().__init__()
         self.layers = nn.ModuleList([encoder_layer for _ in range(num_layers)])
-        self.num_layers = num_layers
         self.norm = norm
 
     def forward(self, src, mask=None, src_key_padding_mask=None, return_attn=False):
         output = src
         attn_weights = None
-        for mod in self.layers:
-            if return_attn:
-                output, attn_weights = mod(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask, return_attn=True)
+
+        for layer_idx, layer in enumerate(self.layers):
+            # Only return attention from the final layer if asked
+            is_last = (layer_idx == len(self.layers) - 1)
+            if return_attn and is_last:
+                output, attn_weights = layer(
+                    output,
+                    src_mask=mask,
+                    src_key_padding_mask=src_key_padding_mask,
+                    return_attn=True
+                )
             else:
-                output = mod(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask)
+                output = layer(
+                    output,
+                    src_mask=mask,
+                    src_key_padding_mask=src_key_padding_mask,
+                    return_attn=False
+                )
+
         if self.norm is not None:
             output = self.norm(output)
+
         if return_attn:
             return output, attn_weights
         return output
+
+
+# -----------------------------------------------------------------------------
+#   - "TransformerDecoderLayerWithAttn" for self-attn + cross-attn + feedforward
+#   - "TransformerDecoderWithAttn" to stack multiple layers and optionally return the last layer's cross-attn
+# -----------------------------------------------------------------------------
+class TransformerDecoderLayerWithAttn(nn.Module):
+    """
+    A single Transformer decoder layer with self-attention + cross-attention + feed-forward.
+    Returns cross-attn weights if return_attn=True.
+    """
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu"):
+        super().__init__()
+        # Self-attn
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        # Cross-attn
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+
+        # Feed-forward
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.dropout_attn = nn.Dropout(dropout)
+        self.dropout_cross = nn.Dropout(dropout)
+        self.dropout_ffn = nn.Dropout(dropout)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+        # Activation function
+        self.activation_fn = F.relu if activation == "relu" else F.gelu
+
+    def forward(
+        self,
+        tgt, 
+        memory,
+        tgt_mask=None,
+        memory_mask=None,
+        tgt_key_padding_mask=None,
+        memory_key_padding_mask=None,
+        return_attn=False
+    ):
+        # 1) Self-Attn
+        x = tgt
+        sa_out, _ = self.self_attn(
+            x, x, x,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask,
+            need_weights=False
+        )
+        x = x + self.dropout_attn(sa_out)
+        x = self.norm1(x)
+
+        # 2) Cross-Attn
+        cross_attn_weights = None
+        ca_out, ca_weights = self.cross_attn(
+            x, memory, memory,
+            attn_mask=memory_mask,
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=True
+        )
+        x = x + self.dropout_cross(ca_out)
+        x = self.norm2(x)
+
+        if return_attn:
+            cross_attn_weights = ca_weights  # shape [B, T_tgt, T_mem]
+
+        # 3) Feed-forward
+        ff = self.linear2(self.dropout_ffn(self.activation_fn(self.linear1(x))))
+        x = x + ff
+        x = self.norm3(x)
+
+        if return_attn:
+            return x, cross_attn_weights
+        return x, None
+
+
+class TransformerDecoderWithAttn(nn.Module):
+    """
+    Stacks multiple TransformerDecoderLayerWithAttn.
+    If return_attn=True, returns the final layer's cross-attn weights.
+    """
+    def __init__(self, decoder_layer, num_layers, norm=None):
+        super().__init__()
+        self.layers = nn.ModuleList([decoder_layer for _ in range(num_layers)])
+        self.norm = norm
+
+    def forward(
+        self,
+        tgt,
+        memory,
+        tgt_mask=None,
+        memory_mask=None,
+        tgt_key_padding_mask=None,
+        memory_key_padding_mask=None,
+        return_attn=False
+    ):
+        output = tgt
+        cross_attn_weights = None
+
+        for layer_idx, layer in enumerate(self.layers):
+            is_last = (layer_idx == len(self.layers) - 1)
+            if return_attn and is_last:
+                output, cross_attn_weights = layer(
+                    output,
+                    memory,
+                    tgt_mask=tgt_mask,
+                    memory_mask=memory_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask,
+                    memory_key_padding_mask=memory_key_padding_mask,
+                    return_attn=True
+                )
+            else:
+                output, _ = layer(
+                    output,
+                    memory,
+                    tgt_mask=tgt_mask,
+                    memory_mask=memory_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask,
+                    memory_key_padding_mask=memory_key_padding_mask,
+                    return_attn=False
+                )
+
+        if self.norm is not None:
+            output = self.norm(output)
+
+        return output, cross_attn_weights
+
 
 # -----------------------------------------------------------------------------
 # Modified Meal Encoder (dropout configurable via parameters)
@@ -247,55 +412,79 @@ class MealEncoder(nn.Module):
         # Use the configurable dropout rate
         self.dropout = nn.Dropout(dropout_rate)
 
-        encoder_layer = TransformerEncoderLayerWithAttn(
+        # Build an encoder stack
+        enc_layer = TransformerEncoderLayerWithAttn(
             d_model=hidden_dim,
             nhead=num_heads,
             dim_feedforward=hidden_dim * 2,
-            dropout=transformer_dropout,  # configurable dropout in transformer layer
+            dropout=transformer_dropout,
             activation="relu"
         )
-        norm = nn.LayerNorm(hidden_dim)
-        self.encoder = TransformerEncoderWithAttn(encoder_layer, num_layers=num_layers, norm=norm)
+        self.encoder = TransformerEncoderWithAttn(
+            enc_layer,
+            num_layers=num_layers,
+            norm=nn.LayerNorm(hidden_dim)
+        )
     
     def forward(self, meal_ids: torch.LongTensor, meal_macros: torch.Tensor, return_self_attn: bool = False):
         B, T, M = meal_ids.size()
         meal_ids_flat = meal_ids.view(B * T, M)
         meal_macros_flat = meal_macros.view(B * T, M, -1)
 
+        # Food Embedding
         food_emb = self.food_emb(meal_ids_flat)
         food_emb = self.food_emb_adapter(food_emb)
-        
         food_emb = self.food_emb_proj(food_emb)
         food_emb = self.dropout(food_emb)  # dropout on food embeddings
 
+        # Macro Embedding
         macro_emb = self.macro_proj(meal_macros_flat)
         macro_emb = self.dropout(macro_emb)  # dropout on macro embeddings
 
         meal_token_emb = food_emb + macro_emb
 
+        # Positional Encoding
         pos_indices = torch.arange(self.max_meals, device=meal_ids.device)
         pos_enc = self.pos_emb(pos_indices).unsqueeze(0)
         meal_token_emb = meal_token_emb + pos_enc
         meal_token_emb = self.dropout(meal_token_emb)  # dropout after adding positional encoding
-
+        
+        # Insert start token at position 0
         start_token_expanded = self.start_token.expand(B * T, -1, -1)
         meal_token_emb = torch.cat([start_token_expanded, meal_token_emb], dim=1)
 
-        pad_mask = meal_ids_flat == 0
-        pad_mask = torch.cat(
-            [torch.zeros(B * T, 1, device=pad_mask.device, dtype=torch.bool), pad_mask],
-            dim=1,
-        )
+        # Build a padding mask
+        pad_mask = (meal_ids_flat == 0)  # shape [B*T, M]
+        # Insert a zero column for the start token
+        zero_col = torch.zeros(B * T, 1, dtype=torch.bool, device=pad_mask.device)
+        pad_mask = torch.cat([zero_col, pad_mask], dim=1)  # [B*T, M+1]
+        
+    
         if return_self_attn:
-            meal_attn_out, self_attn = self.encoder(meal_token_emb, src_key_padding_mask=pad_mask, return_attn=True)
+            meal_attn_out, self_attn = self.encoder(
+                meal_token_emb,
+                src_key_padding_mask=pad_mask,
+                return_attn=True
+            )
         else:
-            meal_attn_out = self.encoder(meal_token_emb, src_key_padding_mask=pad_mask)
-        # Use the start token output as the meal embedding.
-        meal_timestep_emb = meal_attn_out[:, 0, :]
+            meal_attn_out = self.encoder(
+                meal_token_emb,
+                src_key_padding_mask=pad_mask,
+                return_attn=False
+            )
+            self_attn = None
+
+        # Use the start token output as the "meal embedding" for each T
+        # meal_attn_out: [B*T, M+1, hidden_dim]
+        meal_timestep_emb = meal_attn_out[:, 0, :]  # [B*T, hidden_dim]
         meal_timestep_emb = meal_timestep_emb.view(B, T, self.hidden_dim)
-        if return_self_attn:
-            num_tokens = meal_attn_out.size(1)
-            self_attn = self_attn.view(B, T, num_tokens, num_tokens)
+
+        if return_self_attn and self_attn is not None:
+            # self_attn shape: [B*T, (M+1), (M+1)]
+            # Reshape to [B, T, M+1, M+1]
+            b_t = B * T
+            self_attn = self_attn.view(B, T, self_attn.size(-2), self_attn.size(-1))
+
             return meal_timestep_emb, self_attn
         return meal_timestep_emb
 
@@ -434,128 +623,176 @@ class MealGlucoseForecastModel(pl.LightningModule):
         forecast_horizon: int = 4,
         eval_window: int = None,
         num_heads: int = 4,
-        enc_layers: int = 1,
-        patch_size: int = 1 * 4,
+        transformer_encoder_layers: int = 2,
+        transformer_decoder_layers: int = 2,
+        patch_size: int = 4,
         patch_stride: int = 1,
         residual_pred: bool = True,
         num_quantiles: int = 7,
         loss_iauc_weight: float = 1,
+        
         dropout_rate: float = 0.2,
         transformer_dropout: float = 0.1,
         bootstrap_food_id_embeddings: nn.Embedding = None,
-        optimizer_lr: float = 1e-4,            
+        
+        optimizer_lr: float = 1e-4,
         weight_decay: float = 1e-5,
-        food_embedding_projection_batch_size: int = 1025   # NEW configurable parameter
+        gradient_clip_val: float = 0.1,
+        food_embedding_projection_batch_size: int = 1024 * 4,
+        disable_plots: bool = False,
     ):
-        super(MealGlucoseForecastModel, self).__init__()
+        super().__init__()
         self.forecast_horizon = forecast_horizon
         self.eval_window = eval_window if eval_window is not None else forecast_horizon
 
-        self.food_embed_dim = food_embed_dim
-        self.food_embed_adapter_dim = food_embed_adapter_dim
-        self.hidden_dim = hidden_dim
-        self.max_meals = max_meals
-        self.num_foods = num_foods
-        self.macro_dim = macro_dim
-                
         self.residual_pred = residual_pred
         self.num_quantiles = num_quantiles
         self.loss_iauc_weight = loss_iauc_weight
 
-        self.optimizer_lr = optimizer_lr       
-        self.weight_decay = weight_decay       
-
-        # NEW: store the configurable batch size for food embeddings logging
+        self.hidden_dim = hidden_dim
+        self.optimizer_lr = optimizer_lr
+        self.weight_decay = weight_decay
+        self.gradient_clip_val = gradient_clip_val
         self.food_embedding_projection_batch_size = food_embedding_projection_batch_size
-
-        # Encoders with configurable dropout
+        self.disable_plots = disable_plots
+        
+        # 1) Meal Encoder (transformer-based)
         self.meal_encoder = MealEncoder(
-            food_embed_dim, food_embed_adapter_dim, hidden_dim, num_foods, macro_dim, max_meals,
-            num_heads, enc_layers, dropout_rate=dropout_rate, transformer_dropout=transformer_dropout,
+            food_embed_dim, food_embed_adapter_dim, hidden_dim,
+            num_foods, macro_dim, max_meals,
+            num_heads=num_heads,
+            num_layers=transformer_encoder_layers,
+            dropout_rate=dropout_rate,
+            transformer_dropout=transformer_dropout,
             bootstrap_food_id_embeddings=bootstrap_food_id_embeddings
         )
-        # self.glucose_encoder = GlucoseEncoder(
-        #     hidden_dim, num_heads, enc_layers, glucose_seq_len, dropout_rate=dropout_rate
-        # )
+
+        # 2) Glucose Encoder (patch-based)
         self.glucose_encoder = PatchedGlucoseEncoder(
-            embed_dim=hidden_dim, patch_size=patch_size, patch_stride=patch_stride, num_heads=num_heads, num_layers=enc_layers, max_seq_len=glucose_seq_len, dropout_rate=dropout_rate
+            embed_dim=hidden_dim,
+            patch_size=patch_size,
+            patch_stride=patch_stride,
+            num_heads=num_heads,
+            num_layers=transformer_encoder_layers,
+            max_seq_len=glucose_seq_len,
+            dropout_rate=dropout_rate
         )
 
-        # Cross-Attention Modules with dropout set from transformer_dropout
-        self.cross_attn_past = nn.MultiheadAttention(
-            embed_dim=hidden_dim, num_heads=num_heads, dropout=transformer_dropout, batch_first=True
+        # 3) Transformer Decoder (unified style)
+        dec_layer = TransformerDecoderLayerWithAttn(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 2,
+            dropout=transformer_dropout,
+            activation="relu"
         )
-        self.cross_attn_future = nn.MultiheadAttention(
-            embed_dim=hidden_dim, num_heads=num_heads, dropout=transformer_dropout, batch_first=True
-        )
-
-        # Dropout layer applied after cross-attention outputs and in the forecast MLP
-        self.dropout = nn.Dropout(dropout_rate)
-
-        # Forecast MLP with dropout between layers
-        self.forecast_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, forecast_horizon * num_quantiles)
+        self.decoder = TransformerDecoderWithAttn(
+            dec_layer,
+            num_layers=transformer_decoder_layers,
+            norm=nn.LayerNorm(hidden_dim)
         )
 
+        # Query embeddings for each forecast horizon step
+        self.future_time_queries = nn.Embedding(forecast_horizon, hidden_dim)
+
+        # Final projection: hidden_dim -> num_quantiles
+        self.forecast_linear = nn.Linear(hidden_dim, num_quantiles)
+
+        # Register the quantiles as a buffer
         self.register_buffer("quantiles", torch.linspace(0.05, 0.95, steps=self.num_quantiles))
-        self.last_attn_weights = None
-        self.example_forecasts = None
 
     def forward(
         self,
-        past_glucose,
-        past_meal_ids,
-        past_meal_macros,
-        future_meal_ids,
-        future_meal_macros,
-        target_scales,
+        past_glucose,        # [B, T_glucose]
+        past_meal_ids,       # [B, T_pastMeal, M]
+        past_meal_macros,    # [B, T_pastMeal, M, macro_dim]
+        future_meal_ids,     # [B, T_futureMeal, M]
+        future_meal_macros,  # [B, T_futureMeal, M, macro_dim]
+        target_scales,       # [B, 2] for unscale
         return_attn: bool = False,
-        return_meal_self_attn: bool = False,
+        return_meal_self_attn: bool = False
     ):
-        logging.debug("MealGlucoseForecastModel: --- Forward Pass Start ---")
-        # glucose_enc = self.glucose_encoder(past_glucose)  # [B, T_glucose, hidden_dim]
-        glucose_enc = self.glucose_encoder(past_glucose) # PatchedGlucoseEncoder
+        """
+        Returns either a single tensor [B, T_future, Q]
+        or a tuple if return_attn=True: 
+          (pred_future, past_meal_enc, attn_past, future_meal_enc, attn_future, meal_self_attn_past, meal_self_attn_future)
+        """
+        # 1) Encode glucose
+        glucose_enc = self.glucose_encoder(past_glucose)  # [B, G_patches, hidden_dim]
 
+        # 2) Encode past & future meals (optionally returning meal self-attn)
         if return_meal_self_attn:
-            past_meal_enc, meal_self_attn_past = self.meal_encoder(past_meal_ids, past_meal_macros, return_self_attn=True)
-            future_meal_enc, meal_self_attn_future = self.meal_encoder(future_meal_ids, future_meal_macros, return_self_attn=True)
+            past_meal_enc, meal_self_attn_past = self.meal_encoder(
+                past_meal_ids, past_meal_macros, return_self_attn=True
+            )
+            future_meal_enc, meal_self_attn_future = self.meal_encoder(
+                future_meal_ids, future_meal_macros, return_self_attn=True
+            )
         else:
             past_meal_enc = self.meal_encoder(past_meal_ids, past_meal_macros)
             future_meal_enc = self.meal_encoder(future_meal_ids, future_meal_macros)
+            meal_self_attn_past = None
+            meal_self_attn_future = None
 
-        attn_output_past, attn_weights_past = self.cross_attn_past(
-            query=glucose_enc, key=past_meal_enc, value=past_meal_enc, need_weights=True
-        )
-        attn_output_past = self.dropout(attn_output_past)  # configurable dropout
-        attn_output_future, attn_weights_future = self.cross_attn_future(
-            query=glucose_enc, key=future_meal_enc, value=future_meal_enc, need_weights=True
-        )
-        attn_output_future = self.dropout(attn_output_future)
-        combined_glucose = glucose_enc + attn_output_past + attn_output_future
-        self.last_attn_weights = attn_weights_future
+        # 3) Combine them in a single "memory" sequence
+        #    memory: [B, T_mem, hidden_dim], where T_mem = T_pastMeal + T_futureMeal + G_patches
+        memory = torch.cat([past_meal_enc, future_meal_enc, glucose_enc], dim=1)
 
-        final_rep = torch.cat(
-            [combined_glucose[:, -1, :], future_meal_enc[:, -1, :]],
-            dim=-1
-        )
-        with torch.amp.autocast("cuda", enabled=False):
-            final_rep_fp32 = final_rep.float()
-            pred_future = self.forecast_mlp(final_rep_fp32)
-            pred_future = pred_future.view(final_rep.size(0), self.forecast_horizon, self.num_quantiles)
-            if self.residual_pred:
-                last_val = past_glucose[:, -1].unsqueeze(1).unsqueeze(-1).float()
-                pred_future = pred_future + last_val
-        pred_future = unscale_tensor(pred_future, target_scales)
-        logging.debug("MealGlucoseForecastModel: --- Forward Pass End ---")
+        B = past_glucose.size(0)
+        device = memory.device
+        # Prepare queries for each forecast horizon
+        t_future_idx = torch.arange(self.forecast_horizon, device=device).unsqueeze(0).expand(B, -1)
+        query_emb = self.future_time_queries(t_future_idx)  # [B, T_future, hidden_dim]
+
+        # 4) Decode, optionally capturing cross-attn from the last layer
         if return_attn:
-            if return_meal_self_attn:
-                return (pred_future, past_meal_enc, attn_weights_past, future_meal_enc, attn_weights_future,
-                        meal_self_attn_past, meal_self_attn_future)
-            return (pred_future, past_meal_enc, attn_weights_past, future_meal_enc, attn_weights_future)
-        return pred_future
+            decoder_output, cross_attn = self.decoder(
+                tgt=query_emb,
+                memory=memory,
+                return_attn=True
+            )
+        else:
+            decoder_output, cross_attn = self.decoder(
+                tgt=query_emb,
+                memory=memory,
+                return_attn=False
+            )
+
+        # cross_attn: [B, T_future, T_mem] if return_attn=True
+
+        # Slice out "past" vs. "future" from cross_attn
+        attn_past = None
+        attn_future = None
+        if cross_attn is not None:
+            past_len = past_meal_enc.shape[1]
+            future_len = future_meal_enc.shape[1]
+            # We can ignore the portion that corresponds to glucose_enc if we just want "meals"
+            # memory = [past (0..past_len-1), future (past_len..past_len+future_len-1), glucose]
+            attn_past = cross_attn[:, :, :past_len]  # [B, T_future, past_len]
+            attn_future = cross_attn[:, :, past_len : past_len + future_len]
+
+        # 5) Final projection => [B, T_future, num_quantiles]
+        pred_future = self.forecast_linear(decoder_output)
+
+        # Optionally add last known glucose as a baseline
+        if self.residual_pred:
+            # last_val => shape [B, 1, 1]
+            last_val = past_glucose[:, -1].unsqueeze(1).unsqueeze(-1)
+            pred_future = pred_future + last_val
+
+        # Unscale
+        pred_future = unscale_tensor(pred_future, target_scales)  # [B, T_future, num_quantiles]
+
+        # Return
+        if return_attn:
+            return (
+                pred_future,           # [B, T_future, Q]
+                past_meal_enc, attn_past,      # e.g. shape [B, T_future, past_len]
+                future_meal_enc, attn_future,  # e.g. shape [B, T_future, future_len]
+                meal_self_attn_past, meal_self_attn_future
+            )
+        else:
+            return pred_future
 
     def _compute_forecast_metrics(self, past_glucose, future_glucose, target_scales, preds):
         if isinstance(preds, tuple):
@@ -642,8 +879,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
                 "future_meal_ids": future_meal_ids.detach().cpu(),
                 "past_meal_ids": past_meal_ids.detach().cpu(),
             }
-            self.example_attn_weights_past = attn_past.detach().cpu()
-            self.example_attn_weights_future = attn_future.detach().cpu()
+            self.example_attn_weights_past = attn_past
+            self.example_attn_weights_future = attn_future
             self.example_meal_self_attn_past = meal_self_attn_past # do not detach, as plotting functions needs to do some more processing
             self.example_meal_self_attn_future = meal_self_attn_future # do not detach, as plotting functions needs to do some more processing
         return {
@@ -661,11 +898,10 @@ class MealGlucoseForecastModel(pl.LightningModule):
     def on_validation_epoch_end(self):
         if not hasattr(self, "val_outputs") or len(self.val_outputs) == 0:
             return
+
         outputs = self.val_outputs
         
-        
-        # Rest of the existing validation epoch end code
-        if self.example_forecasts is not None:
+        if (not self.disable_plots) and (self.example_forecasts is not None):
             fixed_indices = getattr(self, "fixed_forecast_indices", None)
             
             if hasattr(self, "example_meal_self_attn_past") and hasattr(self, "example_meal_self_attn_future"):
@@ -847,7 +1083,7 @@ def main(**kwargs):
     config = ExperimentConfig(**kwargs)
 
     if config.debug_mode:
-        config.dataloader_num_workers = 1 # for debugging
+        config.dataloader_num_workers = 1  # for debugging
 
     train_loader, val_loader, training_dataset = get_dataloaders(config)
     
@@ -867,7 +1103,8 @@ def main(**kwargs):
         forecast_horizon=config.prediction_length,
         eval_window=config.eval_window,
         num_heads=config.num_heads,
-        enc_layers=config.enc_layers,
+        transformer_encoder_layers=config.transformer_encoder_layers,
+        transformer_decoder_layers=config.transformer_decoder_layers,
         patch_size=config.patch_size,
         patch_stride=config.patch_stride,
         residual_pred=config.residual_pred,
@@ -876,10 +1113,10 @@ def main(**kwargs):
         dropout_rate=config.dropout_rate,
         transformer_dropout=config.transformer_dropout,
         bootstrap_food_id_embeddings=bootstrap_food_id_embeddings,
-        
         optimizer_lr=config.optimizer_lr,
         weight_decay=config.weight_decay,
-        food_embedding_projection_batch_size=config.food_embedding_projection_batch_size
+        food_embedding_projection_batch_size=config.food_embedding_projection_batch_size,
+        disable_plots=config.disable_plots
     )
     
     # Compile the model
