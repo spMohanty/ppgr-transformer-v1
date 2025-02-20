@@ -67,9 +67,9 @@ def plot_forecast_examples(forecasts, attn_weights_past, attn_weights_future, qu
         
         
         num_past_timesteps = attn_past_i.shape[0]
-        past_meals_xtick_labels = [str(label) for label in range(-num_past_timesteps + 1, 1)]
-        ax_attn_past.set_xticks(np.arange(num_past_timesteps))
-        ax_attn_past.set_xticklabels(past_meals_xtick_labels, rotation=90)
+        ax_attn_past.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+        ax_attn_past.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, pos: f"{int(x - (num_past_timesteps - 1))}"))
+        plt.setp(ax_attn_past.get_xticklabels(), rotation=90)
         
         ax_attn_past.set_title("Past Meals Attention")
         ax_attn_past.set_xlabel("Past Meal Timestep")

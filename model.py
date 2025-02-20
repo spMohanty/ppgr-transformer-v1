@@ -54,9 +54,9 @@ class ExperimentConfig:
     dataloader_num_workers: int = 7  # Added configurable dataloader_num_workers parameter
 
     # Data splitting & sequence parameters
-    min_encoder_length: int = 8 * 4    # e.g., 8 * 4
-    prediction_length: int = 8 * 4     # e.g., 8 * 4
-    eval_window: int = 2 * 4            # e.g., 2 * 4
+    min_encoder_length: int = 8 * 4    # e.g., 8hrs * 4
+    prediction_length: int = 4 * 4     # e.g.,  4hrs * 4
+    eval_window: int = 2 * 4            # e.g., 2hrs * 4
     validation_percentage: float = 0.1
     test_percentage: float = 0.1
 
@@ -82,7 +82,7 @@ class ExperimentConfig:
     hidden_dim: int = 256
     num_heads: int = 4
     enc_layers: int = 2
-    residual_pred: bool = True
+    residual_pred: bool = False
     num_quantiles: int = 7
     loss_iauc_weight: float = 0.00
 
@@ -229,6 +229,7 @@ class MealEncoder(nn.Module):
         self.macro_dim = macro_dim
                 
         self.food_emb = nn.Embedding(num_foods, food_embed_dim, padding_idx=0)
+        self.food_emb_adapter = nn.Linear(food_embed_dim, food_embed_dim) # A linear projection to make it easier to visualize
         self.food_emb_proj = nn.Linear(food_embed_dim, hidden_dim)
         self.macro_proj = nn.Linear(macro_dim, hidden_dim, bias=False)
         self.pos_emb = nn.Embedding(max_meals, hidden_dim)
@@ -255,6 +256,8 @@ class MealEncoder(nn.Module):
         meal_macros_flat = meal_macros.view(B * T, M, -1)
 
         food_emb = self.food_emb(meal_ids_flat)
+        food_emb = self.food_emb_adapter(food_emb)
+        
         food_emb = self.food_emb_proj(food_emb)
         food_emb = self.dropout(food_emb)  # dropout on food embeddings
 
@@ -623,8 +626,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
             # Loop over the embeddings in batches
             for i in tqdm(range(0, food_emb.size(0), batch_size), desc="Projecting food embeddings for visualization"):
                 batch = food_emb[i : i + batch_size]
-                # Forward pass through the projection layer
-                proj_batch = self.meal_encoder.food_emb_proj(batch)
+                # Apply the layers in the correct order: adapter then projection
+                proj_batch = self.meal_encoder.food_emb_adapter(batch)
                 projected_embeddings.append(proj_batch.detach().cpu())
         
         # Concatenate all batches into a single array and convert to numpy
