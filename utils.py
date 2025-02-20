@@ -11,11 +11,16 @@ from pytorch_forecasting.data.encoders import (
 )
 import ast
 
-from tqdm import tqdm
-tqdm.pandas()
+import click
+from typing import Any, Callable, List, Type, Union
+from dataclasses import MISSING, fields
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
+
+from tqdm import tqdm
+tqdm.pandas()
+
 def create_slice(df: pd.DataFrame, slice_start: int, slice_end: int) -> pd.DataFrame:
     """
     Create a time-series slice with a unique cluster id and a time index.
@@ -373,3 +378,75 @@ def unscale_tensor(tensor, target_scales):
         offset = offset.unsqueeze(-1)
         scale = scale.unsqueeze(-1)
     return tensor * scale + offset 
+
+
+def create_click_options(config_class: Type[Any]) -> Callable:
+    """
+    Create a decorator that adds Click options based on the fields of a 
+    dataclass configuration. This updated version supports the new 
+    ExperimentConfig class by handling fields with a default_factory
+    and Optional types.
+
+    Args:
+        config_class: A dataclass type (e.g. ExperimentConfig) containing configuration parameters.
+
+    Returns:
+        A decorator that can be applied to a Click command function.
+    """
+    # Mapping for converting dataclass types to click types
+    type_mapping = {str: str, int: int, float: float, bool: bool}
+
+    def decorator(f: Callable) -> Callable:
+        # Iterate in reverse so that decorators are applied in the correct order.
+        for field in reversed(list(fields(config_class))):
+            # Get the raw field type.
+            field_type = field.type
+
+            # If the field type is Optional[T] (i.e. Union[T, None]), extract T.
+            if hasattr(field.type, '__origin__') and field.type.__origin__ is Union:
+                non_none_types = [arg for arg in field.type.__args__ if arg is not type(None)]
+                if len(non_none_types) == 1:
+                    field_type = non_none_types[0]
+
+            # Convert the field type using our mapping (or leave it as is)
+            click_type = type_mapping.get(field_type, field_type)
+
+            # Handle defaults: check for both a default value and a default_factory.
+            if field.default is MISSING and field.default_factory is MISSING:
+                option_kwargs = {"required": True, "help": "Required parameter"}
+            else:
+                if field.default is not MISSING:
+                    default_val = field.default
+                else:
+                    default_val = field.default_factory()
+                option_kwargs = {
+                    "default": default_val,
+                    "show_default": True,
+                    "help": f"Default: {default_val}",
+                }
+
+            # Special handling for boolean fields: use dual flag syntax.
+            if click_type == bool:
+                hyphen_declaration = f"--{field.name.replace('_', '-')}/--no-{field.name.replace('_', '-')}"
+                underscore_declaration = f"--{field.name}/--no-{field.name}"
+                option_names = [hyphen_declaration, underscore_declaration]
+
+                # For special cases, e.g. "debug_mode", add additional alias if needed.
+                if field.name == "debug_mode":
+                    option_names.append("--debug/--no-debug")
+
+                f = click.option(
+                    *option_names,
+                    default=default_val,
+                    show_default=True,
+                    help=f"Default: {default_val}"
+                )(f)
+            else:
+                # Create both hyphenated and underscored option names.
+                hyphen_name = f"--{field.name.replace('_', '-')}"
+                underscore_name = f"--{field.name}"
+                option_names = [hyphen_name, underscore_name]
+                f = click.option(*option_names, type=click_type, **option_kwargs)(f)
+        return f
+
+    return decorator

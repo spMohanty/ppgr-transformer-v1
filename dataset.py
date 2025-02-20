@@ -409,6 +409,8 @@ class PPGRTimeSeriesDataset(Dataset):
         # Compute the mapping from MFR food_id to internal food id.
         # Although this mapping is not used further for reordering, it confirms consistency.
         mfr_food_id_to_internal_food_id = self.categorical_encoders["food_id"].classes_
+        
+        # This is the ordering of the internal id vs the food_embeddings_df.index
         food_embeddings_df_internal_food_ids = [mfr_food_id_to_internal_food_id[str(mfr_food_id)] for mfr_food_id in self.food_embeddings_df.index]
         food_embeddings_df_internal_food_ids = torch.tensor(food_embeddings_df_internal_food_ids)
 
@@ -427,7 +429,19 @@ class PPGRTimeSeriesDataset(Dataset):
         self.food_id_embeddings_layer.weight.data.zero_() # default weight of 0 for nan values
         embeddings_tensor = torch.stack(self.food_embeddings_df["embedding"].tolist())
         self.food_id_embeddings_layer.weight.data[food_embeddings_df_internal_food_ids] = embeddings_tensor
-    
+        
+        # Gather human readable food names for easier debugging        
+        # Reorder to match the ordering of the embeddings
+        custom_order = list(self.categorical_encoders["food_id"].classes_.keys())[1:] # skip the nan value
+        custom_order = [int(x) for x in custom_order]
+        unique_foods_df = self.food_embeddings_df.loc[custom_order]
+                
+        # reconcile the name to use the available name in another language if its not available in english        
+        unique_foods_df['display_name'] = unique_foods_df['display_name_en'].fillna(unique_foods_df['display_name_fr']).fillna(unique_foods_df['display_name_de'])
+
+        # Add a human readable list of food names for the model plotters to readily use
+        self.food_names = ["UNKNOWN"] + unique_foods_df["display_name"].tolist() # Add UNKNOWN to represent the nan value as 0 index 
+            
     def get_food_id_embeddings_layer(self):
         """
         Get the embeddings for the given food ids
@@ -1020,8 +1034,6 @@ class PPGRToMealGlucoseWrapper(Dataset):
             max_meals (int, optional): Maximum number of meals per timestep. If None, the wrapper
                                        will use ppgr_dataset.max_meals_per_timestep if available;
                                        otherwise, it defaults to 11.
-            num_foods (int, optional): Total number of distinct food IDs. If None, the wrapper will
-                                       attempt to extract it from ppgr_dataset.categorical_encoders["food_id"].
         """
         self.ppgr_dataset = ppgr_dataset
         
@@ -1035,18 +1047,13 @@ class PPGRToMealGlucoseWrapper(Dataset):
             self.max_meals = max_meals
 
         # Determine num_foods from the food_id encoder if available
-        if num_foods is None:
-            if hasattr(ppgr_dataset, "categorical_encoders") and "food_id" in ppgr_dataset.categorical_encoders:
-                food_encoder = ppgr_dataset.categorical_encoders["food_id"]
-                # +1 for padding (assumed index 0)
-                self.num_foods = len(food_encoder.classes_) 
-                self.food_names = food_encoder.classes_ # Overriding the food names
-            else:
-                self.num_foods = None
+        if hasattr(ppgr_dataset, "categorical_encoders") and "food_id" in ppgr_dataset.categorical_encoders:
+            # +1 for padding (assumed index 0)
+            self.food_names = self.ppgr_dataset.food_names
+            self.num_foods = len(self.food_names)
         else:
-            self.num_foods = num_foods
-            self.food_names = food_names
-
+            self.num_foods = None
+            
         # Determine the number of nutrient dimensions from the dataset's food_reals list.
         if hasattr(ppgr_dataset, "food_reals"):
             self.num_nutrients = len(ppgr_dataset.food_reals)
@@ -1056,7 +1063,7 @@ class PPGRToMealGlucoseWrapper(Dataset):
     def __len__(self):
         return len(self.ppgr_dataset)
 
-    def get_food_id_embeddings_layer(self):
+    def get_food_id_embeddings(self):
         """
         Get the food id embeddings layer to bootstrap the model's food id embeddings
         """

@@ -34,13 +34,20 @@ import wandb
 from dataset import create_cached_dataset
 from utils import unscale_tensor
 
+from loguru import logger
+
+from tqdm import tqdm
+
+from utils import create_click_options
+from plot_helpers import plot_meal_self_attention, plot_forecast_examples, plot_iAUC_scatter, plot_meal_self_attention
+
 # -----------------------------------------------------------------------------
 # Experiment Configuration
 # -----------------------------------------------------------------------------
 @dataclass
 class ExperimentConfig:
     # Dataset / caching settings
-    dataset_version: str = "v0.4"
+    dataset_version: str = "v0.5"
     cache_dir: str = "/scratch/mohanty/food/ppgr-v1/datasets-cache"
     use_cache: bool = True
     debug_mode: bool = False
@@ -71,13 +78,13 @@ class ExperimentConfig:
     targets: list = None
 
     # Model hyperparameters
-    food_embed_dim: int = 64
+    food_embed_dim: int = 64 # If bootstrapping from pre-trained embeddings, this is treated as max-dimensions to use from them
     hidden_dim: int = 256
     num_heads: int = 4
     enc_layers: int = 2
     residual_pred: bool = True
     num_quantiles: int = 7
-    loss_iAUC_weight: float = 0.00
+    loss_iauc_weight: float = 0.00
 
     # New dropout hyperparameters
     dropout_rate: float = 0.1          # Used for projections, cross-attention, forecast MLP, etc.
@@ -85,7 +92,7 @@ class ExperimentConfig:
 
     # Training hyperparameters
     batch_size: int = 1024 * 2
-    max_epochs: int = 5
+    max_epochs: int = 10
     optimizer_lr: float = 1e-4
     weight_decay: float = 1e-5
     gradient_clip_val: float = 0.1  # Added gradient clipping parameter
@@ -96,6 +103,9 @@ class ExperimentConfig:
 
     # Precision
     precision: str = "bf16"
+
+    # Batch size for projecting food embeddings when logging
+    food_embedding_projection_batch_size: int = 1024 * 4
 
     def __post_init__(self):
         # Set default lists if not provided.
@@ -209,6 +219,7 @@ class MealEncoder(nn.Module):
         num_layers: int = 1,
         dropout_rate: float = 0.2,
         transformer_dropout: float = 0.1,
+        bootstrap_food_id_embeddings: nn.Embedding = None
     ):
         super(MealEncoder, self).__init__()
         self.food_embed_dim = food_embed_dim
@@ -216,12 +227,14 @@ class MealEncoder(nn.Module):
         self.max_meals = max_meals
         self.num_foods = num_foods
         self.macro_dim = macro_dim
-
+                
         self.food_emb = nn.Embedding(num_foods, food_embed_dim, padding_idx=0)
         self.food_emb_proj = nn.Linear(food_embed_dim, hidden_dim)
         self.macro_proj = nn.Linear(macro_dim, hidden_dim, bias=False)
         self.pos_emb = nn.Embedding(max_meals, hidden_dim)
         self.start_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        
+        self.bootstrap_food_id_embeddings(bootstrap_food_id_embeddings)
 
         # Use the configurable dropout rate
         self.dropout = nn.Dropout(dropout_rate)
@@ -235,7 +248,7 @@ class MealEncoder(nn.Module):
         )
         norm = nn.LayerNorm(hidden_dim)
         self.encoder = TransformerEncoderWithAttn(encoder_layer, num_layers=num_layers, norm=norm)
-
+    
     def forward(self, meal_ids: torch.LongTensor, meal_macros: torch.Tensor, return_self_attn: bool = False):
         B, T, M = meal_ids.size()
         meal_ids_flat = meal_ids.view(B * T, M)
@@ -275,6 +288,15 @@ class MealEncoder(nn.Module):
             self_attn = self_attn.view(B, T, num_tokens, num_tokens)
             return meal_timestep_emb, self_attn
         return meal_timestep_emb
+
+    def bootstrap_food_id_embeddings(self, bootstrap_food_id_embeddings: nn.Embedding):
+        # Bootstrap the food id embeddings to pre-computed ones
+        if bootstrap_food_id_embeddings is not None:
+            with torch.no_grad():
+                logger.warning(f"Bootstrapping food id embeddings with {self.food_embed_dim} dimensions of pre-computed embeddings")
+                self.food_emb.weight.copy_(bootstrap_food_id_embeddings.weight[:, :self.food_embed_dim])
+            logger.warning(f"Food id embeddings have been frozen")
+            self.food_emb.weight.requires_grad = False  # Freeze the food id embeddings        
 
 # -----------------------------------------------------------------------------
 # Glucose Encoder (dropout configurable)
@@ -328,9 +350,13 @@ class MealGlucoseForecastModel(pl.LightningModule):
         enc_layers: int = 1,
         residual_pred: bool = True,
         num_quantiles: int = 7,
-        loss_iAUC_weight: float = 1,
+        loss_iauc_weight: float = 1,
         dropout_rate: float = 0.2,
         transformer_dropout: float = 0.1,
+        bootstrap_food_id_embeddings: nn.Embedding = None,
+        optimizer_lr: float = 1e-4,            
+        weight_decay: float = 1e-5,
+        food_embedding_projection_batch_size: int = 1025   # NEW configurable parameter
     ):
         super(MealGlucoseForecastModel, self).__init__()
         self.forecast_horizon = forecast_horizon
@@ -343,12 +369,19 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.macro_dim = macro_dim
         self.residual_pred = residual_pred
         self.num_quantiles = num_quantiles
-        self.loss_iAUC_weight = loss_iAUC_weight
+        self.loss_iauc_weight = loss_iauc_weight
+
+        self.optimizer_lr = optimizer_lr       
+        self.weight_decay = weight_decay       
+
+        # NEW: store the configurable batch size for food embeddings logging
+        self.food_embedding_projection_batch_size = food_embedding_projection_batch_size
 
         # Encoders with configurable dropout
         self.meal_encoder = MealEncoder(
             food_embed_dim, hidden_dim, num_foods, macro_dim, max_meals,
-            num_heads, enc_layers, dropout_rate=dropout_rate, transformer_dropout=transformer_dropout
+            num_heads, enc_layers, dropout_rate=dropout_rate, transformer_dropout=transformer_dropout,
+            bootstrap_food_id_embeddings=bootstrap_food_id_embeddings
         )
         self.glucose_encoder = GlucoseEncoder(
             hidden_dim, num_heads, enc_layers, glucose_seq_len, dropout_rate=dropout_rate
@@ -447,7 +480,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             median_pred, future_glucose, past_glucose, target_scales, eval_window=self.eval_window
         )
         iAUC_loss = F.mse_loss(pred_iAUC, true_iAUC)
-        weighted_iAUC_loss = self.loss_iAUC_weight * iAUC_loss
+        weighted_iAUC_loss = self.loss_iauc_weight * iAUC_loss
         total_loss = q_loss + weighted_iAUC_loss
         return {
             "q_loss": q_loss,
@@ -524,35 +557,18 @@ class MealGlucoseForecastModel(pl.LightningModule):
             "true_iAUC": metrics["true_iAUC"],
         }
 
+    def on_train_start(self):
+        self.log_food_embeddings("train_start")
+        
+    def on_train_end(self):
+        self.log_food_embeddings("train_end")
+
     def on_validation_epoch_end(self):
         if not hasattr(self, "val_outputs") or len(self.val_outputs) == 0:
             return
         outputs = self.val_outputs
         
-        # Convert food embeddings to pandas DataFrame
-        food_embeddings = self.meal_encoder.food_emb.weight.detach().cpu().numpy()
         
-        # Create column names for the DataFrame
-        embedding_cols = [f"embedding_{i}" for i in range(self.food_embed_dim)]
-        food_vocab = [f"food_id_{i}" for i in range(self.num_foods)]
-        
-        
-        
-        dataset = self.trainer.val_dataloaders.dataset
-        dataset.num_foods
-        len(dataset.ppgr_dataset.categorical_encoders["food_id"].classes_)
-        
-        
-        breakpoint()
-                
-        
-        # Log to wandb as before
-        self.logger.experiment.log({"food_embeddings": wandb.Table(
-            data=food_embeddings,
-            columns=embedding_cols,
-        )}, step=self.global_step)
-        
-                
         # Rest of the existing validation epoch end code
         if self.example_forecasts is not None:
             fixed_indices = getattr(self, "fixed_forecast_indices", None)
@@ -594,8 +610,44 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.log("val_iAUC_corr", corr.item(), prog_bar=True)
         self.val_outputs.clear()
 
+    def log_food_embeddings(self, label: str):
+        logger.info(f"Logging food embeddings for {label}")
+        # Retrieve the food embeddings from the embedding layer
+        food_emb = self.meal_encoder.food_emb.weight  # shape: (num_foods, food_embed_dim)
+        
+        # Process the embeddings in batches using the configurable batch size
+        batch_size = self.food_embedding_projection_batch_size  # NEW: now configurable through ExperimentConfig
+        projected_embeddings = []
+        
+        with torch.no_grad():
+            # Loop over the embeddings in batches
+            for i in tqdm(range(0, food_emb.size(0), batch_size), desc="Projecting food embeddings for visualization"):
+                batch = food_emb[i : i + batch_size]
+                # Forward pass through the projection layer
+                proj_batch = self.meal_encoder.food_emb_proj(batch)
+                projected_embeddings.append(proj_batch.detach().cpu())
+        
+        # Concatenate all batches into a single array and convert to numpy
+        projected_embeddings = torch.cat(projected_embeddings, dim=0).numpy()
+        embedding_cols = [f"proj_embedding_{i}" for i in range(projected_embeddings.shape[1])]
+        
+        # Retrieve food names from your dataset (assuming they are available as a list)
+        dataset = self.trainer.val_dataloaders.dataset
+        food_names = dataset.food_names  # a list of food names corresponding to each row
+        
+        # Create a DataFrame with the projected embeddings and insert the food names as the first column
+        food_embeddings_df = pd.DataFrame(projected_embeddings, columns=embedding_cols)
+        food_embeddings_df.insert(0, 'food_name', food_names)
+        
+        # Log the DataFrame as a WandB Table
+        self.logger.experiment.log({f"food_embeddings_{label}": wandb.Table(dataframe=food_embeddings_df)})
+
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=1e-4, weight_decay=1e-5)
+        return torch.optim.AdamW(
+            self.parameters(),
+            lr=self.optimizer_lr,
+            weight_decay=self.weight_decay
+        )
 
     def on_train_epoch_end(self):
         pass
@@ -624,292 +676,6 @@ def compute_iAUC(median_pred, future_glucose, past_glucose, target_scales, eval_
     pred_iAUC = torch.trapz(torch.clamp(pred_diff, min=0), dx=1, dim=1)
     true_iAUC = torch.trapz(torch.clamp(true_diff, min=0), dx=1, dim=1)
     return pred_iAUC, true_iAUC
-
-# -----------------------------------------------------------------------------
-# Plotting Functions
-# -----------------------------------------------------------------------------
-def plot_forecast_examples(forecasts, attn_weights_past, attn_weights_future, quantiles, logger, global_step, fixed_indices=None):
-    past = forecasts["past"]
-    pred = forecasts["pred"]
-    truth = forecasts["truth"]
-    meal_ids_future = forecasts["future_meal_ids"]
-    meal_ids_past = forecasts["past_meal_ids"]
-    num_examples = min(4, past.size(0))
-    if fixed_indices is None:
-        fixed_indices = random.sample(list(range(past.size(0))), num_examples)
-    sampled_indices = fixed_indices
-    fig, axs = plt.subplots(num_examples, 3, figsize=(18, 4 * num_examples))
-    if num_examples == 1:
-        axs = [axs]
-    for i, idx in enumerate(sampled_indices):
-        ax_ts = axs[i][0]
-        ax_attn_past = axs[i][1]
-        ax_attn_future = axs[i][2]
-        past_i = past[idx].cpu().numpy()
-        pred_i = pred[idx].cpu().numpy()
-        truth_i = truth[idx].cpu().numpy()
-        attn_past_i = attn_weights_past[idx].cpu().numpy()
-        attn_future_i = attn_weights_future[idx].cpu().numpy()
-        T_context = past_i.shape[0]
-        T_forecast = pred_i.shape[0]
-        x_hist = list(range(-T_context + 1, 1))
-        x_forecast = list(range(1, T_forecast + 1))
-        ax_ts.plot(x_hist, past_i, marker="o", markersize=2, label="Historical Glucose")
-        ax_ts.plot(x_forecast, truth_i, marker="o", markersize=2, label="Ground Truth Forecast")
-        num_q = pred_i.shape[1]
-        base_color = "blue"
-        median_index = num_q // 2
-        for qi in range(num_q - 1):
-            alpha_val = 0.1 + (abs(qi - median_index)) * 0.05
-            ax_ts.fill_between(x_forecast, pred_i[:, qi], pred_i[:, qi + 1], color=base_color, alpha=alpha_val / 2)
-        ax_ts.plot(x_forecast, pred_i[:, median_index], marker="o", markersize=2, color="darkblue", label="Median Forecast")
-        meal_label_added = False
-        meals_past = meal_ids_past[idx].cpu().numpy()
-        T_past = meals_past.shape[0]
-        for t, meal in enumerate(meals_past):
-            if (meal != 0).any():
-                relative_time = t - T_past + 1
-                if not meal_label_added:
-                    ax_ts.axvline(x=relative_time, color="purple", linestyle="--", alpha=0.7, label="Meal Consumption")
-                    meal_label_added = True
-                else:
-                    ax_ts.axvline(x=relative_time, color="purple", linestyle="--", alpha=0.7)
-        meals_future = meal_ids_future[idx].cpu().numpy()
-        for t, meal in enumerate(meals_future):
-            if (meal != 0).any():
-                relative_time = t + 1
-                ax_ts.axvline(x=relative_time, color="purple", linestyle="--", alpha=0.7)
-        ax_ts.set_xlabel("Relative Timestep")
-        ax_ts.set_ylabel("Glucose Level")
-        ax_ts.set_title(f"Forecast Example {i} (Idx: {idx})")
-        ax_ts.legend(fontsize="small")
-        im_past = ax_attn_past.imshow(attn_past_i, aspect="auto", cmap="viridis")
-        ax_attn_past.set_title("Past Meals Attention")
-        ax_attn_past.set_xlabel("Past Meal Timestep")
-        ax_attn_past.set_ylabel("Glucose Timestep")
-        fig.colorbar(im_past, ax=ax_attn_past, fraction=0.046, pad=0.04)
-        im_future = ax_attn_future.imshow(attn_future_i, aspect="auto", cmap="viridis")
-        ax_attn_future.set_title("Future Meals Attention")
-        ax_attn_future.set_xlabel("Future Meal Timestep")
-        ax_attn_future.set_ylabel("Glucose Timestep")
-        fig.colorbar(im_future, ax=ax_attn_future, fraction=0.046, pad=0.04)
-    fig.tight_layout()
-    logger.experiment.log({"forecast_samples": wandb.Image(fig), "global_step": global_step})
-    return fixed_indices, fig
-
-def plot_iAUC_scatter(all_pred_iAUC, all_true_iAUC):
-    mean_pred = torch.mean(all_pred_iAUC)
-    mean_true = torch.mean(all_true_iAUC)
-    cov = torch.mean((all_true_iAUC - mean_true) * (all_pred_iAUC - mean_pred))
-    std_true = torch.std(all_true_iAUC, unbiased=False)
-    std_pred = torch.std(all_pred_iAUC, unbiased=False)
-    corr = cov / (std_true * std_pred)
-    fig_scatter, ax_scatter = plt.subplots(figsize=(6, 6))
-    ax_scatter.scatter(all_true_iAUC.cpu().numpy(), all_pred_iAUC.cpu().numpy(), alpha=0.5, s=0.5)
-    ax_scatter.set_xlabel("True iAUC")
-    ax_scatter.set_ylabel("Predicted iAUC")
-    ax_scatter.set_title("iAUC Scatter Plot")
-    ax_scatter.grid(True)
-    ax_scatter.text(0.05, 0.95, f'Corr: {corr.item():.2f}', transform=ax_scatter.transAxes,
-                    fontsize=12, verticalalignment='top', bbox=dict(facecolor='white', alpha=0.5))
-    return fig_scatter, corr
-
-def pack_valid_attn_subblocks(attn_4d: torch.Tensor, meal_ids_3d: torch.Tensor):
-    """
-    Extract valid sub-blocks from attention [B,T,M,M] by removing padding around
-    meal tokens.  Returns one "big" 2D numpy array, plus the total height (sum
-    of valid M_i) and the max width (max(M_i)).
-    
-    attn_4d: [B, T, M, M] attention.  We'll ignore the start token dimension, so
-             effectively we treat it as attn_4d[:, :, 1:, 1:].
-    meal_ids_3d: [B, T, M] corresponding meal IDs.  A value of 0 means "padded".
-    """
-    # 1) Strip off the first row/col if you're ignoring the "start token"
-    attn_4d = attn_4d[:, :, 1:, 1:]  # shape [B, T, M-1, M-1]
-    meal_ids_3d = meal_ids_3d[:, :, 1:]  # shape [B, T, M-1]
-
-    B, T, M, _ = attn_4d.shape
-    # For each (b, t), figure out how many valid tokens there actually are:
-    # (i.e. the number of non‐zero meal_ids).
-    subblocks = []
-    sizes = []
-    for b in range(B):
-        for t in range(T):
-            meal_ids_slice = meal_ids_3d[b, t]  # shape [M]
-            valid_count = (meal_ids_slice != 0).sum().item()
-            if valid_count > 0:
-                # slice out the valid sub-block [valid_count x valid_count]
-                block = attn_4d[b, t, :valid_count, :valid_count]
-                subblocks.append(block.cpu().numpy())
-                sizes.append(valid_count)
-
-    if not subblocks:
-        # No valid sub‐blocks at all
-        return np.zeros((1,1)), 1, 1
-
-    # 2) Figure out how large an array we need:
-    # Height is sum of all valid_counts, width is max of valid_counts
-    total_height = sum(sizes)
-    max_width = max(sizes)
-
-    # 3) Create the big 2D array (we will fill it with NaN so that any "unfilled"
-    # region is just blank).
-    big_array = np.full((total_height, max_width), np.nan, dtype=np.float32)
-
-    # 4) Copy each sub‐block in, one under the other
-    row_offset = 0
-    for block, size in zip(subblocks, sizes):
-        big_array[row_offset:row_offset+size, 0:size] = block
-        row_offset += size
-
-    return big_array, total_height, max_width
-
-
-def plot_meal_self_attention(
-    attn_weights_past: torch.Tensor,
-    meal_ids_past: torch.Tensor,
-    attn_weights_future: torch.Tensor,
-    meal_ids_future: torch.Tensor,
-    logger,
-    global_step: int,
-    fixed_indices: list = None,
-    max_examples: int = 3,
-    random_samples: bool = True
-):
-    """
-    Show up to `max_examples` samples from the batch, each in its own row of a
-    2-column figure: left = self-attn for the 'past' meals, right = self-attn
-    for the 'future' meals.
-    """
-    # Decide which batch indices we will plot:
-    batch_size = attn_weights_past.size(0)
-    if fixed_indices is not None:
-        # Use the fixed indices provided (limit to at most max_examples)
-        indices = fixed_indices[:min(max_examples, len(fixed_indices))]
-    elif random_samples:
-        indices = random.sample(range(batch_size), k=min(max_examples, batch_size))
-    else:
-        indices = list(range(min(max_examples, batch_size)))
-
-    # Increase figure size and adjust spacing
-    fig, axes = plt.subplots(
-        nrows=len(indices), 
-        ncols=2, 
-        figsize=(16, 5 * len(indices)),  # Wider figure, more height per row
-        constrained_layout=True  # Better automatic layout handling
-    )
-    if len(indices) == 1:
-        axes = [axes]
-
-    # A helper that packs sub-blocks and returns boundaries to draw horizontal lines.
-    def pack_with_boundaries(attn_4d, meal_ids_3d):
-        """
-        Returns (big_array, subblock_row_boundaries).
-
-        big_array is the result of pack_valid_attn_subblocks.
-        subblock_row_boundaries is the cumulative row index after each sub-block.
-        """
-        # Strip off "start token" dimension:
-        attn_4d = attn_4d[:, :, 1:, 1:]    # shape [B, T, M-1, M-1]
-        meal_ids_3d = meal_ids_3d[:, :, 1:]  # shape [B, T, M-1]
-
-        # We only have a single sample in [B], so drop that dimension:
-        attn_4d = attn_4d[0]      # [T, M-1, M-1]
-        meal_ids_3d = meal_ids_3d[0]  # [T, M-1]
-
-        subblocks = []
-        sizes = []
-        for t in range(attn_4d.size(0)):
-            meal_ids_slice = meal_ids_3d[t]
-            valid_count = (meal_ids_slice != 0).sum().item()
-            if valid_count > 0:
-                block = attn_4d[t, :valid_count, :valid_count]
-                subblocks.append(block.cpu().numpy())
-                sizes.append(valid_count)
-        
-        if not subblocks:
-            return np.zeros((1, 1), dtype=np.float32), []
-
-        # Create big packed array:
-        total_height = sum(sizes)
-        max_width = max(sizes)
-        big_array = np.full((total_height, max_width), np.nan, dtype=np.float32)
-
-        boundaries = []
-        row_offset = 0
-        for sz, sb in zip(sizes, subblocks):
-            big_array[row_offset:row_offset+sz, 0:sz] = sb
-            row_offset += sz
-            boundaries.append(row_offset)  # The boundary after this sub-block
-
-        return big_array, boundaries
-
-    # Define a consistent colormap and normalization
-    cmap = plt.cm.viridis
-    norm = plt.Normalize(vmin=0, vmax=1)
-
-    # Loop over the chosen examples:
-    for row_i, idx in enumerate(indices):
-        ax_past = axes[row_i][0]
-        ax_fut = axes[row_i][1]
-
-        # Extract the single sample's T×M×M from the batch:
-        attn_past_1 = attn_weights_past[idx:idx+1]   # shape [1,T,M,M]
-        meals_past_1 = meal_ids_past[idx:idx+1]        # shape [1,T,M]
-        attn_fut_1  = attn_weights_future[idx:idx+1]   # shape [1,T,M,M]
-        meals_fut_1 = meal_ids_future[idx:idx+1]        # shape [1,T,M]
-
-        # Pack and plot with improved formatting
-        packed_past, boundaries_past = pack_with_boundaries(attn_past_1, meals_past_1)
-        packed_fut, boundaries_future = pack_with_boundaries(attn_fut_1, meals_fut_1)
-
-        # Past attention plot
-        im_past = ax_past.imshow(packed_past, aspect="auto", cmap=cmap, norm=norm)
-        ax_past.set_title(f"Sample {idx} - Past Self-Attention", pad=10, fontsize=12)
-        ax_past.set_xlabel("Token Position", fontsize=10)
-        ax_past.set_ylabel("Stacked Timesteps", fontsize=10)
-        
-        # Add boundaries with improved visibility
-        for b in boundaries_past:
-            ax_past.axhline(y=b-0.5, color="white", linestyle="--", linewidth=0.8, alpha=0.6)
-        
-        # Customize ticks
-        ax_past.tick_params(axis='both', which='major', labelsize=9)
-
-        # Future attention plot
-        im_fut = ax_fut.imshow(packed_fut, aspect="auto", cmap=cmap, norm=norm)
-        ax_fut.set_title(f"Sample {idx} - Future Self-Attention", pad=10, fontsize=12)
-        ax_fut.set_xlabel("Token Position", fontsize=10)
-        ax_fut.set_ylabel("Stacked Timesteps", fontsize=10)
-        
-        # Add boundaries with improved visibility
-        for b in boundaries_future:
-            ax_fut.axhline(y=b-0.5, color="white", linestyle="--", linewidth=0.8, alpha=0.6)
-        
-        # Customize ticks
-        ax_fut.tick_params(axis='both', which='major', labelsize=9)
-
-        # Add gridlines for better readability
-        ax_past.grid(False)
-        ax_fut.grid(False)
-
-    # Main title with improved positioning
-    fig.suptitle("Meal Self-Attention for Selected Samples", 
-                 fontsize=14, 
-                 y=1.01,  # Slightly adjusted for constrained_layout
-                 fontweight='bold')
-
-    # Add a single colorbar with better positioning and formatting
-    cbar = fig.colorbar(im_fut, ax=axes, 
-                       aspect=30)
-    cbar.ax.set_ylabel("Attention Weight", fontsize=10)
-    cbar.ax.tick_params(labelsize=9)
-
-    # Log to WandB
-    logger.experiment.log({"meal_self_attention_samples": wandb.Image(fig), 
-                          "global_step": global_step})
-    plt.close(fig)
-    return fig
 
 # -----------------------------------------------------------------------------
 # DataLoader & Trainer Setup Functions
@@ -985,17 +751,21 @@ def get_trainer(config: ExperimentConfig, callbacks):
 # Main Training & Evaluation Entry Point
 # -----------------------------------------------------------------------------
 @click.command()
-@click.option("--debug/--no-debug", default=False, help="Enable debug logging.")
-@click.option("--no-cache", is_flag=True, default=False, help="Ignore cached datasets and rebuild dataset from scratch.")
-@click.option("--precision", type=click.Choice(["32", "bf16"]), default="bf16", help="Training precision: bf16 or 32")
-def main(debug, no_cache, precision):
-    logging.getLogger().setLevel(logging.DEBUG if debug else logging.INFO)
-    logging.info(f"Starting main with debug={debug}, no_cache={no_cache}, precision={precision}.")
-    config = ExperimentConfig(debug_mode=debug, use_cache=not no_cache, precision=precision)
-    config.min_encoder_length = 32
-    config.prediction_length = 32
-    config.eval_window = 8
+@create_click_options(ExperimentConfig)
+def main(**kwargs):
+    logging.getLogger().setLevel(logging.DEBUG if kwargs["debug_mode"] else logging.INFO)
+    config = ExperimentConfig(**kwargs)
+
+    if config.debug_mode:
+        config.dataloader_num_workers = 1 # for debugging
+
     train_loader, val_loader, training_dataset = get_dataloaders(config)
+    
+    if config.use_bootstraped_food_embeddings:
+        bootstrap_food_id_embeddings = training_dataset.get_food_id_embeddings()
+    else:
+        bootstrap_food_id_embeddings = None
+    
     model = MealGlucoseForecastModel(
         food_embed_dim=config.food_embed_dim,
         hidden_dim=config.hidden_dim,
@@ -1009,9 +779,14 @@ def main(debug, no_cache, precision):
         enc_layers=config.enc_layers,
         residual_pred=config.residual_pred,
         num_quantiles=config.num_quantiles,
-        loss_iAUC_weight=config.loss_iAUC_weight,
+        loss_iauc_weight=config.loss_iauc_weight,
         dropout_rate=config.dropout_rate,
         transformer_dropout=config.transformer_dropout,
+        bootstrap_food_id_embeddings=bootstrap_food_id_embeddings,
+        
+        optimizer_lr=config.optimizer_lr,
+        weight_decay=config.weight_decay,
+        food_embedding_projection_batch_size=config.food_embedding_projection_batch_size
     )
     
     # Compile the model
