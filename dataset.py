@@ -26,7 +26,6 @@ import p_tqdm
 import numpy as np
 import hashlib
 import os
-import logging
 
 import random
 
@@ -1222,6 +1221,7 @@ def create_cached_dataset(
     }
     
     logger.info(f"Loading dataset with the following config: {config}")
+    
 
     # 2) Compute a unique hash from the config
     import pickle  # Only used for hashing the config; caching itself is now handled by torch.save
@@ -1231,7 +1231,7 @@ def create_cached_dataset(
 
     # 3) If cache exists and caching is enabled, load & return immediately using torch.load
     if use_cache and os.path.exists(cache_file):
-        logging.info(f"[CACHE-HIT] Loading pipeline from: {cache_file}")
+        logger.info(f"[CACHE-HIT] Loading pipeline from: {cache_file}")
         cached_data = torch.load(cache_file, weights_only=False)
         return (
             cached_data["training_dataset"],
@@ -1242,7 +1242,7 @@ def create_cached_dataset(
         )
 
     # 4) Otherwise, proceed to load & build everything
-    logging.info("[CACHE-MISS] Building dataset from scratch...")
+    logger.info("[CACHE-MISS] Building dataset from scratch...")
     os.makedirs(cache_dir, exist_ok=True)
 
     # Load base dataframes
@@ -1380,7 +1380,7 @@ def create_cached_dataset(
         "continuous_scalers": continuous_scalers,
     }
     torch.save(cache_dict, cache_file)
-    logging.info(f"Dataset pipeline built and saved to cache: {cache_file}")
+    logger.info(f"Dataset pipeline built and saved to cache: {cache_file}")
     return (
         wrapped_training_dataset,
         wrapped_validation_dataset,

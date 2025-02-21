@@ -62,6 +62,7 @@ class ExperimentConfig:
     batch_size: int = 1024 * 2
     max_epochs: int = 50
     optimizer_lr: float = 1e-4
+    optimizer_lr_scheduler_pct_start: float = 0.1
     weight_decay: float = 1e-5
     gradient_clip_val: float = 0.1  # Added gradient clipping parameter
 

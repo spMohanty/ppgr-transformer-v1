@@ -44,6 +44,8 @@ from plot_helpers import plot_meal_self_attention, plot_forecast_examples, plot_
 
 from config import ExperimentConfig, generate_experiment_name
 
+from callbacks import LRSchedulerCallback
+
 # -----------------------------------------------------------------------------
 #   - "TransformerEncoderLayerWithAttn" for single self-attention + feedforward
 #   - "TransformerEncoderWithAttn" to stack multiple layers and optionally return the last layer's attn
@@ -768,12 +770,12 @@ class MealGlucoseForecastModel(pl.LightningModule):
             "metrics": {
                 "q_loss": q_loss,
                 "rmse": rmse,
-                "iAUC_loss": iAUC_loss,
-                "weighted_iAUC_loss": weighted_iAUC_loss,
+                f"iAUC_eval_window_{self.eval_window}_loss": iAUC_loss,
+                f"iAUC_eval_window_{self.eval_window}_weighted_loss": weighted_iAUC_loss,
                 "total_loss": total_loss,
             },
-            "pred_iAUC": pred_iAUC,
-            "true_iAUC": true_iAUC,        
+            f"pred_iAUC_{self.eval_window}": pred_iAUC,
+            f"true_iAUC_{self.eval_window}": true_iAUC,        
         }
 
     def training_step(self, batch, batch_idx):
@@ -820,8 +822,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
             self.val_outputs = []
         self.val_outputs.append({
             "val_quantile_loss": metrics["metrics"]["q_loss"],
-            "pred_iAUC": metrics["pred_iAUC"],
-            "true_iAUC": metrics["true_iAUC"],
+            f"val_pred_iAUC_{self.eval_window}": metrics[f"pred_iAUC_{self.eval_window}"],
+            f"val_true_iAUC_{self.eval_window}": metrics[f"true_iAUC_{self.eval_window}"],
         })
         if batch_idx == 0:
             (pred_future, _, attn_past, _, attn_future, meal_self_attn_past, meal_self_attn_future) = preds
@@ -838,8 +840,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
             self.example_meal_self_attn_future = meal_self_attn_future # do not detach, as plotting functions needs to do some more processing
         return {
             "val_quantile_loss": metrics["metrics"]["q_loss"],
-            "pred_iAUC": metrics["pred_iAUC"],
-            "true_iAUC": metrics["true_iAUC"],
+            f"val_pred_iAUC_{self.eval_window}": metrics[f"pred_iAUC_{self.eval_window}"],
+            f"val_true_iAUC_{self.eval_window}": metrics[f"true_iAUC_{self.eval_window}"],
         }
 
     def on_train_start(self):
@@ -928,11 +930,13 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.logger.experiment.log({f"food_embeddings_{label}": wandb.Table(dataframe=food_embeddings_df)})
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(
+        optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.optimizer_lr,
             weight_decay=self.weight_decay
         )
+        
+        return optimizer
 
     def on_train_epoch_end(self):
         pass
@@ -1086,9 +1090,18 @@ def main(**kwargs):
     # model = model.to(device)
     # model = torch.compile(model)
     
+    optimizer = model.configure_optimizers()
+    
     rich_model_summary = RichModelSummary(max_depth=2)
     rich_progress_bar = RichProgressBar()
-    callbacks = [rich_model_summary, rich_progress_bar]
+    
+    lr_scheduler = LRSchedulerCallback(
+        optimizer=optimizer,
+        base_lr=config.optimizer_lr,
+        total_steps=config.max_epochs * len(train_loader),
+        pct_start=config.optimizer_lr_scheduler_pct_start,
+    )
+    callbacks = [rich_model_summary, rich_progress_bar, lr_scheduler]
     trainer = get_trainer(config, callbacks)
     logging.info("Starting training.")
     
