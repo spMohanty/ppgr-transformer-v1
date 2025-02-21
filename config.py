@@ -22,7 +22,7 @@ class ExperimentConfig:
     
     # Aggregation
     patch_size: int = 1 * 4 # 1 hour patch size
-    patch_stride: int = 1  # 15 min stride
+    patch_stride: int = 2  # 15 min stride
     
     meal_aggregator_type: str = "set"
 
@@ -135,19 +135,64 @@ def generate_experiment_name(config: ExperimentConfig, kwargs: dict) -> str:
     
     # List of important parameters to include in name
     key_params = {
+        # Dataset/caching
+        'dataset_version': 'ds_ver',
+        'use_cache': 'cache',
+        'debug_mode': 'debug',
+        'dataloader_num_workers': 'workers',
+        
+        # Sequence parameters
         'min_encoder_length': 'enc',
         'prediction_length': 'pred',
+        'eval_window': 'eval',
+        'validation_percentage': 'val_pct',
+        'test_percentage': 'test_pct',
+        
+        # Aggregation
         'patch_size': 'patch',
         'patch_stride': 'stride',
-        'eval_window': 'eval',
+        
+        # Data options
+        'is_food_anchored': 'food_anchor',
+        'sliding_window_stride': 'slide_stride',
+        'use_meal_level_food_covariates': 'meal_cov',
+        'use_bootstraped_food_embeddings': 'boot_emb',
+        'use_microbiome_embeddings': 'micro_emb',
+        
+        # Model architecture
+        'food_embed_dim': 'food_emb',
+        'food_embed_adapter_dim': 'food_adapt',
         'hidden_dim': 'h',
         'num_heads': 'heads',
-        'transformer_encoder_layers': 'enc',
-        'transformer_decoder_layers': 'dec',
-        'meal_aggregator_type': 'meal',
+        'transformer_encoder_layers': 'enc_layers',
+        'transformer_decoder_layers': 'dec_layers',
+        'residual_pred': 'res_pred',
+        'num_quantiles': 'quantiles',
+        'loss_iauc_weight': 'iauc_wt',
+        
+        # Dropout
         'dropout_rate': 'drop',
         'transformer_dropout': 'tdrop',
-        'batch_size': 'bs'
+        
+        # Training
+        'batch_size': 'bs',
+        'max_epochs': 'epochs',
+        'optimizer_lr': 'lr',
+        'weight_decay': 'wd',
+        'gradient_clip_val': 'clip',
+        
+        # Logging
+        'wandb_project': 'wandb',
+        'wandb_run_name': 'run',
+        
+        # Precision
+        'precision': 'prec',
+        
+        # Food embedding projection
+        'food_embedding_projection_batch_size': 'proj_bs',
+        
+        # Plots
+        'disable_plots': 'no_plots'
     }
     
     # Build name components for modified parameters
@@ -155,8 +200,11 @@ def generate_experiment_name(config: ExperimentConfig, kwargs: dict) -> str:
     for param, shorthand in key_params.items():
         if param in kwargs and getattr(config, param) != getattr(default_config, param):
             value = getattr(config, param)
+            # Handle boolean values with more readable format
+            if isinstance(value, bool):
+                value = "T" if value else "F"
             # Format numbers to remove trailing zeros
-            if isinstance(value, float):
+            elif isinstance(value, float):
                 value = f"{value:.3f}".rstrip('0').rstrip('.')
             name_parts.append(f"{shorthand}{value}")
     

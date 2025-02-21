@@ -471,29 +471,23 @@ class PatchedGlucoseEncoder(nn.Module):
         glucose_seq = glucose_seq.to(next(self.parameters()).dtype)
         B, T = glucose_seq.size()
         
-        # 1) Patchify: if you want non-overlapping patches
-        # shape => (B, floor(T / patch_size), patch_size)
-        # for overlapping patches, you'd do a more advanced fold/unfold or 1D strided approach
-        # but let's do the simplest approach first:
-        patch_list = []
-        patch_indices = [] # we need to send it back to the main model (for adding positional embeddings)
-        for start in range(0, T - self.patch_size + 1, self.patch_stride):
-            patch = glucose_seq[:, start:start + self.patch_size]  # shape (B, patch_size)
-            patch_list.append(patch.unsqueeze(1))  # shape => (B, 1, patch_size)
-            patch_indices.append(start) # lets just use the index of the first element of the patch
+        # 1) Patchify using unfold for efficient sliding window
+        # shape => (B, N_patches, patch_size)
+        patches = glucose_seq.unfold(1, self.patch_size, self.patch_stride)
         
-        if len(patch_list) == 0:
-            # Edge case: if T < patch_size. Might need a fallback or zero-padding
-            # Just an example fallback:
-            patch_list = [F.pad(glucose_seq, (0, self.patch_size - T))[:, None, :]]
+        # Handle edge case where T < patch_size
+        if patches.size(1) == 0:
+            patches = F.pad(glucose_seq, (0, self.patch_size - T))[:, None, :]
         
-        patches = torch.cat(patch_list, dim=1)  # shape => (B, N_patches, patch_size)
+        # Get patch indices for positional embeddings
+        patch_indices = torch.arange(0, T - self.patch_size + 1, self.patch_stride, device=glucose_seq.device)
+        if patch_indices.size(0) == 0:
+            patch_indices = torch.tensor([0], device=glucose_seq.device)
         
         # 2) Project each patch into embed_dim
-        # We can flatten or keep it as is for linear layer
         # shape => (B*N_patches, patch_size)
         B_np, N_patches, _ = patches.shape
-        patches = patches.view(B_np * N_patches, self.patch_size)
+        patches = patches.reshape(B_np * N_patches, self.patch_size)  # Changed from view to reshape
         
         # linear projection
         patch_emb = self.patch_proj(patches)  # (B*N_patches, embed_dim)
@@ -503,7 +497,7 @@ class PatchedGlucoseEncoder(nn.Module):
         # Transformer on patches
         patch_emb = self.transformer(patch_emb)  # => (B, N_patches, embed_dim)
         
-        return patch_emb, torch.tensor(patch_indices, device=patch_emb.device)
+        return patch_emb, patch_indices
 
 # -----------------------------------------------------------------------------
 # MealGlucoseForecastModel with configurable dropout parameters
