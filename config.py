@@ -33,6 +33,7 @@ class ExperimentConfig:
     use_meal_level_food_covariates: bool = True
     use_bootstraped_food_embeddings: bool = True
     freeze_food_id_embeddings: bool = True
+    ignore_food_macro_features: bool = False
     use_microbiome_embeddings: bool = True
     group_by_columns: list = None
 

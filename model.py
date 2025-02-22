@@ -283,6 +283,7 @@ class MealEncoder(nn.Module):
         dropout_rate: float = 0.2,
         transformer_dropout: float = 0.1,
         aggregator_type: str = "set",  # Either "set" or "sum"
+        ignore_food_macro_features: bool = False,
         bootstrap_food_id_embeddings: Optional[nn.Embedding] = None,
         freeze_food_id_embeddings: bool = True
     ):
@@ -295,13 +296,17 @@ class MealEncoder(nn.Module):
         self.food_names = food_names
         self.food_group_names = food_group_names
         self.aggregator_type = aggregator_type.lower().strip()
+        self.ignore_food_macro_features = ignore_food_macro_features
 
         # --------------------
         #  Embedding Layers
         # --------------------
         self.food_emb = nn.Embedding(num_foods, food_embed_dim, padding_idx=0)
         self.food_emb_proj = nn.Linear(food_embed_dim, hidden_dim)
-        self.macro_proj = nn.Linear(food_macro_dim, hidden_dim, bias=False)
+        
+        if not self.ignore_food_macro_features:
+            #We need the macro projection only if we are not using all the macro features
+            self.macro_proj = nn.Linear(food_macro_dim, hidden_dim, bias=False)
 
                 
         # Optional aggregator token to collect representations (only used in "set" mode).
@@ -355,13 +360,17 @@ class MealEncoder(nn.Module):
         food_emb = self.food_emb(meal_ids_flat)               # (B*T, M, food_embed_dim)
         food_emb = self.food_emb_proj(food_emb)               # (B*T, M, hidden_dim)
         food_emb = self.dropout(food_emb)
-
-        macro_emb = self.macro_proj(meal_macros_flat)         # (B*T, M, hidden_dim)
-        macro_emb = self.dropout(macro_emb)
-
-        # Combine them
-        meal_token_emb = food_emb + macro_emb  # shape = (B*T, M, hidden_dim)
-
+        
+        if self.ignore_food_macro_features:
+            # Basically multiply the scaled food weights with the food embeddings
+            food_scaled_weight = meal_macros_flat[:, :, 0].unsqueeze(-1) # pluck out just the weight (first column)
+            meal_token_emb = food_emb * food_scaled_weight # Experimental : just use the embeddings and scale them by their weight (not the full nutritional profile)
+        else:
+            macro_emb = self.macro_proj(meal_macros_flat)         # (B*T, M, hidden_dim)
+            macro_emb = self.dropout(macro_emb)
+            # Combine 
+            meal_token_emb = food_emb + macro_emb  # shape = (B*T, M, hidden_dim)
+        
         # -------------------------------------------------------------------
         #  aggregator_type = "sum"
         # -------------------------------------------------------------------
@@ -386,7 +395,6 @@ class MealEncoder(nn.Module):
         elif self.aggregator_type == "set":
             # We do a self-attention aggregator with a special start token
             # *Without* adding any positional embeddings to keep it permutation-invariant
-            # (i.e. we skip meal_token_emb + pos_enc).
 
             # Insert aggregator token at position 0
             start_token_expanded = self.start_token.expand(B * T, -1, -1)  # => (B*T, 1, hidden_dim)
@@ -557,6 +565,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             num_layers=config.transformer_encoder_layers,
             dropout_rate=config.dropout_rate,
             transformer_dropout=config.transformer_dropout,
+            ignore_food_macro_features=config.ignore_food_macro_features,
             bootstrap_food_id_embeddings=None, # This is initialized in the from_dataset method
             freeze_food_id_embeddings=config.freeze_food_id_embeddings,
             aggregator_type=config.meal_aggregator_type
