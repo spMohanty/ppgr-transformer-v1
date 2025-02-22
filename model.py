@@ -22,6 +22,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -278,7 +280,7 @@ class MealEncoder(nn.Module):
         dropout_rate: float = 0.2,
         transformer_dropout: float = 0.1,
         aggregator_type: str = "set",  # Either "set" or "sum"
-        bootstrap_food_id_embeddings: nn.Embedding = None
+        bootstrap_food_id_embeddings: Optional[nn.Embedding] = None
     ):
         super(MealEncoder, self).__init__()
         self.food_embed_dim = food_embed_dim
@@ -435,8 +437,8 @@ class MealEncoder(nn.Module):
             with torch.no_grad():
                 logger.warning(f"Bootstrapping food id embeddings with {self.food_embed_dim} dimensions of pre-computed embeddings")
                 self.food_emb.weight.copy_(bootstrap_food_id_embeddings.weight[:, :self.food_embed_dim])
+            self.food_emb.weight.requires_grad = False  # Freeze the food id embeddings
             logger.warning(f"Food id embeddings have been frozen")
-            self.food_emb.weight.requires_grad = False  # Freeze the food id embeddings        
 
 # -----------------------------------------------------------------------------
 # Glucose Encoder
@@ -505,103 +507,84 @@ class PatchedGlucoseEncoder(nn.Module):
 # MealGlucoseForecastModel with configurable dropout parameters
 # -----------------------------------------------------------------------------
 class MealGlucoseForecastModel(pl.LightningModule):
-    def __init__(
-        self,
-        food_embed_dim: int,
-        food_embed_adapter_dim: int,
-        hidden_dim: int,
-        num_foods: int,
-        macro_dim: int,
-        max_meals: int = 11,
-        meal_aggregator_type: str = "set",
-        
-        glucose_seq_len: int = 20,
-        forecast_horizon: int = 4,
-        
-        eval_window: int = None,
-        num_heads: int = 4,
-        transformer_encoder_layers: int = 2,
-        transformer_decoder_layers: int = 2,
-        patch_size: int = 4,
-        patch_stride: int = 1,
-        residual_pred: bool = True,
-        num_quantiles: int = 7,
-        loss_iauc_weight: float = 1,
-        
-        dropout_rate: float = 0.2,
-        transformer_dropout: float = 0.1,
-        bootstrap_food_id_embeddings: nn.Embedding = None,
-        
-        optimizer_lr: float = 1e-4,
-        weight_decay: float = 1e-5,
-        gradient_clip_val: float = 0.1,
-        food_embedding_projection_batch_size: int = 1024 * 4,
-        disable_plots: bool = False,
-    ):
+    def __init__(self, config: ExperimentConfig, num_foods: int, macro_dim: int):
         super().__init__()
-        self.forecast_horizon = forecast_horizon
-        self.eval_window = eval_window if eval_window is not None else forecast_horizon
+        # Save hyperparameters correctly
+        self.save_hyperparameters({
+            'config': asdict(config),
+            'num_foods': num_foods,
+            'macro_dim': macro_dim
+        })
+        self.config = config
+        self.num_foods = num_foods
+        self.macro_dim = macro_dim
+        self.forecast_horizon = config.prediction_length
+        self.eval_window = config.eval_window if config.eval_window is not None else config.prediction_length
 
-        self.residual_pred = residual_pred
-        self.num_quantiles = num_quantiles
-        self.loss_iauc_weight = loss_iauc_weight
+        self.residual_pred = config.residual_pred
+        self.num_quantiles = config.num_quantiles
+        self.loss_iauc_weight = config.loss_iauc_weight
 
-        self.hidden_dim = hidden_dim
-        self.optimizer_lr = optimizer_lr
-        self.weight_decay = weight_decay
-        self.gradient_clip_val = gradient_clip_val
-        self.food_embedding_projection_batch_size = food_embedding_projection_batch_size
-        self.disable_plots = disable_plots
+        self.hidden_dim = config.hidden_dim
+        self.optimizer_lr = config.optimizer_lr
+        self.weight_decay = config.weight_decay
+        self.gradient_clip_val = config.gradient_clip_val
+        self.food_embedding_projection_batch_size = config.food_embedding_projection_batch_size
+        self.disable_plots = config.disable_plots
         
         # 1) Meal Encoder
         self.meal_encoder = MealEncoder(
-            food_embed_dim, food_embed_adapter_dim, hidden_dim,
-            num_foods, macro_dim, max_meals,
-            num_heads=num_heads,
-            num_layers=transformer_encoder_layers,
-            dropout_rate=dropout_rate,
-            transformer_dropout=transformer_dropout,
-            bootstrap_food_id_embeddings=bootstrap_food_id_embeddings,
-            aggregator_type=meal_aggregator_type
+            food_embed_dim=config.food_embed_dim,
+            food_embed_adapter_dim=config.food_embed_adapter_dim,
+            hidden_dim=config.hidden_dim,
+            num_foods=num_foods,
+            macro_dim=macro_dim,
+            max_meals=config.max_meals,
+            num_heads=config.num_heads,
+            num_layers=config.transformer_encoder_layers,
+            dropout_rate=config.dropout_rate,
+            transformer_dropout=config.transformer_dropout,
+            bootstrap_food_id_embeddings=None, # This is initialized in the from_dataset method
+            aggregator_type=config.meal_aggregator_type
         )
 
         # 2) Glucose Encoder (patch-based)
         self.glucose_encoder = PatchedGlucoseEncoder(
-            embed_dim=hidden_dim,
-            patch_size=patch_size,
-            patch_stride=patch_stride,
-            num_heads=num_heads,
-            num_layers=transformer_encoder_layers,
-            max_seq_len=glucose_seq_len,
-            dropout_rate=dropout_rate
+            embed_dim=config.hidden_dim,
+            patch_size=config.patch_size,
+            patch_stride=config.patch_stride,
+            num_heads=config.num_heads,
+            num_layers=config.transformer_encoder_layers,
+            max_seq_len=config.min_encoder_length,
+            dropout_rate=config.dropout_rate
         )
 
         # 3) Transformer Decoder
         dec_layer = TransformerDecoderLayerWithAttn(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 2,
-            dropout=transformer_dropout,
+            d_model=config.hidden_dim,
+            nhead=config.num_heads,
+            dim_feedforward=config.hidden_dim * 2,
+            dropout=config.transformer_dropout,
             activation="relu"
         )
         self.decoder = TransformerDecoderWithAttn(
             dec_layer,
-            num_layers=transformer_decoder_layers,
-            norm=nn.LayerNorm(hidden_dim)
+            num_layers=config.transformer_decoder_layers,
+            norm=nn.LayerNorm(config.hidden_dim)
         )
 
         # Query embeddings for each forecast horizon step
-        self.future_time_queries = nn.Embedding(forecast_horizon, hidden_dim)
+        self.future_time_queries = nn.Embedding(config.prediction_length, config.hidden_dim)
 
         # Final projection: hidden_dim -> num_quantiles
-        self.forecast_linear = nn.Linear(hidden_dim, num_quantiles)
+        self.forecast_linear = nn.Linear(config.hidden_dim, config.num_quantiles)
 
         # Register the quantiles as a buffer
-        self.register_buffer("quantiles", torch.linspace(0.05, 0.95, steps=self.num_quantiles))
+        self.register_buffer("quantiles", torch.linspace(0.05, 0.95, steps=config.num_quantiles))
         
         # global time-based positional embedding
-        max_time = glucose_seq_len + forecast_horizon + 2000  # a safe upper bound
-        self.time_emb = nn.Embedding(max_time, hidden_dim)
+        max_time = config.min_encoder_length + config.prediction_length + 2000  # a safe upper bound
+        self.time_emb = nn.Embedding(max_time, config.hidden_dim)
         
 
     def forward(
@@ -610,8 +593,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         past_meal_ids,       # [B, T_pastMeal, M]
         past_meal_macros,    # [B, T_pastMeal, M, macro_dim]
         future_meal_ids,     # [B, T_futureMeal, M]
-        future_meal_macros,  # [B, T_futureMeal, M, macro_dim]
-        target_scales,       # [B, 2] for unscale
+        future_meal_macros,   # [B, T_futureMeal, M, macro_dim]
+        target_scales,        # [B, 2] for unscale
         return_attn: bool = False,
         return_meal_self_attn: bool = False
     ):
@@ -745,61 +728,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         else:
             return pred_future
 
-
-    def _compute_forecast_metrics(self, past_glucose, future_glucose, target_scales, preds):
-        if isinstance(preds, tuple):
-            predictions = preds[0]
-        else:
-            predictions = preds
-        future_glucose_unscaled = (
-            future_glucose * target_scales[:, 1].unsqueeze(1) + target_scales[:, 0].unsqueeze(1)
-        )
-        q_loss = quantile_loss(predictions, future_glucose_unscaled, self.quantiles)
-        median_idx = self.num_quantiles // 2
-        median_pred = predictions[:, :, median_idx]
-        median_pred_eval = median_pred[:, :self.eval_window]
-        future_glucose_unscaled_eval = future_glucose_unscaled[:, :self.eval_window]
-        rmse = torch.sqrt(F.mse_loss(median_pred_eval, future_glucose_unscaled_eval))
-        pred_iAUC, true_iAUC = compute_iAUC(
-            median_pred, future_glucose, past_glucose, target_scales, eval_window=self.eval_window
-        )
-        iAUC_loss = F.mse_loss(pred_iAUC, true_iAUC)
-        weighted_iAUC_loss = self.loss_iauc_weight * iAUC_loss
-        total_loss = q_loss + weighted_iAUC_loss
-        return {
-            "metrics": {
-                "q_loss": q_loss,
-                "rmse": rmse,
-                f"iAUC_eval_window_{self.eval_window}_loss": iAUC_loss,
-                f"iAUC_eval_window_{self.eval_window}_weighted_loss": weighted_iAUC_loss,
-                "total_loss": total_loss,
-            },
-            f"pred_iAUC_{self.eval_window}": pred_iAUC,
-            f"true_iAUC_{self.eval_window}": true_iAUC,        
-        }
-
-    def training_step(self, batch, batch_idx):
-        (past_glucose, past_meal_ids, past_meal_macros,
-         future_meal_ids, future_meal_macros, future_glucose, target_scales) = batch
-        if target_scales.dim() > 2:
-            target_scales = target_scales.view(target_scales.size(0), -1)
-        preds = self(
-            past_glucose,
-            past_meal_ids,
-            past_meal_macros,
-            future_meal_ids,
-            future_meal_macros,
-            target_scales,
-            return_attn=False,
-            return_meal_self_attn=False,
-        )
-        metrics = self._compute_forecast_metrics(past_glucose, future_glucose, target_scales, preds)
-        for _key in metrics["metrics"]:
-            self.log(f"train_{_key}", metrics["metrics"][_key], on_step=True, on_epoch=True, prog_bar=True)
-            
-        return metrics["metrics"]["total_loss"]
-
-    def validation_step(self, batch, batch_idx):
+    def _shared_step(self, batch, batch_idx, phase: str):
         (past_glucose, past_meal_ids, past_meal_macros,
          future_meal_ids, future_meal_macros, future_glucose, target_scales) = batch
         if target_scales.dim() > 2:
@@ -815,16 +744,21 @@ class MealGlucoseForecastModel(pl.LightningModule):
             return_meal_self_attn=True,
         )
         metrics = self._compute_forecast_metrics(past_glucose, future_glucose, target_scales, preds)
-        for _key in metrics["metrics"]:
-            self.log(f"val_{_key}", metrics["metrics"][_key], on_step=False, on_epoch=True, prog_bar=True)
-
-        if not hasattr(self, "val_outputs"):
-            self.val_outputs = []
-        self.val_outputs.append({
-            "val_quantile_loss": metrics["metrics"]["q_loss"],
-            f"val_pred_iAUC_{self.eval_window}": metrics[f"pred_iAUC_{self.eval_window}"],
-            f"val_true_iAUC_{self.eval_window}": metrics[f"true_iAUC_{self.eval_window}"],
+        
+        # Log metrics with phase prefix
+        for key, value in metrics["metrics"].items():
+            self.log(f"{phase}_{key}", value, on_step=True, on_epoch=True, prog_bar=True)
+        
+        # Store outputs for phase end
+        if not hasattr(self, f"{phase}_outputs"):
+            setattr(self, f"{phase}_outputs", [])
+        getattr(self, f"{phase}_outputs").append({
+            f"{phase}_q_loss": metrics["metrics"]["q_loss"],
+            f"{phase}_pred_iAUC_{self.eval_window}": metrics[f"pred_iAUC_{self.eval_window}"],
+            f"{phase}_true_iAUC_{self.eval_window}": metrics[f"true_iAUC_{self.eval_window}"],
         })
+        
+        # Store example data for plotting
         if batch_idx == 0:
             (pred_future, _, attn_past, _, attn_future, meal_self_attn_past, meal_self_attn_future) = preds
             self.example_forecasts = {
@@ -836,26 +770,16 @@ class MealGlucoseForecastModel(pl.LightningModule):
             }
             self.example_attn_weights_past = attn_past
             self.example_attn_weights_future = attn_future
-            self.example_meal_self_attn_past = meal_self_attn_past # do not detach, as plotting functions needs to do some more processing
-            self.example_meal_self_attn_future = meal_self_attn_future # do not detach, as plotting functions needs to do some more processing
-        return {
-            "val_quantile_loss": metrics["metrics"]["q_loss"],
-            f"val_pred_iAUC_{self.eval_window}": metrics[f"pred_iAUC_{self.eval_window}"],
-            f"val_true_iAUC_{self.eval_window}": metrics[f"true_iAUC_{self.eval_window}"],
-        }
-
-    def on_train_start(self):
-        self.log_food_embeddings("train_start")
+            self.example_meal_self_attn_past = meal_self_attn_past
+            self.example_meal_self_attn_future = meal_self_attn_future
         
-    def on_train_end(self):
-        self.log_food_embeddings("train_end")
+        return metrics["metrics"]["q_loss"]
 
-    def on_validation_epoch_end(self):
-        if not hasattr(self, "val_outputs") or len(self.val_outputs) == 0:
+    def _shared_phase_end(self, phase: str):
+        outputs = getattr(self, f"{phase}_outputs", [])
+        if len(outputs) == 0:
             return
 
-        outputs = self.val_outputs
-        
         if (not self.disable_plots) and (self.example_forecasts is not None):
             fixed_indices = getattr(self, "fixed_forecast_indices", None)
             
@@ -884,17 +808,83 @@ class MealGlucoseForecastModel(pl.LightningModule):
             plt.close(fig)
             self.example_forecasts = None
         
-        all_pred_iAUC = torch.cat([output["pred_iAUC"] for output in outputs], dim=0)
-        all_true_iAUC = torch.cat([output["true_iAUC"] for output in outputs], dim=0)
+        all_pred_iAUC = torch.cat([output[f"{phase}_pred_iAUC_{self.eval_window}"] for output in outputs], dim=0)
+        all_true_iAUC = torch.cat([output[f"{phase}_true_iAUC_{self.eval_window}"] for output in outputs], dim=0)
         fig_scatter, corr = plot_iAUC_scatter(all_pred_iAUC, all_true_iAUC)
         self.logger.experiment.log({
-            "iAUC_scatter": wandb.Image(fig_scatter),
-            "iAUC_correlation": corr.item(),
+            f"{phase}_iAUC_eh{self.eval_window}_scatter": wandb.Image(fig_scatter),
+            f"{phase}_iAUC_eh{self.eval_window}_correlation": corr.item(),
             "global_step": self.global_step
         })
         plt.close(fig_scatter)
-        self.log("val_iAUC_corr", corr.item(), prog_bar=True)
-        self.val_outputs.clear()
+        setattr(self, f"{phase}_outputs", [])
+
+    def validation_step(self, batch, batch_idx):
+        return self._shared_step(batch, batch_idx, "val")
+
+    def on_validation_epoch_end(self):
+        self._shared_phase_end("val")
+
+    def test_step(self, batch, batch_idx):
+        return self._shared_step(batch, batch_idx, "test")
+
+    def on_test_end(self):
+        self._shared_phase_end("test")
+
+    def training_step(self, batch, batch_idx):
+        (past_glucose, past_meal_ids, past_meal_macros,
+         future_meal_ids, future_meal_macros, future_glucose, target_scales) = batch
+        
+        # Forward pass
+        preds = self(
+            past_glucose,
+            past_meal_ids,
+            past_meal_macros,
+            future_meal_ids,
+            future_meal_macros,
+            target_scales
+        )
+        
+        # Compute metrics
+        metrics = self._compute_forecast_metrics(past_glucose, future_glucose, target_scales, preds)
+        
+        # Log metrics
+        for key in metrics["metrics"]:
+            self.log(f"train_step_{key}", metrics["metrics"][key], on_step=True, on_epoch=True, prog_bar=True)
+            
+        return metrics["metrics"]["total_loss"]
+
+    def _compute_forecast_metrics(self, past_glucose, future_glucose, target_scales, preds):
+        if isinstance(preds, tuple):
+            predictions = preds[0]
+        else:
+            predictions = preds
+        future_glucose_unscaled = (
+            future_glucose * target_scales[:, 1].unsqueeze(1) + target_scales[:, 0].unsqueeze(1)
+        )
+        q_loss = quantile_loss(predictions, future_glucose_unscaled, self.quantiles)
+        median_idx = self.num_quantiles // 2
+        median_pred = predictions[:, :, median_idx]
+        median_pred_eval = median_pred[:, :self.eval_window]
+        future_glucose_unscaled_eval = future_glucose_unscaled[:, :self.eval_window]
+        rmse = torch.sqrt(F.mse_loss(median_pred_eval, future_glucose_unscaled_eval))
+        pred_iAUC, true_iAUC = compute_iAUC(
+            median_pred, future_glucose, past_glucose, target_scales, eval_window=self.eval_window
+        )
+        iAUC_loss = F.mse_loss(pred_iAUC, true_iAUC)
+        weighted_iAUC_loss = self.loss_iauc_weight * iAUC_loss
+        total_loss = q_loss + weighted_iAUC_loss
+        return {
+            "metrics": {
+                "q_loss": q_loss,
+                "rmse": rmse,
+                f"iAUC_eh{self.eval_window}_loss": iAUC_loss,
+                f"iAUC_eh{self.eval_window}_weighted_loss": weighted_iAUC_loss,
+                "total_loss": total_loss,
+            },
+            f"pred_iAUC_{self.eval_window}": pred_iAUC,
+            f"true_iAUC_{self.eval_window}": true_iAUC,        
+        }
 
     def log_food_embeddings(self, label: str):
         logger.info(f"Logging food embeddings for {label}")
@@ -940,6 +930,33 @@ class MealGlucoseForecastModel(pl.LightningModule):
 
     def on_train_epoch_end(self):
         pass
+
+    @classmethod
+    def load_from_checkpoint(cls, checkpoint_path: str, config: ExperimentConfig, num_foods: int, macro_dim: int, **kwargs):
+        return super().load_from_checkpoint(
+            checkpoint_path=checkpoint_path,
+            config=config,
+            num_foods=num_foods,
+            macro_dim=macro_dim,
+            **kwargs
+        )
+
+    @classmethod
+    def from_dataset(cls, dataset, config: ExperimentConfig):
+        """
+        Create a MealGlucoseForecastModel instance from a dataset and config.
+        """
+        model = cls(
+            config=config,
+            num_foods=dataset.num_foods,
+            macro_dim=dataset.num_nutrients,
+        )
+        
+        # If you want to bootstrap with pretrained embeddings:
+        if config.use_bootstraped_food_embeddings:
+            pretrained_weights = dataset.get_food_id_embeddings()  # returns a Tensor
+            model.meal_encoder.bootstrap_food_id_embeddings(pretrained_weights)
+        return model
 
 # -----------------------------------------------------------------------------
 # Loss and Metric Helper Functions
@@ -1008,29 +1025,63 @@ def get_dataloaders(config: ExperimentConfig):
         pin_memory=True, 
         persistent_workers=True
     )
-    return train_loader, val_loader, training_dataset
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=config.batch_size, 
+        num_workers=config.dataloader_num_workers, 
+        pin_memory=True, 
+        persistent_workers=True)
+    
+    return train_loader, val_loader, test_loader, training_dataset
 
-def get_trainer(config: ExperimentConfig, callbacks):
-    # Log the entire configuration to WandB by converting the dataclass to a dictionary.
+def get_trainer(config: ExperimentConfig, callbacks):    
     wandb_logger = WandbLogger(
         project=config.wandb_project,
         name=config.wandb_run_name,
-        config=asdict(config),  # Now logs the whole config
+        config=asdict(config),
         log_model=True,
     )
     precision_value = int(config.precision) if config.precision == "32" else "bf16"
     trainer = pl.Trainer(
         profiler="simple",
         max_epochs=config.max_epochs,
-        enable_checkpointing=False,
+        enable_checkpointing=True,  # Enable checkpointing
         logger=wandb_logger,
         callbacks=callbacks,
         precision=precision_value,
-        gradient_clip_val=config.gradient_clip_val  # Use the value from config
+        gradient_clip_val=config.gradient_clip_val
     )
     return trainer
 
 
+def prepare_callbacks(config: ExperimentConfig, model: MealGlucoseForecastModel, train_loader: DataLoader):
+    optimizer = model.configure_optimizers()
+    
+    rich_model_summary = RichModelSummary(max_depth=2)
+    rich_progress_bar = RichProgressBar()
+    
+    # Create checkpoint directory if it doesn't exist
+    checkpoint_dir = os.path.join(config.checkpoint_base_dir, config.wandb_run_name)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Add ModelCheckpoint callback with configurable parameters
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        dirpath=checkpoint_dir,
+        monitor=config.checkpoint_monitor,
+        mode=config.checkpoint_mode,
+        save_top_k=config.checkpoint_top_k,
+        filename="best-{epoch}-{val_q_loss:.2f}",
+        save_last=True
+    )    
+    
+    lr_scheduler = LRSchedulerCallback(
+        optimizer=optimizer,
+        base_lr=config.optimizer_lr,
+        total_steps=config.max_epochs * len(train_loader),
+        pct_start=config.optimizer_lr_scheduler_pct_start,
+    )
+    callbacks = [rich_model_summary, rich_progress_bar, lr_scheduler, checkpoint_callback]
+    return callbacks
 
 # -----------------------------------------------------------------------------
 # Main Training & Evaluation Entry Point
@@ -1050,72 +1101,40 @@ def main(**kwargs):
     if config.debug_mode:
         config.dataloader_num_workers = 1  # for debugging
 
-    train_loader, val_loader, training_dataset = get_dataloaders(config)
+    train_loader, val_loader, test_loader, training_dataset = get_dataloaders(config)
     
-    if config.use_bootstraped_food_embeddings:
-        bootstrap_food_id_embeddings = training_dataset.get_food_id_embeddings()
-    else:
-        bootstrap_food_id_embeddings = None
-    
-    model = MealGlucoseForecastModel(
-        food_embed_dim=config.food_embed_dim,
-        food_embed_adapter_dim=config.food_embed_adapter_dim,
-        hidden_dim=config.hidden_dim,
-        num_foods=training_dataset.num_foods,
-        macro_dim=training_dataset.num_nutrients,
-        max_meals=training_dataset.max_meals,
-        meal_aggregator_type=config.meal_aggregator_type,
-        glucose_seq_len=config.min_encoder_length,
-        forecast_horizon=config.prediction_length,
-        eval_window=config.eval_window,
-        num_heads=config.num_heads,
-        transformer_encoder_layers=config.transformer_encoder_layers,
-        transformer_decoder_layers=config.transformer_decoder_layers,
-        patch_size=config.patch_size,
-        patch_stride=config.patch_stride,
-        residual_pred=config.residual_pred,
-        num_quantiles=config.num_quantiles,
-        loss_iauc_weight=config.loss_iauc_weight,
-        dropout_rate=config.dropout_rate,
-        transformer_dropout=config.transformer_dropout,
-        bootstrap_food_id_embeddings=bootstrap_food_id_embeddings,
-        optimizer_lr=config.optimizer_lr,
-        weight_decay=config.weight_decay,
-        food_embedding_projection_batch_size=config.food_embedding_projection_batch_size,
-        disable_plots=config.disable_plots
-    )
+    model = MealGlucoseForecastModel.from_dataset(training_dataset, config)
     
     # Compile the model
-    # device = "cuda" if torch.cuda.is_available() else "cpu"
-    # model = model.to(device)
-    # model = torch.compile(model)
-    
-    optimizer = model.configure_optimizers()
-    
-    rich_model_summary = RichModelSummary(max_depth=2)
-    rich_progress_bar = RichProgressBar()
-    
-    lr_scheduler = LRSchedulerCallback(
-        optimizer=optimizer,
-        base_lr=config.optimizer_lr,
-        total_steps=config.max_epochs * len(train_loader),
-        pct_start=config.optimizer_lr_scheduler_pct_start,
-    )
-    callbacks = [rich_model_summary, rich_progress_bar, lr_scheduler]
+    callbacks = prepare_callbacks(config, model, train_loader)
     trainer = get_trainer(config, callbacks)
     logging.info("Starting training.")
     
-    device = torch.device("cpu")
-    model.to(device)
-    
     trainer.fit(model, train_loader, val_loader)
     logging.info("Training complete.")
-    # device = torch.device("cpu")
-    # model.to(device)
+    
+    # Load best model checkpoint
+    best_model_path = trainer.checkpoint_callback.best_model_path
+    if best_model_path:
+        logging.info(f"Loading best model from: {best_model_path}")
+        model = MealGlucoseForecastModel.load_from_checkpoint(
+            best_model_path,
+            config=config,
+            num_foods=training_dataset.num_foods,
+            macro_dim=training_dataset.num_nutrients
+        )
+    
+    # Test phase
+    logging.info("Starting testing.")
+    # Evaluate on test set
+    test_results = trainer.test(model, test_loader)
+    logging.info("Test results: %s", test_results)
+    
+    # Detailed evaluation similar to validation
     model.eval()
     with torch.no_grad():
-        batch = next(iter(val_loader))
-        batch = [x.to(device) for x in batch]
+        batch = next(iter(test_loader))
+        batch = [x.to(model.device) for x in batch]
         (past_glucose, past_meal_ids, past_meal_macros,
          future_meal_ids, future_meal_macros, future_glucose, target_scales) = batch
         preds = model(
@@ -1129,12 +1148,13 @@ def main(**kwargs):
             return_meal_self_attn=True,
         )
         (pred_future, _, attn_past, _, attn_future, meal_self_attn_past, meal_self_attn_future) = preds
-    logging.info("Predicted future glucose (first sample): %s", pred_future[0].cpu().numpy())
-    logging.info("Actual future glucose (first sample):   %s", future_glucose[0].cpu().numpy())
-    logging.info("Past cross-attention shape: %s", attn_past.shape)
-    logging.info("Future cross-attention shape: %s", attn_future.shape)
-    logging.info("Meal self-attention (past) shape: %s", meal_self_attn_past.shape)
-    logging.info("Meal self-attention (future) shape: %s", meal_self_attn_future.shape)
+        
+    logging.info("Test set predictions (first sample): %s", pred_future[0].cpu().numpy())
+    logging.info("Test set actual values (first sample): %s", future_glucose[0].cpu().numpy())
+    logging.info("Test set past cross-attention shape: %s", attn_past.shape)
+    logging.info("Test set future cross-attention shape: %s", attn_future.shape)
+    logging.info("Test set meal self-attention (past) shape: %s", meal_self_attn_past.shape)
+    logging.info("Test set meal self-attention (future) shape: %s", meal_self_attn_future.shape)
     
 if __name__ == "__main__":
     main()

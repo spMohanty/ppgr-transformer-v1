@@ -44,6 +44,7 @@ class ExperimentConfig:
     targets: list = None
 
     # Model hyperparameters
+    max_meals: int = 11  # Maximum number of meals to consider
     food_embed_dim: int = 2048 # the number of dimensions from the pre-trained embeddings to use
     food_embed_adapter_dim: int = 64 # the number of dimensions to project the food embeddings to for visualization purposes
     hidden_dim: int = 256
@@ -65,6 +66,13 @@ class ExperimentConfig:
     optimizer_lr_scheduler_pct_start: float = 0.1
     weight_decay: float = 1e-5
     gradient_clip_val: float = 0.1  # Added gradient clipping parameter
+
+
+    # Checkpoint Settings
+    checkpoint_base_dir: str = "/scratch/mohanty/checkpoints/ppgr-meal-representation"  # Directory to save checkpoints
+    checkpoint_monitor: str = "val_q_loss"  # Metric to monitor
+    checkpoint_mode: str = "min"  # "min" or "max"
+    checkpoint_top_k: int = 5  # Number of best checkpoints to keep
 
     # WandB logging
     wandb_project: str = "meal-representations-learning-v0"
@@ -213,7 +221,9 @@ def generate_experiment_name(config: ExperimentConfig, kwargs: dict) -> str:
     if name_parts:
         experiment_name = "ppgr_" + "_".join(name_parts)
     else:
-        experiment_name = "ppgr_default"
+        from faker import Faker
+        fake = Faker()
+        experiment_name = f"ppgr_default_{fake.word()}"
         
     # Add timestamp for uniqueness
     # timestamp = datetime.datetime.now().strftime("%m%d_%H%M")
