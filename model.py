@@ -273,7 +273,7 @@ class MealEncoder(nn.Module):
         food_embed_adapter_dim: int,
         hidden_dim: int,
         num_foods: int,
-        macro_dim: int,
+        food_macro_dim: int,
         food_names: List[str],
         food_group_names: List[str],
         max_meals: int = 11,
@@ -291,7 +291,7 @@ class MealEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.max_meals = max_meals
         self.num_foods = num_foods
-        self.macro_dim = macro_dim
+        self.food_macro_dim = food_macro_dim
         self.food_names = food_names
         self.food_group_names = food_group_names
         self.aggregator_type = aggregator_type.lower().strip()
@@ -302,7 +302,7 @@ class MealEncoder(nn.Module):
         self.food_emb = nn.Embedding(num_foods, food_embed_dim, padding_idx=0)
         self.food_emb_adapter = nn.Linear(food_embed_dim, food_embed_adapter_dim) # A linear projection to make it easier to visualize
         self.food_emb_proj = nn.Linear(food_embed_adapter_dim, hidden_dim)
-        self.macro_proj = nn.Linear(macro_dim, hidden_dim, bias=False)
+        self.macro_proj = nn.Linear(food_macro_dim, hidden_dim, bias=False)
 
                 
         # Optional aggregator token to collect representations (only used in "set" mode).
@@ -340,7 +340,7 @@ class MealEncoder(nn.Module):
     ):
         """
         :param meal_ids:    (B, T, M)  with each M being item indices in that meal
-        :param meal_macros: (B, T, M, macro_dim)  macro features for each item
+        :param meal_macros: (B, T, M, food_macro_dim)  macro features for each item
         :param return_self_attn: If True, returns self-attention weights (only works in "set" mode).
         :return: 
           - meal_timestep_emb: (B, T, hidden_dim) aggregator encoding for each meal/time-step
@@ -350,7 +350,7 @@ class MealEncoder(nn.Module):
 
         # 1) Flatten out (B,T) -> (B*T) for item-level embeddings
         meal_ids_flat = meal_ids.view(B * T, M)            # => (B*T, M)
-        meal_macros_flat = meal_macros.view(B * T, M, -1)  # => (B*T, M, macro_dim)
+        meal_macros_flat = meal_macros.view(B * T, M, -1)  # => (B*T, M, food_macro_dim)
 
         # 2) Embed items
         food_emb = self.food_emb(meal_ids_flat)               # (B*T, M, food_embed_dim)
@@ -478,6 +478,12 @@ class PatchedGlucoseEncoder(nn.Module):
         self.dropout = nn.Dropout(dropout_rate)
 
     def forward(self, glucose_seq: torch.Tensor) -> torch.Tensor:
+        # if torch.is_autocast_enabled():
+        #     target_dtype = torch.get_autocast_gpu_dtype()
+        # else:
+        #     target_dtype = next(self.parameters()).dtype        
+        # glucose_seq = glucose_seq.to(target_dtype)
+        
         glucose_seq = glucose_seq.to(next(self.parameters()).dtype)
         B, T = glucose_seq.size()
         
@@ -513,17 +519,17 @@ class PatchedGlucoseEncoder(nn.Module):
 # MealGlucoseForecastModel with configurable dropout parameters
 # -----------------------------------------------------------------------------
 class MealGlucoseForecastModel(pl.LightningModule):
-    def __init__(self, config: ExperimentConfig, num_foods: int, macro_dim: int, food_names: List[str], food_group_names: List[str]):
+    def __init__(self, config: ExperimentConfig, num_foods: int, food_macro_dim: int, food_names: List[str], food_group_names: List[str]):
         super().__init__()
         # Save hyperparameters correctly
         self.save_hyperparameters({
             'config': asdict(config),
             'num_foods': num_foods,
-            'macro_dim': macro_dim
+            'food_macro_dim': food_macro_dim
         })
         self.config = config
         self.num_foods = num_foods
-        self.macro_dim = macro_dim
+        self.food_macro_dim = food_macro_dim
         self.food_names = food_names
         self.food_group_names = food_group_names
         self.forecast_horizon = config.prediction_length
@@ -546,7 +552,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             food_embed_adapter_dim=config.food_embed_adapter_dim,
             hidden_dim=config.hidden_dim,
             num_foods=num_foods,
-            macro_dim=macro_dim,
+            food_macro_dim=food_macro_dim,
             food_names=food_names,
             food_group_names=food_group_names,
             max_meals=config.max_meals,
@@ -602,9 +608,9 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self,
         past_glucose,        # [B, T_glucose]
         past_meal_ids,       # [B, T_pastMeal, M]
-        past_meal_macros,    # [B, T_pastMeal, M, macro_dim]
+        past_meal_macros,    # [B, T_pastMeal, M, food_macro_dim]
         future_meal_ids,     # [B, T_futureMeal, M]
-        future_meal_macros,   # [B, T_futureMeal, M, macro_dim]
+        future_meal_macros,   # [B, T_futureMeal, M, food_macro_dim]
         target_scales,        # [B, 2] for unscale
         return_attn: bool = False,
         return_meal_self_attn: bool = False
@@ -613,7 +619,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         Returns either a single tensor [B, T_future, Q]
         or a tuple if return_attn=True: 
           (pred_future, past_meal_enc, attn_past, future_meal_enc, attn_future, meal_self_attn_past, meal_self_attn_future)
-        """
+        """        
         device = past_glucose.device
         B = past_glucose.size(0)
         
@@ -945,12 +951,14 @@ class MealGlucoseForecastModel(pl.LightningModule):
     
 
     @classmethod
-    def load_from_checkpoint(cls, checkpoint_path: str, config: ExperimentConfig, num_foods: int, macro_dim: int, **kwargs):
+    def load_from_checkpoint(cls, checkpoint_path: str, config: ExperimentConfig, num_foods: int, food_macro_dim: int, food_names: List[str], food_group_names: List[str], **kwargs):
         return super().load_from_checkpoint(
             checkpoint_path=checkpoint_path,
             config=config,
             num_foods=num_foods,
-            macro_dim=macro_dim,
+            food_macro_dim=food_macro_dim,
+            food_names=food_names,
+            food_group_names=food_group_names,
             **kwargs
         )
 
@@ -962,7 +970,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         model = cls(
             config=config,
             num_foods=dataset.num_foods,
-            macro_dim=dataset.num_nutrients,
+            food_macro_dim=dataset.num_nutrients,
             food_names=dataset.food_names,
             food_group_names=dataset.food_group_names,
         )
@@ -1138,7 +1146,9 @@ def main(**kwargs):
             best_model_path,
             config=config,
             num_foods=training_dataset.num_foods,
-            macro_dim=training_dataset.num_nutrients
+            food_macro_dim=training_dataset.num_nutrients,
+            food_names=training_dataset.food_names,
+            food_group_names=training_dataset.food_group_names,
         )
     
     # Test phase
