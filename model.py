@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from typing import Optional
+from typing import Optional, List
 
 import torch
 import torch.nn as nn
@@ -34,7 +34,7 @@ from pytorch_lightning.callbacks import RichModelSummary, RichProgressBar
 from pytorch_lightning.loggers import WandbLogger
 import wandb
 
-from dataset import create_cached_dataset
+from dataset import create_cached_dataset, PPGRToMealGlucoseWrapper
 from utils import unscale_tensor
 
 from loguru import logger
@@ -274,13 +274,16 @@ class MealEncoder(nn.Module):
         hidden_dim: int,
         num_foods: int,
         macro_dim: int,
+        food_names: List[str],
+        food_group_names: List[str],
         max_meals: int = 11,
         num_heads: int = 4,
         num_layers: int = 1,
         dropout_rate: float = 0.2,
         transformer_dropout: float = 0.1,
         aggregator_type: str = "set",  # Either "set" or "sum"
-        bootstrap_food_id_embeddings: Optional[nn.Embedding] = None
+        bootstrap_food_id_embeddings: Optional[nn.Embedding] = None,
+        freeze_food_id_embeddings: bool = True
     ):
         super(MealEncoder, self).__init__()
         self.food_embed_dim = food_embed_dim
@@ -289,6 +292,8 @@ class MealEncoder(nn.Module):
         self.max_meals = max_meals
         self.num_foods = num_foods
         self.macro_dim = macro_dim
+        self.food_names = food_names
+        self.food_group_names = food_group_names
         self.aggregator_type = aggregator_type.lower().strip()
 
         # --------------------
@@ -304,7 +309,7 @@ class MealEncoder(nn.Module):
         self.start_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
 
         # Bootstrapping pre-trained food embeddings if provided
-        self.bootstrap_food_id_embeddings(bootstrap_food_id_embeddings)
+        self.bootstrap_food_id_embeddings(bootstrap_food_id_embeddings, freeze_embeddings=freeze_food_id_embeddings)
         
         #  Dropout
         self.dropout = nn.Dropout(dropout_rate)
@@ -431,14 +436,15 @@ class MealEncoder(nn.Module):
         else:
             raise ValueError(f"Invalid aggregator_type='{self.aggregator_type}'. Use 'set' or 'sum' only.")
 
-    def bootstrap_food_id_embeddings(self, bootstrap_food_id_embeddings: nn.Embedding):
+    def bootstrap_food_id_embeddings(self, bootstrap_food_id_embeddings: nn.Embedding, freeze_embeddings: bool = True):
         # Bootstrap the food id embeddings to pre-computed ones
         if bootstrap_food_id_embeddings is not None:
             with torch.no_grad():
                 logger.warning(f"Bootstrapping food id embeddings with {self.food_embed_dim} dimensions of pre-computed embeddings")
                 self.food_emb.weight.copy_(bootstrap_food_id_embeddings.weight[:, :self.food_embed_dim])
-            self.food_emb.weight.requires_grad = False  # Freeze the food id embeddings
-            logger.warning(f"Food id embeddings have been frozen")
+            if freeze_embeddings:
+                self.food_emb.weight.requires_grad = True  # Freeze the food id embeddings
+                logger.warning(f"Food id embeddings have been frozen")
 
 # -----------------------------------------------------------------------------
 # Glucose Encoder
@@ -507,7 +513,7 @@ class PatchedGlucoseEncoder(nn.Module):
 # MealGlucoseForecastModel with configurable dropout parameters
 # -----------------------------------------------------------------------------
 class MealGlucoseForecastModel(pl.LightningModule):
-    def __init__(self, config: ExperimentConfig, num_foods: int, macro_dim: int):
+    def __init__(self, config: ExperimentConfig, num_foods: int, macro_dim: int, food_names: List[str], food_group_names: List[str]):
         super().__init__()
         # Save hyperparameters correctly
         self.save_hyperparameters({
@@ -518,6 +524,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.config = config
         self.num_foods = num_foods
         self.macro_dim = macro_dim
+        self.food_names = food_names
+        self.food_group_names = food_group_names
         self.forecast_horizon = config.prediction_length
         self.eval_window = config.eval_window if config.eval_window is not None else config.prediction_length
 
@@ -539,12 +547,15 @@ class MealGlucoseForecastModel(pl.LightningModule):
             hidden_dim=config.hidden_dim,
             num_foods=num_foods,
             macro_dim=macro_dim,
+            food_names=food_names,
+            food_group_names=food_group_names,
             max_meals=config.max_meals,
             num_heads=config.num_heads,
             num_layers=config.transformer_encoder_layers,
             dropout_rate=config.dropout_rate,
             transformer_dropout=config.transformer_dropout,
             bootstrap_food_id_embeddings=None, # This is initialized in the from_dataset method
+            freeze_food_id_embeddings=config.freeze_food_id_embeddings,
             aggregator_type=config.meal_aggregator_type
         )
 
@@ -585,7 +596,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # global time-based positional embedding
         max_time = config.min_encoder_length + config.prediction_length + 2000  # a safe upper bound
         self.time_emb = nn.Embedding(max_time, config.hidden_dim)
-        
+               
 
     def forward(
         self,
@@ -814,7 +825,6 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.logger.experiment.log({
             f"{phase}_iAUC_eh{self.eval_window}_scatter": wandb.Image(fig_scatter),
             f"{phase}_iAUC_eh{self.eval_window}_correlation": corr.item(),
-            "global_step": self.global_step
         })
         plt.close(fig_scatter)
         setattr(self, f"{phase}_outputs", [])
@@ -830,6 +840,12 @@ class MealGlucoseForecastModel(pl.LightningModule):
 
     def on_test_end(self):
         self._shared_phase_end("test")
+
+    def on_fit_start(self):
+        self.log_food_embeddings("on_fit_start")
+
+    def on_fit_end(self):
+        self.log_food_embeddings("on_fit_end")
 
     def training_step(self, batch, batch_idx):
         (past_glucose, past_meal_ids, past_meal_macros,
@@ -884,7 +900,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             },
             f"pred_iAUC_{self.eval_window}": pred_iAUC,
             f"true_iAUC_{self.eval_window}": true_iAUC,        
-        }
+        }        
 
     def log_food_embeddings(self, label: str):
         logger.info(f"Logging food embeddings for {label}")
@@ -908,10 +924,9 @@ class MealGlucoseForecastModel(pl.LightningModule):
         embedding_cols = [f"proj_embedding_{i}" for i in range(projected_embeddings.shape[1])]
         
         # Retrieve food names from your dataset (assuming they are available as a list)
-        dataset = self.trainer.val_dataloaders.dataset
-        food_names = dataset.food_names  # a list of food names corresponding to each row
-        food_group_names = dataset.food_group_names  # a list of food group names corresponding to each row
-        
+        food_names = self.meal_encoder.food_names  # a list of food names corresponding to each row
+        food_group_names = self.meal_encoder.food_group_names  # a list of food group names corresponding to each row
+
         # Create a DataFrame with the projected embeddings and insert the food names as the first column
         food_embeddings_df = pd.DataFrame(projected_embeddings, columns=embedding_cols)
         food_embeddings_df.insert(0, 'food_group_name', food_group_names) # becomes the second column 
@@ -927,9 +942,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         )
         
         return optimizer
-
-    def on_train_epoch_end(self):
-        pass
+    
 
     @classmethod
     def load_from_checkpoint(cls, checkpoint_path: str, config: ExperimentConfig, num_foods: int, macro_dim: int, **kwargs):
@@ -950,12 +963,14 @@ class MealGlucoseForecastModel(pl.LightningModule):
             config=config,
             num_foods=dataset.num_foods,
             macro_dim=dataset.num_nutrients,
+            food_names=dataset.food_names,
+            food_group_names=dataset.food_group_names,
         )
         
         # If you want to bootstrap with pretrained embeddings:
         if config.use_bootstraped_food_embeddings:
             pretrained_weights = dataset.get_food_id_embeddings()  # returns a Tensor
-            model.meal_encoder.bootstrap_food_id_embeddings(pretrained_weights)
+            model.meal_encoder.bootstrap_food_id_embeddings(pretrained_weights, freeze_embeddings=config.freeze_food_id_embeddings)
         return model
 
 # -----------------------------------------------------------------------------
@@ -1110,8 +1125,10 @@ def main(**kwargs):
     trainer = get_trainer(config, callbacks)
     logging.info("Starting training.")
     
+    
     trainer.fit(model, train_loader, val_loader)
     logging.info("Training complete.")
+    
     
     # Load best model checkpoint
     best_model_path = trainer.checkpoint_callback.best_model_path
