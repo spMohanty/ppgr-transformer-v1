@@ -443,7 +443,7 @@ class MealEncoder(nn.Module):
                 logger.warning(f"Bootstrapping food id embeddings with {self.food_embed_dim} dimensions of pre-computed embeddings")
                 self.food_emb.weight.copy_(bootstrap_food_id_embeddings.weight[:, :self.food_embed_dim])
             if freeze_embeddings:
-                self.food_emb.weight.requires_grad = True  # Freeze the food id embeddings
+                self.food_emb.weight.requires_grad = not freeze_embeddings   # Freeze the food id embeddings
                 logger.warning(f"Food id embeddings have been frozen")
 
 # -----------------------------------------------------------------------------
