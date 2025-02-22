@@ -6,6 +6,7 @@ from dataclasses import dataclass, asdict
 @dataclass
 class ExperimentConfig:
     # Dataset / caching settings
+    random_seed: int = 42
     dataset_version: str = "v0.5"
     cache_dir: str = "/scratch/mohanty/food/ppgr-v1/datasets-cache"
     use_cache: bool = True
@@ -47,7 +48,6 @@ class ExperimentConfig:
     # Model hyperparameters
     max_meals: int = 11  # Maximum number of meals to consider
     food_embed_dim: int = 2048 # the number of dimensions from the pre-trained embeddings to use
-    food_embed_adapter_dim: int = 64 # the number of dimensions to project the food embeddings to for visualization purposes
     hidden_dim: int = 256
     num_heads: int = 4
     transformer_encoder_layers: int = 2

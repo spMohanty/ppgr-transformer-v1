@@ -34,6 +34,8 @@ from pytorch_lightning.callbacks import RichModelSummary, RichProgressBar
 from pytorch_lightning.loggers import WandbLogger
 import wandb
 
+from lightning.pytorch import seed_everything
+
 from dataset import create_cached_dataset, PPGRToMealGlucoseWrapper
 from utils import unscale_tensor
 
@@ -270,7 +272,6 @@ class MealEncoder(nn.Module):
     def __init__(
         self,
         food_embed_dim: int,
-        food_embed_adapter_dim: int,
         hidden_dim: int,
         num_foods: int,
         food_macro_dim: int,
@@ -287,7 +288,6 @@ class MealEncoder(nn.Module):
     ):
         super(MealEncoder, self).__init__()
         self.food_embed_dim = food_embed_dim
-        self.food_embed_adapter_dim = food_embed_adapter_dim
         self.hidden_dim = hidden_dim
         self.max_meals = max_meals
         self.num_foods = num_foods
@@ -300,8 +300,7 @@ class MealEncoder(nn.Module):
         #  Embedding Layers
         # --------------------
         self.food_emb = nn.Embedding(num_foods, food_embed_dim, padding_idx=0)
-        self.food_emb_adapter = nn.Linear(food_embed_dim, food_embed_adapter_dim) # A linear projection to make it easier to visualize
-        self.food_emb_proj = nn.Linear(food_embed_adapter_dim, hidden_dim)
+        self.food_emb_proj = nn.Linear(food_embed_dim, hidden_dim)
         self.macro_proj = nn.Linear(food_macro_dim, hidden_dim, bias=False)
 
                 
@@ -354,7 +353,6 @@ class MealEncoder(nn.Module):
 
         # 2) Embed items
         food_emb = self.food_emb(meal_ids_flat)               # (B*T, M, food_embed_dim)
-        food_emb = self.food_emb_adapter(food_emb)            # (B*T, M, food_embed_adapter_dim)
         food_emb = self.food_emb_proj(food_emb)               # (B*T, M, hidden_dim)
         food_emb = self.dropout(food_emb)
 
@@ -549,7 +547,6 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # 1) Meal Encoder
         self.meal_encoder = MealEncoder(
             food_embed_dim=config.food_embed_dim,
-            food_embed_adapter_dim=config.food_embed_adapter_dim,
             hidden_dim=config.hidden_dim,
             num_foods=num_foods,
             food_macro_dim=food_macro_dim,
@@ -922,7 +919,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             for i in tqdm(range(0, food_emb.size(0), batch_size), desc="Projecting food embeddings for visualization"):
                 batch = food_emb[i : i + batch_size]
                 # Apply the layers in the correct order: adapter then projection
-                proj_batch = self.meal_encoder.food_emb_adapter(batch)
+                proj_batch = self.meal_encoder.food_emb_proj(batch)
                 projected_embeddings.append(proj_batch.detach().cpu())
         
         # Concatenate all batches into a single array and convert to numpy
@@ -1114,6 +1111,9 @@ def prepare_callbacks(config: ExperimentConfig, model: MealGlucoseForecastModel,
 def main(**kwargs):
     logging.getLogger().setLevel(logging.DEBUG if kwargs["debug_mode"] else logging.INFO)
     config = ExperimentConfig(**kwargs)
+    
+    # seed the random number generator
+    seed_everything(config.random_seed)
     
     # Generate experiment name based on modified parameters
     experiment_name = generate_experiment_name(config, kwargs)
