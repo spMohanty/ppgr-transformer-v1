@@ -56,6 +56,8 @@ class ExperimentConfig:
     residual_pred: bool = False
     num_quantiles: int = 7
     loss_iauc_weight: float = 0.00
+    
+    add_glucose_causal_mask: bool = True
 
     # New dropout hyperparameters
     dropout_rate: float = 0.1          # Used for projections, cross-attention, forecast MLP, etc.
@@ -180,6 +182,7 @@ def generate_experiment_name(config: ExperimentConfig, kwargs: dict) -> str:
         'residual_pred': 'res_pred',
         'num_quantiles': 'quantiles',
         'loss_iauc_weight': 'iauc_wt',
+        'add_glucose_causal_mask': 'gluc_causal_mask',
         
         # Dropout
         'dropout_rate': 'drop',

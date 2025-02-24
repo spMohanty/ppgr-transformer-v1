@@ -457,12 +457,14 @@ class MealEncoder(nn.Module):
 # -----------------------------------------------------------------------------
 class PatchedGlucoseEncoder(nn.Module):
     def __init__(
-        self, embed_dim: int, patch_size: int, patch_stride: int, num_heads: int = 4, num_layers: int = 1, max_seq_len: int = 100, dropout_rate: float = 0.2
+        self, embed_dim: int, patch_size: int, patch_stride: int, num_heads: int = 4, num_layers: int = 1, max_seq_len: int = 100, add_causal_mask: bool = True, dropout_rate: float = 0.2
     ):
         super(PatchedGlucoseEncoder, self).__init__()
         self.embed_dim = embed_dim
         self.patch_size = patch_size
         self.patch_stride = patch_stride
+        
+        self.add_causal_mask = add_causal_mask
 
         # Simple linear projection from each patch to embed_dim
         self.patch_proj = nn.Linear(patch_size, embed_dim)
@@ -516,8 +518,16 @@ class PatchedGlucoseEncoder(nn.Module):
         patch_emb = self.dropout(patch_emb)
         patch_emb = patch_emb.view(B_np, N_patches, -1)  # => (B, N_patches, embed_dim)
         
+        # Create a causal mask
+        if self.add_causal_mask:
+            # The mask shape is (N_patches, N_patches)
+            causal_mask = torch.triu(
+                torch.full((N_patches, N_patches), float('-inf')), diagonal=1
+            ).to(glucose_seq.device)
+        else:
+            causal_mask = None
         # Transformer on patches
-        patch_emb = self.transformer(patch_emb)  # => (B, N_patches, embed_dim)
+        patch_emb = self.transformer(patch_emb, mask=causal_mask)  # => (B, N_patches, embed_dim)
         
         return patch_emb, patch_indices
 
@@ -579,6 +589,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             num_heads=config.num_heads,
             num_layers=config.transformer_encoder_layers,
             max_seq_len=config.min_encoder_length,
+            add_causal_mask=config.add_glucose_causal_mask,
             dropout_rate=config.dropout_rate
         )
 

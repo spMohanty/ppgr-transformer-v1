@@ -137,7 +137,7 @@ class PPGRTimeSeriesDataset(Dataset):
                         group_by_columns: List[str] = ["timeseries_block_id"], # Decides what the timeseries grouping/boundaries are
                         
                         min_encoder_length: int = 8 * 4, # context window
-                        max_encoder_length: int = False, # context window
+                        max_encoder_length: int = 12 * 4, # context window
                         prediction_length: int = 3 * 4, # prediction window
                         
                         use_food_covariates_from_prediction_window: bool = True, # decides if the food covariates are used from the prediction window as well
@@ -217,7 +217,7 @@ class PPGRTimeSeriesDataset(Dataset):
     
     def validate_parameters(self):
         assert self.min_encoder_length > 0, "Minimum encoder length must be greater than 0"
-        assert self.max_encoder_length > 0 or self.max_encoder_length is False, "Maximum encoder length must be greater than 0 or set to False to disable randomization"
+        assert self.max_encoder_length > self.min_encoder_length or self.max_encoder_length is None, "Maximum encoder length must be greater than minimum encoder length, or set to False"
         assert self.prediction_length > 0, "Prediction length must be greater than 0"
         assert self.sliding_window_stride is None or self.sliding_window_stride > 0, "Sliding window stride must be greater than 0"
         
