@@ -144,6 +144,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         future_meal_ids: torch.Tensor,     # [B, T_futureMeal, M]
         future_meal_macros: torch.Tensor,  # [B, T_futureMeal, M, food_macro_dim]
         target_scales: torch.Tensor,       # [B, 2] for unscale
+        encoder_lengths: torch.Tensor,     # [B]
+        encoder_padding_mask: torch.Tensor, # [B, T_pastMeal]
         return_attn: bool = False,
         return_meal_self_attn: bool = False
     ) -> Union[torch.Tensor, Tuple]:
@@ -247,7 +249,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         """
         # Unpack batch
         (past_glucose, past_meal_ids, past_meal_macros,
-         future_meal_ids, future_meal_macros, future_glucose, target_scales) = batch
+         future_meal_ids, future_meal_macros, future_glucose, target_scales, encoder_lengths, encoder_padding_mask) = batch
          
         # Ensure target_scales has the right shape
         if target_scales.dim() > 2:
@@ -261,6 +263,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
             future_meal_ids,
             future_meal_macros,
             target_scales,
+            encoder_lengths,
+            encoder_padding_mask,
             return_attn=True,
             return_meal_self_attn=True,
         )
@@ -383,7 +387,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         """Training step."""
         (past_glucose, past_meal_ids, past_meal_macros,
-         future_meal_ids, future_meal_macros, future_glucose, target_scales) = batch
+         future_meal_ids, future_meal_macros, future_glucose, target_scales, encoder_lengths, encoder_padding_mask) = batch
         
         # Forward pass
         preds = self(
@@ -392,7 +396,9 @@ class MealGlucoseForecastModel(pl.LightningModule):
             past_meal_macros,
             future_meal_ids,
             future_meal_macros,
-            target_scales
+            target_scales,
+            encoder_lengths,
+            encoder_padding_mask
         )
         
         # Compute metrics

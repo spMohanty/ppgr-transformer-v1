@@ -213,6 +213,11 @@ def ppgr_collate_fn(batch):
     the time dimension if their first dimension (sequence length) is variable.
     Other keys (like metadata or static tensors) are simply collated into a list
     or stacked if they have consistent shapes.
+    
+    
+    IMPORTANT: We are not using this anymore. This is only kepr here for reference.
+    We have a new custom collate function that operates on the PPGRToMealGlucoseWrapper dataset.
+    Check dataset.py
     """
     collated = {}
             

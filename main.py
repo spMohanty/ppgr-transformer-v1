@@ -49,6 +49,7 @@ def get_dataloaders(config: ExperimentConfig):
         validation_percentage=config.validation_percentage,
         test_percentage=config.test_percentage,
         min_encoder_length=config.min_encoder_length,
+        max_encoder_length=config.max_encoder_length,
         prediction_length=config.prediction_length,
         is_food_anchored=config.is_food_anchored,
         sliding_window_stride=config.sliding_window_stride,
@@ -67,6 +68,7 @@ def get_dataloaders(config: ExperimentConfig):
         use_cache=config.use_cache,
     )
     
+    from dataset import meal_glucose_collate_fn
     # Create data loaders
     train_loader = DataLoader(
         training_dataset, 
@@ -74,23 +76,28 @@ def get_dataloaders(config: ExperimentConfig):
         num_workers=config.dataloader_num_workers, 
         pin_memory=True, 
         persistent_workers=True, 
-        shuffle=True
+        shuffle=True,
+        collate_fn=meal_glucose_collate_fn
     )
     val_loader = DataLoader(
         validation_dataset, 
         batch_size=config.batch_size, 
         num_workers=config.dataloader_num_workers, 
         pin_memory=True, 
-        persistent_workers=True
+        persistent_workers=True,
+        shuffle=False,
+        collate_fn=meal_glucose_collate_fn
     )
     test_loader = DataLoader(
         test_dataset, 
         batch_size=config.batch_size, 
         num_workers=config.dataloader_num_workers, 
         pin_memory=True, 
-        persistent_workers=True
+        persistent_workers=True,
+        shuffle=False,
+        collate_fn=meal_glucose_collate_fn
     )
-    
+        
     return train_loader, val_loader, test_loader, training_dataset
 
 
@@ -196,7 +203,7 @@ def main(**kwargs):
     # Debug mode adjustments
     if config.debug_mode:
         config.dataloader_num_workers = 1
-        logger.info("Debug mode enabled: reducing worker count")
+        logger.warning("Debug mode enabled: reducing dataloaderworker count to 1")
 
     # Create data loaders
     train_loader, val_loader, test_loader, training_dataset = get_dataloaders(config)
@@ -240,7 +247,7 @@ def main(**kwargs):
         batch = next(iter(test_loader))
         batch = [x.to(model.device) for x in batch]
         (past_glucose, past_meal_ids, past_meal_macros,
-         future_meal_ids, future_meal_macros, future_glucose, target_scales) = batch
+         future_meal_ids, future_meal_macros, future_glucose, target_scale, encoder_lengths, encoder_padding_mask) = batch
         preds = model(
             past_glucose,
             past_meal_ids,

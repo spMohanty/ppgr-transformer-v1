@@ -638,9 +638,7 @@ class PPGRTimeSeriesDataset(Dataset):
         # Get dimensions for start/empty token tensor creation
         num_cat_features = len(self.food_categorical_col_idx)
         num_real_features = len(self.food_real_col_idx)
-        
-        START_TOKEN = 1 # TODO: choose appropriate values later for this. Too brainfucked to think right now.
-    
+            
         # TODO: Setup sensible values for the start token
         max_meals_per_timestep = self.max_meals_per_timestep
         
@@ -1022,44 +1020,45 @@ class PPGRToMealGlucoseWrapper(Dataset):
         (You can change these slices as needed, but `num_nutrients` will be derived from the full list
          available in `ppgr_dataset.food_reals`.)
     """
-    def __init__(self, ppgr_dataset: Dataset, 
-                 max_meals: int = None, 
-                 num_foods: int = None, 
-                 food_names: List[str] = None):
+    def __init__(self, ppgr_dataset: Dataset):
         """
         Args:
             ppgr_dataset (Dataset): An instance of PPGRTimeSeriesDataset.
-            max_meals (int, optional): Maximum number of meals per timestep. If None, the wrapper
-                                       will use ppgr_dataset.max_meals_per_timestep if available;
-                                       otherwise, it defaults to 11.
         """
         self.ppgr_dataset = ppgr_dataset
         
-        # Determine max_meals from the dataset attribute if not explicitly provided
-        if max_meals is None:
-            if hasattr(ppgr_dataset, "max_meals_per_timestep"):
-                self.max_meals = ppgr_dataset.max_meals_per_timestep
-            else:
-                self.max_meals = 11  # default fallback
-        else:
-            self.max_meals = max_meals
+        # First validate all requirements
+        self._validate_dataset()
+        
+        # Then initialize all attributes
+        self._initialize_attributes()
 
-        # Determine num_foods from the food_id encoder if available
-        if hasattr(ppgr_dataset, "categorical_encoders") and "food_id" in ppgr_dataset.categorical_encoders:
-            # +1 for padding (assumed index 0)
-            self.food_names = self.ppgr_dataset.food_names
-            self.food_group_names = self.ppgr_dataset.food_group_names
-            self.num_foods = len(self.food_names)
+    def _validate_dataset(self):
+        """Validate that the dataset meets all requirements for this wrapper."""
+        # Food-related validations
+        assert hasattr(self.ppgr_dataset, "categorical_encoders"), "Dataset missing categorical_encoders attribute"
+        assert "food_id" in self.ppgr_dataset.categorical_encoders, "food_id missing from categorical_encoders"
+        assert hasattr(self.ppgr_dataset, "food_names"), "Dataset missing food_names attribute"
+        assert hasattr(self.ppgr_dataset, "food_group_names"), "Dataset missing food_group_names attribute"
+        
+        # Nutrient-related validations
+        assert hasattr(self.ppgr_dataset, "food_reals"), "Dataset missing food_reals attribute"
+
+    def _initialize_attributes(self):
+        """Initialize all required attributes after validation has passed."""
+        # Initialize max meals
+        if hasattr(self.ppgr_dataset, "max_meals_per_timestep"):
+            self.max_meals = self.ppgr_dataset.max_meals_per_timestep
         else:
-            self.num_foods = num_foods
-            self.food_names = food_names
-            self.food_group_names = food_group_names
+            self.max_meals = 11  # default fallback
             
-        # Determine the number of nutrient dimensions from the dataset's food_reals list.
-        if hasattr(ppgr_dataset, "food_reals"):
-            self.num_nutrients = len(ppgr_dataset.food_reals)
-        else:
-            self.num_nutrients = None
+        # Initialize food attributes
+        self.food_names = self.ppgr_dataset.food_names
+        self.food_group_names = self.ppgr_dataset.food_group_names
+        self.num_foods = len(self.food_names)
+            
+        # Initialize nutrient dimensions
+        self.num_nutrients = len(self.ppgr_dataset.food_reals)
 
     def __len__(self):
         return len(self.ppgr_dataset)
@@ -1092,6 +1091,10 @@ class PPGRToMealGlucoseWrapper(Dataset):
     def __getitem__(self, idx):
         # Retrieve the original PPGR sample (a dict)
         item = self.ppgr_dataset[idx]
+        device = self.ppgr_dataset.device
+        
+        # Store the actual encoder length for this sample
+        encoder_length = torch.tensor(item["encoder_length"].item(), dtype=torch.int32).to(device)
         
         # ---------------------------
         # Past (encoder) side:
@@ -1134,8 +1137,8 @@ class PPGRToMealGlucoseWrapper(Dataset):
             y_length = item["y_real_target"].shape[0]
             num_cat_features = item["y_food_cat"][0].shape[-1]
             num_real_features = item["y_food_real"][0].shape[-1]
-            y_food_cat = torch.zeros(y_length, self.max_meals, num_cat_features)
-            y_food_real = torch.zeros(y_length, self.max_meals, num_real_features)
+            y_food_cat = torch.zeros(y_length, self.max_meals, num_cat_features).to(device)
+            y_food_real = torch.zeros(y_length, self.max_meals, num_real_features).to(device)
         else:
             y_food_cat = torch.nested.to_padded_tensor(item["y_food_cat"], padding=0)
             y_food_real = torch.nested.to_padded_tensor(item["y_food_real"], padding=0)
@@ -1156,12 +1159,72 @@ class PPGRToMealGlucoseWrapper(Dataset):
                 future_meal_ids,        # [T_pred, max_meals]
                 future_meal_macros.float(),     # [T_pred, max_meals, num_nutrients]
                 future_glucose.float(),         # [T_pred]
-                target_scales)         # [2]
+                target_scales,         # [2]
+                encoder_length)         # [1]
 
+def meal_glucose_collate_fn(batch):
+    """
+    Custom collate function for the PPGRToMealGlucoseWrapper that handles variable-length
+    encoder sequences with left padding.
+    
+    Args:
+        batch: A list of tuples from PPGRToMealGlucoseWrapper.__getitem__
+        
+    Returns:
+        A tuple of padded tensors ready for the model.
+    """
+    # Unpack the batch into separate lists
+    past_glucose_list, past_meal_ids_list, past_meal_macros_list, future_meal_ids_list, \
+    future_meal_macros_list, future_glucose_list, target_scales_list, encoder_lengths = zip(*batch)
 
+    
+    # Convert encoder_lengths to a tensor
+    encoder_lengths = torch.stack(encoder_lengths)
+    max_encoder_len = max(encoder_lengths).item()
+    device = encoder_lengths[0].device
+        
+    # Apply left padding directly using pad_sequence
+    past_glucose_batch = torch.nn.utils.rnn.pad_sequence(
+        past_glucose_list, batch_first=True, padding_value=0.0, padding_side="left"
+    )
+    
+    past_meal_ids_batch = torch.nn.utils.rnn.pad_sequence(
+        past_meal_ids_list, batch_first=True, padding_value=0, padding_side="left"
+    )
+    
+    past_meal_macros_batch = torch.nn.utils.rnn.pad_sequence(
+        past_meal_macros_list, batch_first=True, padding_value=0, padding_side="left"
+    )    
+            
+    # Future sequences should all have the same length, so we can just stack them
+    future_glucose_batch = torch.stack(future_glucose_list)
+    future_meal_ids_batch = torch.stack(future_meal_ids_list)
+    future_meal_macros_batch = torch.stack(future_meal_macros_list)
+    
+    # Stack target scales
+    target_scales_batch = torch.stack(target_scales_list)
+    
+    # Create encoder padding mask (1 = valid data, 0 = padding)
+    # Create position indices along the time dimension
+    positions = torch.arange(max_encoder_len).to(device)
+    
+    # For left padding: mask positions where position_index >= (max_len - sequence_length)
+    # This creates a [batch_size, max_encoder_len] boolean mask
+    start_positions = max_encoder_len - encoder_lengths.unsqueeze(1)
+    encoder_padding_mask = positions.unsqueeze(0) >= start_positions
+    
+    return (past_glucose_batch, 
+            past_meal_ids_batch, 
+            past_meal_macros_batch, 
+            future_meal_ids_batch, 
+            future_meal_macros_batch, 
+            future_glucose_batch, 
+            target_scales_batch, 
+            encoder_lengths,
+            encoder_padding_mask)
 
 # -----------------------------------------------------------------------------
-# NEW create_cached_dataset function that caches all splits + encoders/scalers
+# create_cached_dataset function that caches all splits + encoders/scalers
 # -----------------------------------------------------------------------------
 def create_cached_dataset(
     dataset_version,
@@ -1169,6 +1232,7 @@ def create_cached_dataset(
     validation_percentage,
     test_percentage,
     min_encoder_length,
+    max_encoder_length,
     prediction_length,
     is_food_anchored,
     sliding_window_stride,
@@ -1204,6 +1268,7 @@ def create_cached_dataset(
         "validation_percentage": validation_percentage,
         "test_percentage": test_percentage,
         "min_encoder_length": min_encoder_length,
+        "max_encoder_length": max_encoder_length,
         "prediction_length": prediction_length,
         "is_food_anchored": is_food_anchored,
         "sliding_window_stride": sliding_window_stride,
@@ -1218,6 +1283,7 @@ def create_cached_dataset(
         "food_categoricals": food_categoricals,
         "food_reals": food_reals,
         "targets": targets,
+        "device": "cpu" # the dataset always runs on CPU
     }
     
     logger.info(f"Loading dataset with the following config: {config}")
@@ -1296,6 +1362,7 @@ def create_cached_dataset(
         is_food_anchored=is_food_anchored,
         sliding_window_stride=sliding_window_stride,
         min_encoder_length=min_encoder_length,
+        max_encoder_length=max_encoder_length,
         prediction_length=prediction_length,
         use_food_covariates_from_prediction_window=True,
         use_meal_level_food_covariates=use_meal_level_food_covariates,
@@ -1311,6 +1378,7 @@ def create_cached_dataset(
         food_reals=food_reals,
         categorical_encoders=categorical_encoders,
         continuous_scalers=continuous_scalers,
+        device="cpu"
     )
 
     validation_dataset = PPGRTimeSeriesDataset(
@@ -1323,6 +1391,7 @@ def create_cached_dataset(
         is_food_anchored=is_food_anchored,
         sliding_window_stride=sliding_window_stride,
         min_encoder_length=min_encoder_length,
+        max_encoder_length=max_encoder_length,
         prediction_length=prediction_length,
         use_food_covariates_from_prediction_window=True,
         use_meal_level_food_covariates=use_meal_level_food_covariates,
@@ -1338,6 +1407,7 @@ def create_cached_dataset(
         food_reals=food_reals,
         categorical_encoders=categorical_encoders,
         continuous_scalers=continuous_scalers,
+        device="cpu"
     )
 
     test_dataset = PPGRTimeSeriesDataset(
@@ -1350,6 +1420,7 @@ def create_cached_dataset(
         is_food_anchored=is_food_anchored,
         sliding_window_stride=sliding_window_stride,
         min_encoder_length=min_encoder_length,
+        max_encoder_length=max_encoder_length,
         prediction_length=prediction_length,
         use_food_covariates_from_prediction_window=True,
         use_meal_level_food_covariates=use_meal_level_food_covariates,
@@ -1365,6 +1436,7 @@ def create_cached_dataset(
         food_reals=food_reals,
         categorical_encoders=categorical_encoders,
         continuous_scalers=continuous_scalers,
+        device="cpu"
     )
 
     wrapped_training_dataset = PPGRToMealGlucoseWrapper(training_dataset)
@@ -1563,19 +1635,63 @@ if __name__ == "__main__":
     # breakpoint()
     
     
-    from model import ExperimentConfig, get_dataloaders
+    from main import ExperimentConfig, get_dataloaders
     
     config = ExperimentConfig(
-        dataloader_num_workers=1,
-        debug_mode=True,
+        dataloader_num_workers=7,
+        debug_mode=False,
         dataset_version="v0.5",
         use_bootstraped_food_embeddings=True,
-        use_cache = False
+        use_cache = True
+    )
+
+    (training_dataset, validation_dataset, test_dataset, categorical_encoders, continuous_scalers) = create_cached_dataset(
+        dataset_version=config.dataset_version,
+        debug_mode=config.debug_mode,
+        validation_percentage=config.validation_percentage,
+        test_percentage=config.test_percentage,
+        min_encoder_length=config.min_encoder_length,
+        max_encoder_length=config.max_encoder_length,
+        prediction_length=config.prediction_length,
+        is_food_anchored=config.is_food_anchored,
+        sliding_window_stride=config.sliding_window_stride,
+        use_meal_level_food_covariates=config.use_meal_level_food_covariates,
+        use_microbiome_embeddings=config.use_microbiome_embeddings,
+        use_bootstraped_food_embeddings=config.use_bootstraped_food_embeddings,
+        group_by_columns=config.group_by_columns,
+        temporal_categoricals=config.temporal_categoricals,
+        temporal_reals=config.temporal_reals,
+        user_static_categoricals=config.user_static_categoricals,
+        user_static_reals=config.user_static_reals,
+        food_categoricals=config.food_categoricals,
+        food_reals=config.food_reals,
+        targets=config.targets,
+        cache_dir=config.cache_dir,
+        use_cache=config.use_cache,
     )
     
-    train_loader, val_loader, test_loader = get_dataloaders(config)
+    train_loader = DataLoader(
+        training_dataset, 
+        batch_size=config.batch_size, 
+        num_workers=config.dataloader_num_workers, 
+        pin_memory=True, 
+        persistent_workers=True,
+        shuffle=True,
+        collate_fn=meal_glucose_collate_fn
+    )    
     
-    train_loader.dataset[0]
+    for _ in tqdm(train_loader):
+        pass
+    
+    # batch = meal_glucose_collate_fn([training_dataset[0], training_dataset[1], training_dataset[2]])
+    
+    # breakpoint()
+    
+    # print(batch)
+    
+    
+    # train_loader, val_loader, test_loader = get_dataloaders(config)
+    # train_loader.dataset[0]
     
     
     

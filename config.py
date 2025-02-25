@@ -11,10 +11,11 @@ class ExperimentConfig:
     cache_dir: str = "/scratch/mohanty/food/ppgr-v1/datasets-cache"
     use_cache: bool = True
     debug_mode: bool = False
-    dataloader_num_workers: int = 7  # Added configurable dataloader_num_workers parameter
+    dataloader_num_workers: int = 7 
 
     # Data splitting & sequence parameters
     min_encoder_length: int = 8 * 4    # e.g., 8hrs * 4
+    max_encoder_length: int = 12 * 4   # e.g., 12hrs * 4
     prediction_length: int = 4 * 4     # e.g.,  4hrs * 4
     eval_window: int = 2 * 4            # e.g., 2hrs * 4
     validation_percentage: float = 0.1
