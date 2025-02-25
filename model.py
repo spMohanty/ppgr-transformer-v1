@@ -78,23 +78,13 @@ class TransformerEncoderLayerWithAttn(nn.Module):
 
     def forward(self, src, src_mask=None, src_key_padding_mask=None, need_weights=False):
         # 1) Self-Attention
-        try:
-            all_attention_outputs = self.self_attn(
-                src, src, src,
-                attn_mask=src_mask,
-                key_padding_mask=src_key_padding_mask,
-                need_weights=True
-            )
-        except Exception as e:
-            breakpoint()
-            
-        if type(all_attention_outputs) == tuple:
-            attn_output = all_attention_outputs[0]
-            attn_weights = all_attention_outputs[1]
-        else:
-            attn_output = all_attention_outputs
-            attn_weights = None
-                    
+        attn_output, attn_weights = self.self_attn(
+            src, src, src,
+            attn_mask=src_mask,
+            key_padding_mask=src_key_padding_mask,
+            need_weights=True # need_weights=False throws an error, so hard coding it temporarily. 
+        )            
+        
         # Dropout plus residual
         src = src + self.dropout_attn(attn_output)
         src = self.norm1(src)
