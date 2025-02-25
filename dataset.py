@@ -1051,9 +1051,9 @@ class PPGRToMealGlucoseWrapper(Dataset):
             self.food_group_names = self.ppgr_dataset.food_group_names
             self.num_foods = len(self.food_names)
         else:
-            self.num_foods = None
-            self.food_names = None
-            self.food_group_names = None
+            self.num_foods = num_foods
+            self.food_names = food_names
+            self.food_group_names = food_group_names
             
         # Determine the number of nutrient dimensions from the dataset's food_reals list.
         if hasattr(ppgr_dataset, "food_reals"):
