@@ -53,7 +53,7 @@ class ExperimentConfig:
     num_heads: int = 4
     transformer_encoder_layers: int = 2
     transformer_decoder_layers: int = 2
-    residual_pred: bool = False
+    add_residual_connection_before_predictions: bool = False
     num_quantiles: int = 7
     loss_iauc_weight: float = 0.00
     
@@ -81,6 +81,7 @@ class ExperimentConfig:
     # WandB logging
     wandb_project: str = "meal-representations-learning-v0"
     wandb_run_name: str = "MealGlucoseForecastModel_Run"
+    wandb_log_embeddings: bool = False
 
     # Precision
     precision: str = "bf16"
@@ -179,7 +180,7 @@ def generate_experiment_name(config: ExperimentConfig, kwargs: dict) -> str:
         'num_heads': 'heads',
         'transformer_encoder_layers': 'enc_layers',
         'transformer_decoder_layers': 'dec_layers',
-        'residual_pred': 'res_pred',
+        'add_residual_connection_before_predictions': 'res_pred',
         'num_quantiles': 'quantiles',
         'loss_iauc_weight': 'iauc_wt',
         'add_glucose_causal_mask': 'gluc_causal_mask',
@@ -206,7 +207,10 @@ def generate_experiment_name(config: ExperimentConfig, kwargs: dict) -> str:
         'food_embedding_projection_batch_size': 'proj_bs',
         
         # Plots
-        'disable_plots': 'no_plots'
+        'disable_plots': 'no_plots',
+        
+        # WandB logging
+        'wandb_log_embeddings': 'log_emb'
     }
     
     # Build name components for modified parameters

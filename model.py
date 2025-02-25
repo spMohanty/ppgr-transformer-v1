@@ -76,14 +76,26 @@ class TransformerEncoderLayerWithAttn(nn.Module):
         # Activation function
         self.activation_fn = F.relu if activation == "relu" else F.gelu
 
-    def forward(self, src, src_mask=None, src_key_padding_mask=None, return_attn=False):
+    def forward(self, src, src_mask=None, src_key_padding_mask=None, need_weights=False):
         # 1) Self-Attention
-        attn_output, attn_weights = self.self_attn(
-            src, src, src,
-            attn_mask=src_mask,
-            key_padding_mask=src_key_padding_mask,
-            need_weights=True
-        )
+        try:
+            all_attention_outputs = self.self_attn(
+                src, src, src,
+                attn_mask=src_mask,
+                key_padding_mask=src_key_padding_mask,
+                need_weights=True
+            )
+        except Exception as e:
+            breakpoint()
+            
+        if type(all_attention_outputs) == tuple:
+            attn_output = all_attention_outputs[0]
+            attn_weights = all_attention_outputs[1]
+        else:
+            attn_output = all_attention_outputs
+            attn_weights = None
+                    
+        # Dropout plus residual
         src = src + self.dropout_attn(attn_output)
         src = self.norm1(src)
 
@@ -92,10 +104,8 @@ class TransformerEncoderLayerWithAttn(nn.Module):
         src = src + ff
         src = self.norm2(src)
 
-        if return_attn:
-            return src, attn_weights
-        return src
-
+        return src, attn_weights
+        
 
 class TransformerEncoderWithAttn(nn.Module):
     """
@@ -107,34 +117,22 @@ class TransformerEncoderWithAttn(nn.Module):
         self.layers = nn.ModuleList([encoder_layer for _ in range(num_layers)])
         self.norm = norm
 
-    def forward(self, src, mask=None, src_key_padding_mask=None, return_attn=False):
+    def forward(self, src, mask=None, src_key_padding_mask=None, need_weights=False):
         output = src
         attn_weights = None
 
         for layer_idx, layer in enumerate(self.layers):
-            # Only return attention from the final layer if asked
-            is_last = (layer_idx == len(self.layers) - 1)
-            if return_attn and is_last:
-                output, attn_weights = layer(
-                    output,
-                    src_mask=mask,
-                    src_key_padding_mask=src_key_padding_mask,
-                    return_attn=True
-                )
-            else:
-                output = layer(
-                    output,
-                    src_mask=mask,
-                    src_key_padding_mask=src_key_padding_mask,
-                    return_attn=False
-                )
+            output, attn_weights = layer(
+                output,
+                src_mask=mask,
+                src_key_padding_mask=src_key_padding_mask,
+                need_weights=need_weights
+            )
 
         if self.norm is not None:
             output = self.norm(output)
 
-        if return_attn:
-            return output, attn_weights
-        return output
+        return output, attn_weights
 
 
 # -----------------------------------------------------------------------------
@@ -208,10 +206,7 @@ class TransformerDecoderLayerWithAttn(nn.Module):
         x = x + ff
         x = self.norm3(x)
 
-        if return_attn:
-            return x, cross_attn_weights
-        return x, None
-
+        return x, cross_attn_weights
 
 class TransformerDecoderWithAttn(nn.Module):
     """
@@ -238,26 +233,15 @@ class TransformerDecoderWithAttn(nn.Module):
 
         for layer_idx, layer in enumerate(self.layers):
             is_last = (layer_idx == len(self.layers) - 1)
-            if return_attn and is_last:
-                output, cross_attn_weights = layer(
-                    output,
-                    memory,
-                    tgt_mask=tgt_mask,
-                    memory_mask=memory_mask,
-                    tgt_key_padding_mask=tgt_key_padding_mask,
-                    memory_key_padding_mask=memory_key_padding_mask,
-                    return_attn=True
-                )
-            else:
-                output, _ = layer(
-                    output,
-                    memory,
-                    tgt_mask=tgt_mask,
-                    memory_mask=memory_mask,
-                    tgt_key_padding_mask=tgt_key_padding_mask,
-                    memory_key_padding_mask=memory_key_padding_mask,
-                    return_attn=False
-                )
+            output, cross_attn_weights = layer(
+                output,
+                memory,
+                tgt_mask=tgt_mask,
+                memory_mask=memory_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+                return_attn=(return_attn and is_last)
+            )            
 
         if self.norm is not None:
             output = self.norm(output)
@@ -383,11 +367,8 @@ class MealEncoder(nn.Module):
             # No self-attn in sum mode
             self_attn = None
 
-            if return_self_attn:
-                # We don't have attention to return in sum mode
-                return meal_timestep_emb, None
-            else:
-                return meal_timestep_emb
+            # We don't have attention to return in sum mode
+            return meal_timestep_emb, self_attn
 
         # -------------------------------------------------------------------
         #  aggregator_type = "set"
@@ -412,33 +393,17 @@ class MealEncoder(nn.Module):
                 )
 
             # Forward pass through the Transformer
-            if return_self_attn:
-                meal_attn_out, self_attn = self.encoder(
-                    meal_token_emb,
-                    src_key_padding_mask=pad_mask,
-                    return_attn=True
-                )
-                # self_attn shape => (B*T, M+1, M+1)
-            else:
-                meal_attn_out = self.encoder(
-                    meal_token_emb,
-                    src_key_padding_mask=pad_mask,
-                    return_attn=False
-                )
-                self_attn = None
+            meal_attn_out, self_attn = self.encoder(meal_token_emb,src_key_padding_mask=pad_mask,need_weights=return_self_attn)
 
             # Use the aggregator token's output as the "meal embedding"
             meal_timestep_emb = meal_attn_out[:, 0, :]  # => (B*T, hidden_dim)
             meal_timestep_emb = meal_timestep_emb.view(B, T, self.hidden_dim)
-
-            # If returning attention, reshape it for convenience:
-            # from (B*T, M+1, M+1) -> (B, T, M+1, M+1)
-            if return_self_attn and self_attn is not None:
+            
+            if self_attn is not None:
+                # Reshape the attention weights to (B, T, M+1, M+1)
                 self_attn = self_attn.view(B, T, self_attn.size(-2), self_attn.size(-1))
-                return meal_timestep_emb, self_attn
-            else:
-                return meal_timestep_emb
-
+                
+            return meal_timestep_emb, self_attn
         else:
             raise ValueError(f"Invalid aggregator_type='{self.aggregator_type}'. Use 'set' or 'sum' only.")
 
@@ -551,7 +516,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.forecast_horizon = config.prediction_length
         self.eval_window = config.eval_window if config.eval_window is not None else config.prediction_length
 
-        self.residual_pred = config.residual_pred
+        self.add_residual_connection_before_predictions = config.add_residual_connection_before_predictions
         self.num_quantiles = config.num_quantiles
         self.loss_iauc_weight = config.loss_iauc_weight
 
@@ -642,7 +607,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # 1) Encode glucose => shape [B, G_patches, hidden_dim]
         glucose_enc, patch_indices = self.glucose_encoder(past_glucose)
-        n_glucose_patches = glucose_enc.size(1)  # how many patches
+        # n_glucose_patches = glucose_enc.size(1)  # how many patches
         
         # glucose_enc => [B, n_glucose_patches, hidden_dim]
         # We'll broadcast the patch_indices shape => [B, n_patches], do the same embed
@@ -650,18 +615,18 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         
         # 2) Encode past & future meals => [B, T_pastMeal, hidden_dim], [B, T_futureMeal, hidden_dim]
-        if return_meal_self_attn:
-            past_meal_enc, meal_self_attn_past = self.meal_encoder(
-                past_meal_ids, past_meal_macros, return_self_attn=True
-            )
-            future_meal_enc, meal_self_attn_future = self.meal_encoder(
-                future_meal_ids, future_meal_macros, return_self_attn=True
-            )
-        else:
-            past_meal_enc = self.meal_encoder(past_meal_ids, past_meal_macros)
-            future_meal_enc = self.meal_encoder(future_meal_ids, future_meal_macros)
-            meal_self_attn_past = None
-            meal_self_attn_future = None
+        # if return_meal_self_attn:
+        past_meal_enc, meal_self_attn_past = self.meal_encoder(
+            past_meal_ids, past_meal_macros, return_self_attn=return_meal_self_attn
+        )
+        future_meal_enc, meal_self_attn_future = self.meal_encoder(
+            future_meal_ids, future_meal_macros, return_self_attn=return_meal_self_attn
+        )
+        # else:
+        #     past_meal_enc = self.meal_encoder(past_meal_ids, past_meal_macros)
+        #     future_meal_enc = self.meal_encoder(future_meal_ids, future_meal_macros)
+        #     meal_self_attn_past = None
+        #     meal_self_attn_future = None
 
         T_past = past_meal_enc.size(1)
         T_future = future_meal_enc.size(1)
@@ -716,18 +681,11 @@ class MealGlucoseForecastModel(pl.LightningModule):
         query_emb = query_emb + self.time_emb(t_fufure_global_indices)
 
         # 6) Decode
-        if return_attn:
-            decoder_output, cross_attn = self.decoder(
-                tgt=query_emb,
-                memory=memory,
-                return_attn=True
-            )
-        else:
-            decoder_output, cross_attn = self.decoder(
-                tgt=query_emb,
-                memory=memory,
-                return_attn=False
-            )
+        decoder_output, cross_attn = self.decoder(
+            tgt=query_emb,
+            memory=memory,
+            return_attn=return_attn
+        )
 
         # cross_attn => [B, T_future, T_mem]
 
@@ -745,7 +703,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         pred_future = self.forecast_linear(decoder_output)
 
         # Residual
-        if self.residual_pred:
+        if self.add_residual_connection_before_predictions:
             last_val = past_glucose[:, -1].unsqueeze(1).unsqueeze(-1)
             pred_future = pred_future + last_val
 
@@ -865,10 +823,12 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self._shared_phase_end("test")
 
     def on_fit_start(self):
-        self.log_food_embeddings("on_fit_start")
+        if self.config.wandb_log_embeddings:
+            self.log_food_embeddings("on_fit_start")
 
     def on_fit_end(self):
-        self.log_food_embeddings("on_fit_end")
+        if self.config.wandb_log_embeddings:
+            self.log_food_embeddings("on_fit_end")
 
     def training_step(self, batch, batch_idx):
         (past_glucose, past_meal_ids, past_meal_macros,
