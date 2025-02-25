@@ -160,6 +160,7 @@ def generate_experiment_name(config: ExperimentConfig, kwargs: dict) -> str:
         # Sequence parameters
         'min_encoder_length': 'enc',
         'prediction_length': 'pred',
+        'encoder_length_randomization': 'encL_rand',
         'eval_window': 'eval',
         'validation_percentage': 'val_pct',
         'test_percentage': 'test_pct',
