@@ -51,6 +51,7 @@ def get_dataloaders(config: ExperimentConfig):
         min_encoder_length=config.min_encoder_length,
         max_encoder_length=config.max_encoder_length,
         prediction_length=config.prediction_length,
+        encoder_length_randomization=config.encoder_length_randomization,
         is_food_anchored=config.is_food_anchored,
         sliding_window_stride=config.sliding_window_stride,
         use_meal_level_food_covariates=config.use_meal_level_food_covariates,
@@ -245,20 +246,19 @@ def main(**kwargs):
     model.eval()
     with torch.no_grad():
         batch = next(iter(test_loader))
-        batch = [x.to(model.device) for x in batch]
+        
+        # Move batch to device
+        batch = {k: v.to(model.device) for k, v in batch.items()}
+        
+        # Unpack batch
         (past_glucose, past_meal_ids, past_meal_macros,
          future_meal_ids, future_meal_macros, future_glucose, target_scale, encoder_lengths, encoder_padding_mask) = batch
+        
         preds = model(
-            past_glucose,
-            past_meal_ids,
-            past_meal_macros,
-            future_meal_ids,
-            future_meal_macros,
-            target_scales,
+            batch,
             return_attn=True,
             return_meal_self_attn=True,
         )
-        
     logger.info("Example inference complete")
     logger.info(f"Experiment {experiment_name} completed successfully")
 

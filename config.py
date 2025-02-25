@@ -21,6 +21,7 @@ class ExperimentConfig:
     validation_percentage: float = 0.1
     test_percentage: float = 0.1
     
+    encoder_length_randomization: str = "training_only" # "training_only", "all_sets", "none"
     
     # Aggregation
     patch_size: int = 1 * 4 # 1 hour patch size

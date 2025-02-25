@@ -139,6 +139,7 @@ class PPGRTimeSeriesDataset(Dataset):
                         min_encoder_length: int = 8 * 4, # context window
                         max_encoder_length: int = 12 * 4, # context window
                         prediction_length: int = 3 * 4, # prediction window
+                        disable_encoder_length_randomization: bool = False, # decides if the encoder length should be randomized betwen min and max encoder length. 
                         
                         use_food_covariates_from_prediction_window: bool = True, # decides if the food covariates are used from the prediction window as well
                         
@@ -179,6 +180,7 @@ class PPGRTimeSeriesDataset(Dataset):
         self.min_encoder_length = min_encoder_length
         self.max_encoder_length = max_encoder_length
         self.prediction_length = prediction_length
+        self.disable_encoder_length_randomization = disable_encoder_length_randomization
                 
         self.use_food_covariates_from_prediction_window = use_food_covariates_from_prediction_window
         
@@ -483,7 +485,7 @@ class PPGRTimeSeriesDataset(Dataset):
                 microbiome_idx = None
             
             # Iterate over the whole timeseries block            
-            for row_idx in range(block_start, block_end + 1, self.sliding_window_stride):
+            for row_idx in tqdm(range(block_start, block_end + 1, self.sliding_window_stride), total=len(range(block_start, block_end + 1, self.sliding_window_stride))):
                 # 1. Identify the start and end of the context and prediction window
                 slice_start = row_idx - self.min_encoder_length + 1
                 slice_end = row_idx + self.prediction_length
@@ -607,11 +609,16 @@ class PPGRTimeSeriesDataset(Dataset):
                 self.max_encoder_length,
                 slice_anchor_row_idx - block_start  # Ensure we don't go before block start
             )
-            encoder_length = torch.randint(
-                low=self.min_encoder_length,
-                high=max_possible_encoder_length + 1,  # +1 because randint's high is exclusive
-                size=(1,)
-            ).item()
+            
+            if self.disable_encoder_length_randomization:
+                # If we are not randomizing, we just use the max possible encoder length
+                encoder_length = max_possible_encoder_length
+            else:
+                encoder_length = torch.randint(
+                    low=self.min_encoder_length,
+                    high=max_possible_encoder_length + 1,  # +1 because randint's high is exclusive
+                    size=(1,)
+                ).item()
         
         # Calculate slice start based on randomly sampled encoder length
         slice_start = slice_anchor_row_idx - encoder_length + 1
@@ -1213,15 +1220,20 @@ def meal_glucose_collate_fn(batch):
     start_positions = max_encoder_len - encoder_lengths.unsqueeze(1)
     encoder_padding_mask = positions.unsqueeze(0) >= start_positions
     
-    return (past_glucose_batch, 
-            past_meal_ids_batch, 
-            past_meal_macros_batch, 
-            future_meal_ids_batch, 
-            future_meal_macros_batch, 
-            future_glucose_batch, 
-            target_scales_batch, 
-            encoder_lengths,
-            encoder_padding_mask)
+    
+    _response = {
+        "past_glucose": past_glucose_batch, 
+        "past_meal_ids": past_meal_ids_batch, 
+        "past_meal_macros": past_meal_macros_batch, 
+        "future_meal_ids": future_meal_ids_batch, 
+        "future_meal_macros": future_meal_macros_batch, 
+        "future_glucose": future_glucose_batch, 
+        "target_scales": target_scales_batch,
+        "encoder_lengths": encoder_lengths,
+        "encoder_padding_mask": encoder_padding_mask
+    }
+    return _response
+    
 
 # -----------------------------------------------------------------------------
 # create_cached_dataset function that caches all splits + encoders/scalers
@@ -1234,6 +1246,7 @@ def create_cached_dataset(
     min_encoder_length,
     max_encoder_length,
     prediction_length,
+    encoder_length_randomization,
     is_food_anchored,
     sliding_window_stride,
     use_meal_level_food_covariates,
@@ -1270,6 +1283,7 @@ def create_cached_dataset(
         "min_encoder_length": min_encoder_length,
         "max_encoder_length": max_encoder_length,
         "prediction_length": prediction_length,
+        "encoder_length_randomization": encoder_length_randomization,
         "is_food_anchored": is_food_anchored,
         "sliding_window_stride": sliding_window_stride,
         "use_meal_level_food_covariates": use_meal_level_food_covariates,
@@ -1350,6 +1364,27 @@ def create_cached_dataset(
         real_columns=main_df_scaled_all_real_columns,
         use_meal_level_food_covariates=use_meal_level_food_covariates,
     )
+    
+    if encoder_length_randomization == "training_only":
+        disable_encoder_length_randomization = {
+            "training_set": False,
+            "validation_set": True,
+            "test_set": True
+        }
+    elif encoder_length_randomization == "all_sets":
+        disable_encoder_length_randomization = {
+            "training_set": False,
+            "validation_set": False,
+            "test_set": False
+        }
+    elif encoder_length_randomization == "none":
+        disable_encoder_length_randomization = {
+            "training_set": True,
+            "validation_set": True,
+            "test_set": True
+        }
+    else:
+        raise ValueError(f"Invalid encoder_length_randomization: {encoder_length_randomization}")
 
     # Build PPGRTimeSeriesDataset for each split
     training_dataset = PPGRTimeSeriesDataset(
@@ -1364,6 +1399,7 @@ def create_cached_dataset(
         min_encoder_length=min_encoder_length,
         max_encoder_length=max_encoder_length,
         prediction_length=prediction_length,
+        disable_encoder_length_randomization=disable_encoder_length_randomization["training_set"],
         use_food_covariates_from_prediction_window=True,
         use_meal_level_food_covariates=use_meal_level_food_covariates,
         use_microbiome_embeddings=use_microbiome_embeddings,
@@ -1393,6 +1429,7 @@ def create_cached_dataset(
         min_encoder_length=min_encoder_length,
         max_encoder_length=max_encoder_length,
         prediction_length=prediction_length,
+        disable_encoder_length_randomization=disable_encoder_length_randomization["validation_set"],
         use_food_covariates_from_prediction_window=True,
         use_meal_level_food_covariates=use_meal_level_food_covariates,
         use_microbiome_embeddings=use_microbiome_embeddings,
@@ -1422,6 +1459,7 @@ def create_cached_dataset(
         min_encoder_length=min_encoder_length,
         max_encoder_length=max_encoder_length,
         prediction_length=prediction_length,
+        disable_encoder_length_randomization=disable_encoder_length_randomization["test_set"],
         use_food_covariates_from_prediction_window=True,
         use_meal_level_food_covariates=use_meal_level_food_covariates,
         use_microbiome_embeddings=use_microbiome_embeddings,
@@ -1639,10 +1677,10 @@ if __name__ == "__main__":
     
     config = ExperimentConfig(
         dataloader_num_workers=7,
-        debug_mode=False,
+        debug_mode=True,
         dataset_version="v0.5",
         use_bootstraped_food_embeddings=True,
-        use_cache = True
+        use_cache = False
     )
 
     (training_dataset, validation_dataset, test_dataset, categorical_encoders, continuous_scalers) = create_cached_dataset(
@@ -1653,6 +1691,7 @@ if __name__ == "__main__":
         min_encoder_length=config.min_encoder_length,
         max_encoder_length=config.max_encoder_length,
         prediction_length=config.prediction_length,
+        encoder_length_randomization=config.encoder_length_randomization,
         is_food_anchored=config.is_food_anchored,
         sliding_window_stride=config.sliding_window_stride,
         use_meal_level_food_covariates=config.use_meal_level_food_covariates,

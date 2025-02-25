@@ -138,14 +138,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
     
     def forward(
         self,
-        past_glucose: torch.Tensor,        # [B, T_glucose]
-        past_meal_ids: torch.Tensor,       # [B, T_pastMeal, M]
-        past_meal_macros: torch.Tensor,    # [B, T_pastMeal, M, food_macro_dim]
-        future_meal_ids: torch.Tensor,     # [B, T_futureMeal, M]
-        future_meal_macros: torch.Tensor,  # [B, T_futureMeal, M, food_macro_dim]
-        target_scales: torch.Tensor,       # [B, 2] for unscale
-        encoder_lengths: torch.Tensor,     # [B]
-        encoder_padding_mask: torch.Tensor, # [B, T_pastMeal]
+        batch: Dict[str, torch.Tensor],
         return_attn: bool = False,
         return_meal_self_attn: bool = False
     ) -> Union[torch.Tensor, Tuple]:
@@ -156,6 +149,19 @@ class MealGlucoseForecastModel(pl.LightningModule):
         or a tuple if return_attn=True with the following elements:
           (pred_future, past_meal_enc, attn_past, future_meal_enc, attn_future, meal_self_attn_past, meal_self_attn_future)
         """        
+        # Unpack batch         
+        past_glucose = batch["past_glucose"]         # [B, T_past]
+        past_meal_ids = batch["past_meal_ids"]       # [B, T_past, M]
+        past_meal_macros = batch["past_meal_macros"] # [B, T_past, M, food_macro_dim]
+        future_meal_ids = batch["future_meal_ids"]   # [B, T_future, M]
+        future_meal_macros = batch["future_meal_macros"] # [B, T_future, M, food_macro_dim]
+        future_glucose = batch["future_glucose"]     # [B, T_future]
+        target_scales = batch["target_scales"]       # [B, 2]
+        encoder_lengths = batch["encoder_lengths"]   # [B]
+        encoder_padding_mask = batch["encoder_padding_mask"] # [B, T_past]
+        
+        
+        
         device = past_glucose.device
         B = past_glucose.size(0)
         
@@ -247,27 +253,25 @@ class MealGlucoseForecastModel(pl.LightningModule):
         Returns:
             Loss tensor
         """
-        # Unpack batch
-        (past_glucose, past_meal_ids, past_meal_macros,
-         future_meal_ids, future_meal_macros, future_glucose, target_scales, encoder_lengths, encoder_padding_mask) = batch
+        # Unpack batch         
+        past_glucose = batch["past_glucose"]         
+        past_meal_ids = batch["past_meal_ids"]
+        past_meal_macros = batch["past_meal_macros"]
+        future_meal_ids = batch["future_meal_ids"]
+        future_meal_macros = batch["future_meal_macros"]
+        future_glucose = batch["future_glucose"]
+        target_scales = batch["target_scales"]
+        encoder_lengths = batch["encoder_lengths"]
+        encoder_padding_mask = batch["encoder_padding_mask"]
          
         # Ensure target_scales has the right shape
         if target_scales.dim() > 2:
             target_scales = target_scales.view(target_scales.size(0), -1)
             
         # Forward pass with attention weights
-        preds = self(
-            past_glucose,
-            past_meal_ids,
-            past_meal_macros,
-            future_meal_ids,
-            future_meal_macros,
-            target_scales,
-            encoder_lengths,
-            encoder_padding_mask,
-            return_attn=True,
-            return_meal_self_attn=True,
-        )
+        preds = self(batch,
+                    return_attn=True,
+                    return_meal_self_attn=True)
         
         # Compute metrics
         metrics = self._compute_forecast_metrics(past_glucose, future_glucose, target_scales, preds)
@@ -386,20 +390,19 @@ class MealGlucoseForecastModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         """Training step."""
-        (past_glucose, past_meal_ids, past_meal_macros,
-         future_meal_ids, future_meal_macros, future_glucose, target_scales, encoder_lengths, encoder_padding_mask) = batch
+        # Unpack batch         
+        past_glucose = batch["past_glucose"]         
+        past_meal_ids = batch["past_meal_ids"]
+        past_meal_macros = batch["past_meal_macros"]
+        future_meal_ids = batch["future_meal_ids"]
+        future_meal_macros = batch["future_meal_macros"]
+        future_glucose = batch["future_glucose"]
+        target_scales = batch["target_scales"]
+        encoder_lengths = batch["encoder_lengths"]
+        encoder_padding_mask = batch["encoder_padding_mask"]        
         
         # Forward pass
-        preds = self(
-            past_glucose,
-            past_meal_ids,
-            past_meal_macros,
-            future_meal_ids,
-            future_meal_macros,
-            target_scales,
-            encoder_lengths,
-            encoder_padding_mask
-        )
+        preds = self(batch)
         
         # Compute metrics
         metrics = self._compute_forecast_metrics(past_glucose, future_glucose, target_scales, preds)
