@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class TransformerEncoderLayerWithAttn(nn.Module):
+class TransformerEncoderLayer(nn.Module):
     """
     A single Transformer encoder layer with self-attention + feed-forward.
     Returns (output, attn_weights) when need_weights=True.
@@ -56,9 +56,9 @@ class TransformerEncoderLayerWithAttn(nn.Module):
         return src, attn_weights
 
 
-class TransformerEncoderWithAttn(nn.Module):
+class TransformerEncoder(nn.Module):
     """
-    Stacks multiple TransformerEncoderLayerWithAttn. 
+    Stacks multiple TransformerEncoderLayer blocks. 
     If need_weights=True, returns the final layer's attn_weights.
     """
     def __init__(self, encoder_layer, num_layers, norm=None):
@@ -85,7 +85,7 @@ class TransformerEncoderWithAttn(nn.Module):
         return output, attn_weights
 
 
-class TransformerDecoderLayerWithAttn(nn.Module):
+class TransformerDecoderLayer(nn.Module):
     """
     A single Transformer decoder layer with self-attention + cross-attention + feed-forward.
     Returns cross-attn weights if return_attn=True.
@@ -162,9 +162,9 @@ class TransformerDecoderLayerWithAttn(nn.Module):
         return x, cross_attn_weights
 
 
-class TransformerDecoderWithAttn(nn.Module):
+class TransformerDecoder(nn.Module):
     """
-    Stacks multiple TransformerDecoderLayerWithAttn.
+    Stacks multiple TransformerDecoderLayer blocks.
     If return_attn=True, returns the final layer's cross-attn weights.
     """
     def __init__(self, decoder_layer, num_layers, norm=None):

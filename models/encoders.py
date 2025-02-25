@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
 
-from .transformer_blocks import TransformerEncoderLayerWithAttn, TransformerEncoderWithAttn
+from .transformer_blocks import TransformerEncoderLayer, TransformerEncoder
 
 
 class MealEncoder(nn.Module):
@@ -65,14 +65,14 @@ class MealEncoder(nn.Module):
 
         # Transformer stack (only for aggregator_type="set")
         if self.aggregator_type == "set":
-            enc_layer = TransformerEncoderLayerWithAttn(
+            enc_layer = TransformerEncoderLayer(
                 d_model=hidden_dim,
                 nhead=num_heads,
                 dim_feedforward=hidden_dim * 2,
                 dropout=transformer_dropout,
                 activation="relu"
             )
-            self.encoder = TransformerEncoderWithAttn(
+            self.encoder = TransformerEncoder(
                 enc_layer,
                 num_layers=num_layers,
                 norm=nn.LayerNorm(hidden_dim)

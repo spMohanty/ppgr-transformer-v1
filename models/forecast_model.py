@@ -17,7 +17,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 
 from .encoders import MealEncoder, PatchedGlucoseEncoder
-from .transformer_blocks import TransformerDecoderLayerWithAttn, TransformerDecoderWithAttn
+from .transformer_blocks import TransformerDecoderLayer, TransformerDecoder
 from config import ExperimentConfig
 from plot_helpers import plot_meal_self_attention, plot_forecast_examples, plot_iAUC_scatter
 from dataset import PPGRToMealGlucoseWrapper
@@ -123,14 +123,14 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
     def _init_decoder(self, config: ExperimentConfig) -> None:
         """Initialize the transformer decoder component."""
-        dec_layer = TransformerDecoderLayerWithAttn(
+        dec_layer = TransformerDecoderLayer(
             d_model=config.hidden_dim,
             nhead=config.num_heads,
             dim_feedforward=config.hidden_dim * 2,
             dropout=config.transformer_dropout,
             activation="relu"
         )
-        self.decoder = TransformerDecoderWithAttn(
+        self.decoder = TransformerDecoder(
             dec_layer,
             num_layers=config.transformer_decoder_layers,
             norm=nn.LayerNorm(config.hidden_dim)
