@@ -250,16 +250,20 @@ class MealGlucoseForecastModel(pl.LightningModule):
             attn_past = cross_attn[:, :, :past_len]  # => [B, T_future, past_len]
             attn_future = cross_attn[:, :, past_len : past_len + future_len]
 
-        # 8) Final projection to get quantile predictions
-        pred_future = self.forecast_linear(decoder_output)
 
-        # Add residual connection if configured
-        if self.add_residual_connection_before_predictions:
-            last_val = past_glucose[:, -1].unsqueeze(1).unsqueeze(-1)
-            pred_future = pred_future + last_val
+        # Force full precision for the residual connection
+        with torch.cuda.amp.autocast(enabled=False):
 
-        # Unscale predictions back to original range
-        pred_future = unscale_tensor(pred_future, target_scales)
+            # 8) Final projection to get quantile predictions
+            pred_future = self.forecast_linear(decoder_output)
+
+            # Add residual connection if configured
+            if self.add_residual_connection_before_predictions:
+                last_val = past_glucose[:, -1].unsqueeze(1).unsqueeze(-1)
+                pred_future = pred_future + last_val
+
+            # Unscale predictions back to original range
+            pred_future = unscale_tensor(pred_future, target_scales)
 
         # Return appropriate outputs based on return_attn flag
         if return_attn:
@@ -382,12 +386,17 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Plot iAUC scatter and calculate correlation
         all_pred_iAUC = torch.cat([output[f"{phase}_pred_iAUC_{self.eval_window}"] for output in outputs], dim=0)
         all_true_iAUC = torch.cat([output[f"{phase}_true_iAUC_{self.eval_window}"] for output in outputs], dim=0)
-        fig_scatter, corr = plot_iAUC_scatter(all_pred_iAUC, all_true_iAUC)
-        self.logger.experiment.log({
-            f"{phase}_iAUC_eh{self.eval_window}_scatter": wandb.Image(fig_scatter),
-            f"{phase}_iAUC_eh{self.eval_window}_correlation": corr.item(),
-        })
-        plt.close(fig_scatter)
+        fig_scatter, corr = plot_iAUC_scatter(all_pred_iAUC, all_true_iAUC, self.config.disable_plots)
+        if fig_scatter is not None:
+            self.logger.experiment.log({
+                f"{phase}_iAUC_eh{self.eval_window}_scatter": wandb.Image(fig_scatter),
+                f"{phase}_iAUC_eh{self.eval_window}_correlation": corr.item(),
+            })
+            plt.close(fig_scatter)
+        else:
+            self.logger.experiment.log({
+                f"{phase}_iAUC_eh{self.eval_window}_correlation": corr.item()
+            })
         
         # Clear outputs for the next epoch
         setattr(self, f"{phase}_outputs", [])

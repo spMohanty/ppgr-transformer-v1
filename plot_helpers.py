@@ -175,16 +175,21 @@ def plot_forecast_examples(
     return fixed_indices, fig
 
 
-def plot_iAUC_scatter(all_pred_iAUC, all_true_iAUC):
+def plot_iAUC_scatter(all_pred_iAUC, all_true_iAUC, disable_plots=False):
     """
     Plot a scatter of predicted iAUC vs. true iAUC, plus compute their correlation.
     """
+
     mean_pred = torch.mean(all_pred_iAUC)
     mean_true = torch.mean(all_true_iAUC)
     cov = torch.mean((all_true_iAUC - mean_true) * (all_pred_iAUC - mean_pred))
     std_true = torch.std(all_true_iAUC, unbiased=False)
     std_pred = torch.std(all_pred_iAUC, unbiased=False)
     corr = cov / (std_true * std_pred + 1e-9)  # small epsilon for safety
+
+    if disable_plots:
+        fig = None
+        return fig, corr
 
     fig_scatter, ax_scatter = plt.subplots(figsize=(6, 6))
     ax_scatter.scatter(

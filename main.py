@@ -126,12 +126,13 @@ def get_trainer(config: ExperimentConfig, callbacks):
     
     # Determine precision
     precision_value = int(config.precision) if config.precision == "32" else "bf16"
+    enable_checkpointing = not config.disable_checkpoints
     
     # Create trainer
     trainer = pl.Trainer(
         profiler="simple",
         max_epochs=config.max_epochs,
-        enable_checkpointing=True,
+        enable_checkpointing=False,
         logger=wandb_logger,
         callbacks=callbacks,
         precision=precision_value,
@@ -160,20 +161,6 @@ def prepare_callbacks(config: ExperimentConfig, model: MealGlucoseForecastModel,
     rich_model_summary = RichModelSummary(max_depth=2)
     rich_progress_bar = RichProgressBar()
     
-    # Create checkpoint directory if it doesn't exist
-    checkpoint_dir = os.path.join(config.checkpoint_base_dir, config.wandb_run_name)
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    # Checkpoint callback
-    checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        dirpath=checkpoint_dir,
-        monitor=config.checkpoint_monitor,
-        mode=config.checkpoint_mode,
-        save_top_k=config.checkpoint_top_k,
-        filename="best-{epoch}-{val_q_loss:.2f}",
-        save_last=True
-    )    
-    
     # Learning rate scheduler callback
     lr_scheduler = LRSchedulerCallback(
         optimizer=optimizer,
@@ -182,7 +169,26 @@ def prepare_callbacks(config: ExperimentConfig, model: MealGlucoseForecastModel,
         pct_start=config.optimizer_lr_scheduler_pct_start,
     )
     
-    return [rich_model_summary, rich_progress_bar, lr_scheduler, checkpoint_callback]
+    callbacks = [rich_model_summary, rich_progress_bar, lr_scheduler]    
+
+    if not config.disable_checkpoints:    
+        # Create checkpoint directory if it doesn't exist
+        checkpoint_dir = os.path.join(config.checkpoint_base_dir, config.wandb_run_name)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        # Checkpoint callback
+        checkpoint_callback = pl.callbacks.ModelCheckpoint(
+            dirpath=checkpoint_dir,
+            monitor=config.checkpoint_monitor,
+            mode=config.checkpoint_mode,
+            save_top_k=config.checkpoint_top_k,
+            filename="best-{epoch}-{val_q_loss:.2f}",
+            save_last=True
+        )
+    
+        callbacks.append(checkpoint_callback)
+    
+    return callbacks
 
 
 @click.command()
@@ -212,32 +218,33 @@ def main(**kwargs):
     # Create data loaders
     train_loader, val_loader, test_loader, training_dataset = get_dataloaders(config)
     logger.info(f"Dataset loaded: {len(training_dataset)} training, {len(val_loader.dataset)} validation, {len(test_loader.dataset)} test samples")
-    
+        
     # Create model
     model = MealGlucoseForecastModel.from_dataset(training_dataset, config)
-    logger.info(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
+    logger.info(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")    
     
     # Setup callbacks and trainer
     callbacks = prepare_callbacks(config, model, train_loader)
     trainer = get_trainer(config, callbacks)
-    
+        
     # Training
     logger.info("Starting training")
     trainer.fit(model, train_loader, val_loader)
     logger.info("Training complete")
     
+    if not config.disable_checkpoints:
     # Load best model for evaluation
-    best_model_path = trainer.checkpoint_callback.best_model_path
-    if best_model_path:
-        logger.info(f"Loading best model from: {best_model_path}")
-        model = MealGlucoseForecastModel.load_from_checkpoint(
-            best_model_path,
-            config=config,
-            num_foods=training_dataset.num_foods,
-            food_macro_dim=training_dataset.num_nutrients,
-            food_names=training_dataset.food_names,
-            food_group_names=training_dataset.food_group_names,
-        )
+        best_model_path = trainer.checkpoint_callback.best_model_path
+        if best_model_path:
+            logger.info(f"Loading best model from: {best_model_path}")
+            model = MealGlucoseForecastModel.load_from_checkpoint(
+                best_model_path,
+                config=config,
+                num_foods=training_dataset.num_foods,
+                food_macro_dim=training_dataset.num_nutrients,
+                food_names=training_dataset.food_names,
+                food_group_names=training_dataset.food_group_names,
+            )
     
     # Testing
     logger.info("Starting testing")

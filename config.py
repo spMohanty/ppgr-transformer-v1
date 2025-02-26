@@ -11,8 +11,8 @@ class ExperimentConfig:
     cache_dir: str = "/scratch/mohanty/food/ppgr-v1/datasets-cache"
     use_cache: bool = True
     debug_mode: bool = False
-    dataloader_num_workers: int = 4
-    dataloader_prefetch_factor: int = 8
+    dataloader_num_workers: int = 8
+    dataloader_prefetch_factor: int = 50
 
     # Data splitting & sequence parameters
     min_encoder_length: int = 8 * 4    # e.g., 8hrs * 4
@@ -77,6 +77,7 @@ class ExperimentConfig:
 
 
     # Checkpoint Settings
+    disable_checkpoints: bool = True
     checkpoint_base_dir: str = "/scratch/mohanty/checkpoints/ppgr-meal-representation"  # Directory to save checkpoints
     checkpoint_monitor: str = "val_q_loss"  # Metric to monitor
     checkpoint_mode: str = "min"  # "min" or "max"
