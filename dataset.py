@@ -340,6 +340,10 @@ class PPGRTimeSeriesDataset(Dataset):
         
         ### 3. Handle the scaling of the dishes_df if required
         if self.use_meal_level_food_covariates:
+            # Sort dishes_df by food_eaten_quantity_in_gram
+            # this sort ensures that when we are discarding meals > max_meals_per_timestep,
+            # we discard the meals with the least quantity first
+            self.dishes_df = self.dishes_df.sort_values(by="food__eaten_quantity_in_gram", ascending=False)
             self.dishes_df_scaled = self.dishes_df.copy()
             
             assert len(self.food_categoricals) > 0, "Food categoricals should not be empty when using meal level food covariates. We should atleast have food_id column"
@@ -665,7 +669,7 @@ class PPGRTimeSeriesDataset(Dataset):
             else:
                 # If dishes exist, concatenate start token with dish tensors
                 dish_tensors_for_this_row = self.dishes_df_scaled_tensor[dish_idxs_for_this_row]
-                                
+                                                
                 # Only use up to max_dishes_per_row 
                 cat_tensor = torch.cat([
                     dish_tensors_for_this_row[:max_meals_per_timestep, self.food_categorical_col_idx]
@@ -674,7 +678,7 @@ class PPGRTimeSeriesDataset(Dataset):
                     dish_tensors_for_this_row[:max_meals_per_timestep, self.food_real_col_idx]
                 ], dim=0)
                                 
-                dish_tensors_recorded.append( len(dish_idxs_for_this_row)) # +1 for the start token                
+                dish_tensors_recorded.append(len(dish_idxs_for_this_row))         
                 dish_tensors_cat_for_this_slice.append(cat_tensor)
                 dish_tensors_real_for_this_slice.append(real_tensor)
 
@@ -1719,10 +1723,12 @@ if __name__ == "__main__":
         collate_fn=meal_glucose_collate_fn
     )    
     
-    for _ in tqdm(train_loader):
-        pass
+    # for _ in tqdm(train_loader):
+    #     pass
     
-    # batch = meal_glucose_collate_fn([training_dataset[0], training_dataset[1], training_dataset[2]])
+    batch = meal_glucose_collate_fn([
+        training_dataset[x] for x in range(512)
+    ])
     
     # breakpoint()
     

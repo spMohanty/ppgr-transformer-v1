@@ -54,9 +54,9 @@ class ExperimentConfig:
     hidden_dim: int = 256
     num_heads: int = 4
     transformer_encoder_layers: int = 2
-    transformer_encoder_layers_share_weights: bool = False
+    transformer_encoder_layers_share_weights: bool = True
     transformer_decoder_layers: int = 2
-    transformer_decoder_layers_share_weights: bool = False
+    transformer_decoder_layers_share_weights: bool = True
     add_residual_connection_before_predictions: bool = False
     num_quantiles: int = 7
     loss_iauc_weight: float = 0.00
