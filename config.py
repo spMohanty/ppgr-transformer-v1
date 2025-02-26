@@ -50,11 +50,13 @@ class ExperimentConfig:
 
     # Model hyperparameters
     max_meals: int = 11  # Maximum number of meals to consider
-    food_embed_dim: int = 2048 # the number of dimensions from the pre-trained embeddings to use
+    food_embed_dim: int = 512 # the number of dimensions from the pre-trained embeddings to use
     hidden_dim: int = 256
     num_heads: int = 4
     transformer_encoder_layers: int = 2
+    transformer_encoder_layers_share_weights: bool = False
     transformer_decoder_layers: int = 2
+    transformer_decoder_layers_share_weights: bool = False
     add_residual_connection_before_predictions: bool = False
     num_quantiles: int = 7
     loss_iauc_weight: float = 0.00

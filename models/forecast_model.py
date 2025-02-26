@@ -118,6 +118,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             max_meals=config.max_meals,
             num_heads=config.num_heads,
             num_layers=config.transformer_encoder_layers,
+            layers_share_weights=config.transformer_encoder_layers_share_weights,
             dropout_rate=config.dropout_rate,
             transformer_dropout=config.transformer_dropout,
             ignore_food_macro_features=config.ignore_food_macro_features,
@@ -134,6 +135,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             patch_stride=config.patch_stride,
             num_heads=config.num_heads,
             num_layers=config.transformer_encoder_layers,
+            layers_share_weights=config.transformer_encoder_layers_share_weights,
             max_seq_len=config.min_encoder_length,
             dropout_rate=config.dropout_rate
         )
@@ -150,6 +152,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.decoder = TransformerDecoder(
             dec_layer,
             num_layers=config.transformer_decoder_layers,
+            layers_share_weights=config.transformer_decoder_layers_share_weights,
             norm=nn.LayerNorm(config.hidden_dim)
         )
     
@@ -183,7 +186,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         B = past_glucose.size(0)
         
         # 1) Encode glucose sequence => shape [B, G_patches, hidden_dim]
-        glucose_enc, patch_indices = self.glucose_encoder(past_glucose, mask=encoder_padding_mask)
+        glucose_enc, glucose_attn_weights, patch_indices = self.glucose_encoder(past_glucose, mask=encoder_padding_mask, return_self_attn=False)
+        # We dont need the self attention of glucose encoder
                 
         # 2) Encode past & future meals
         past_meal_enc, meal_self_attn_past = self.meal_encoder(
@@ -210,7 +214,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         past_indices = past_indices - centered_offset
         patch_indices = patch_indices - centered_offset
         future_indices = future_indices - centered_offset  # Future will start at index 1
-        
+                
         # 3) Add positional time embeddings
         # TimeEmbedding class handles the offset internally
         glucose_enc = glucose_enc + self.time_emb(patch_indices)

@@ -26,6 +26,7 @@ class MealEncoder(nn.Module):
         max_meals: int = 11,
         num_heads: int = 4,
         num_layers: int = 1,
+        layers_share_weights: bool = False,
         dropout_rate: float = 0.2,
         transformer_dropout: float = 0.1,
         aggregator_type: str = "set",  # Either "set" or "sum"
@@ -75,7 +76,8 @@ class MealEncoder(nn.Module):
             self.encoder = TransformerEncoder(
                 enc_layer,
                 num_layers=num_layers,
-                norm=nn.LayerNorm(hidden_dim)
+                norm=nn.LayerNorm(hidden_dim),
+                layers_share_weights=layers_share_weights
             )
         else:
             self.encoder = None  # No Transformer for aggregator_type="sum"
@@ -214,6 +216,7 @@ class PatchedGlucoseEncoder(nn.Module):
         patch_stride: int, 
         num_heads: int = 4, 
         num_layers: int = 1, 
+        layers_share_weights: bool = False,
         max_seq_len: int = 100, 
         dropout_rate: float = 0.2
     ):
@@ -226,22 +229,24 @@ class PatchedGlucoseEncoder(nn.Module):
         self.patch_proj = nn.Linear(patch_size, embed_dim)
 
         # Encoder Layer
-        encoder_layer = nn.TransformerEncoderLayer(
+        encoder_layer = TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
             dim_feedforward=embed_dim * 2,
             dropout=dropout_rate,
-            batch_first=True,
+            activation="relu"
         )
         # Encoder
-        self.transformer = nn.TransformerEncoder(
+        self.transformer = TransformerEncoder(
             encoder_layer,
-            num_layers=num_layers
+            num_layers=num_layers,
+            norm=nn.LayerNorm(embed_dim),
+            layers_share_weights=layers_share_weights
         )
         # Dropout
         self.dropout = nn.Dropout(dropout_rate)
 
-    def forward(self, glucose_seq: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, glucose_seq: torch.Tensor, mask: Optional[torch.Tensor] = None, return_self_attn: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             glucose_seq: (B, T) time series of glucose values
@@ -303,10 +308,11 @@ class PatchedGlucoseEncoder(nn.Module):
         
         # Pass only the causal mask - it will be broadcast to all batches automatically
         # This is key: mask parameter expects shape [seq_len, seq_len] not [batch, seq_len, seq_len]
-        patch_emb = self.transformer(
+        patch_emb, attn_weights = self.transformer(
             patch_emb,
             mask=causal_mask,
-            src_key_padding_mask=key_padding_mask.float()
+            src_key_padding_mask=key_padding_mask.float(),
+            need_weights=return_self_attn
         )
         
-        return patch_emb, patch_indices
+        return patch_emb, attn_weights, patch_indices
