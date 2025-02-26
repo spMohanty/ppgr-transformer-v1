@@ -76,6 +76,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self._init_meal_encoder(config)
         self._init_glucose_encoder(config)
         self._init_decoder(config)
+        self._init_positional_embeddings(config)
+        
         
         # Future time query embeddings for each forecast horizon step
         self.future_time_queries = nn.Embedding(config.prediction_length + 1, config.hidden_dim)
@@ -87,9 +89,6 @@ class MealGlucoseForecastModel(pl.LightningModule):
 
         # Register the quantiles as a buffer
         self.register_buffer("quantiles", torch.linspace(0.05, 0.95, steps=config.num_quantiles))
-        
-        # Global time-based positional embedding
-        self._init_positional_embeddings(config)
         
         # Initialize tracking variables for plotting
         self.example_forecasts = None
@@ -197,8 +196,6 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Get sequence lengths
         T_past = past_meal_enc.size(1)
         T_future = future_meal_enc.size(1)
-
-
         max_encoder_length = self.config.max_encoder_length
 
         # 3) Add positional time embeddings
