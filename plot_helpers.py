@@ -28,10 +28,10 @@ def plot_forecast_examples(
             "past_meal_ids":   shape (B, T_pastMeal, M)
         attn_weights_past (torch.Tensor or None):
             shape (B, T_context, T_meals) or similar
-            If None, the “past” attention heatmap is skipped.
+            If None, the "past" attention heatmap is skipped.
         attn_weights_future (torch.Tensor or None):
             shape (B, T_context, T_meals) or similar
-            If None, the “future” attention heatmap is skipped.
+            If None, the "future" attention heatmap is skipped.
         quantiles (torch.Tensor or np.array): The list of quantiles used,
             e.g. [0.05, 0.1, ..., 0.95].
         logger: A logger object that supports logger.experiment.log().
@@ -190,7 +190,7 @@ def plot_iAUC_scatter(all_pred_iAUC, all_true_iAUC):
     ax_scatter.scatter(
         all_true_iAUC.cpu().numpy(),
         all_pred_iAUC.cpu().numpy(),
-        alpha=0.5, s=5
+        alpha=0.5, s=4
     )
     ax_scatter.set_xlabel("True iAUC")
     ax_scatter.set_ylabel("Predicted iAUC")
@@ -215,41 +215,50 @@ def plot_meal_self_attention(
     logger,
     global_step: int,
     fixed_indices: list = None,
-    max_examples: int = 3,
+    max_examples: int = 1,  # Default to 1 since grid is already large
     random_samples: bool = True
 ):
     """
-    Visualize the meal self-attention for 'past' meals vs 'future' meals.
-    We stack sub-blocks (one per meal-timestep) into big 2D arrays so that
-    we see how each meal token attends to others.
-
+    Visualize the meal self-attention across all timesteps in a single large grid.
+    
+    The grid is organized as:
+    - 22 rows (11 for past foods, 11 for future foods)
+    - 11 * (T_past + T_future) columns, with each timestep getting an 11×11 block
+    - Past meals shown in top half, future meals in bottom half
+    
     Args:
-        attn_weights_past (torch.Tensor): shape [B, T, M, M]
-            The self-attention for past meals. If None or empty, we skip.
-        meal_ids_past (torch.Tensor): shape [B, T, M]
-        attn_weights_future (torch.Tensor): shape [B, T, M, M]
-            The self-attention for future meals. If None or empty, we skip.
-        meal_ids_future (torch.Tensor): shape [B, T, M]
-        logger: A logger for WandB
-        global_step (int): for logging
-        fixed_indices (list[int], optional): which samples in the batch to plot
-        max_examples (int): how many samples to show
-        random_samples (bool): if True, sample from the batch if no fixed_indices.
-
+        attn_weights_past: Shape [B, T, M, M] - Attention weights for past meals
+        meal_ids_past: Shape [B, T, M] - Meal IDs for past meals
+        attn_weights_future: Shape [B, T, M, M] - Attention weights for future meals
+        meal_ids_future: Shape [B, T, M] - Meal IDs for future meals
+        logger: Logger for W&B
+        global_step: Current training step
+        fixed_indices: Specific batch indices to plot (default: None)
+        max_examples: Maximum number of examples to plot (default: 1)
+        random_samples: Whether to randomly sample examples (default: True)
+        
     Returns:
-        fig (matplotlib.figure.Figure): the created figure
+        matplotlib.figure.Figure: The created figure
     """
-    # Decide which batch indices we'll plot
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import random
+    import wandb
+    import torch
+    
+    # Determine batch size and select sample indices
     if attn_weights_past is not None:
         batch_size = attn_weights_past.size(0)
     elif attn_weights_future is not None:
         batch_size = attn_weights_future.size(0)
     else:
         # Nothing to plot
-        fig = plt.figure()
-        plt.title("No Past or Future Self-Attention Provided.")
-        logger.experiment.log({"meal_self_attention_samples": wandb.Image(fig),
-                               "global_step": global_step})
+        fig = plt.figure(figsize=(8, 6))
+        plt.text(0.5, 0.5, "No meal attention data available", 
+                ha='center', va='center', fontsize=14)
+        plt.axis('off')
+        logger.experiment.log({"meal_self_attention_grid": wandb.Image(fig),
+                              "global_step": global_step})
         plt.close(fig)
         return fig
 
@@ -259,133 +268,174 @@ def plot_meal_self_attention(
         indices = random.sample(range(batch_size), k=min(max_examples, batch_size))
     else:
         indices = list(range(min(max_examples, batch_size)))
-
-    # We'll have 2 columns: [Past Self-Attn, Future Self-Attn]
-    # If either one is None, we skip that column.
-    n_cols = 0
-    if attn_weights_past is not None:
-        n_cols += 1
-    if attn_weights_future is not None:
-        n_cols += 1
-
-    if n_cols == 0:
-        fig = plt.figure()
-        plt.title("No Past or Future Self-Attention Provided.")
-        logger.experiment.log({"meal_self_attention_samples": wandb.Image(fig),
-                               "global_step": global_step})
-        plt.close(fig)
-        return fig
-
-    fig, axes = plt.subplots(
-        nrows=len(indices),
-        ncols=n_cols,
-        figsize=(7*n_cols, 4.5 * len(indices)),
-        constrained_layout=True
-    )
-    if len(indices) == 1 and n_cols == 1:
-        axes = [[axes]]
-    elif len(indices) == 1:
-        axes = [axes]
-    elif n_cols == 1:
-        # Then axes has shape (rows, ), turn it into (rows,1)
-        axes = axes[:, None]
-
-    # Reusable function to pack sub-blocks from a single sample
-    def pack_valid_attn_subblocks(attn_4d, meal_ids_3d):
-        """
-        Convert [B, T, M, M] attention into a big 2D array by stacking only
-        the valid sub-blocks (where meal_ids != 0).
-        We'll remove the first row/col if it's a "start token".
-        Returns: (big_array, boundary_rows), or (None, None) if no valid blocks.
-        """
-        # If None, return None
-        if attn_4d is None:
-            return None, None
-
-        attn_4d = attn_4d[:, :, 1:, 1:]   # remove start token dimension
-        meal_ids_3d = meal_ids_3d[:, :, 1:]
-        # We only handle one sample => drop B dimension
-        attn_4d = attn_4d[0]    # shape (T, M-1, M-1)
-        meal_ids_3d = meal_ids_3d[0]  # shape (T, M-1)
-
-        subblocks = []
-        sizes = []
-        T_meal = attn_4d.shape[0]
-        for t in range(T_meal):
-            meal_ids_slice = meal_ids_3d[t]
-            valid_count = (meal_ids_slice != 0).sum().item()
-            if valid_count > 0:
-                block = attn_4d[t, :valid_count, :valid_count]
-                subblocks.append(block.cpu().numpy())
-                sizes.append(valid_count)
-        if not subblocks:
-            return None, None
-
-        total_height = sum(sizes)
-        max_width = max(sizes)
-        big_array = np.full((total_height, max_width), np.nan, dtype=np.float32)
-        boundaries = []
-        row_offset = 0
-        for sb, sz in zip(subblocks, sizes):
-            big_array[row_offset:row_offset+sz, 0:sz] = sb
-            row_offset += sz
-            boundaries.append(row_offset)
-        return big_array, boundaries
-
-    cmap = plt.cm.viridis
-    norm = plt.Normalize(vmin=0, vmax=1)
-
-    for row_i, idx in enumerate(indices):
-        col_i = 0
-        if attn_weights_past is not None:
-            # Past column
-            ax_past = axes[row_i][col_i]
-            col_i += 1
-
-            attn_past_1 = attn_weights_past[idx:idx+1]   # shape [1, T, M, M]
-            meals_past_1 = meal_ids_past[idx:idx+1]      # shape [1, T, M]
-
-            packed_past, boundaries_past = pack_valid_attn_subblocks(attn_past_1, meals_past_1)
-            if packed_past is None:
-                # no valid meal tokens
-                ax_past.text(0.5, 0.5, "No valid Past Meals", ha="center", va="center")
-            else:
-                im_past = ax_past.imshow(packed_past, aspect="auto", cmap=cmap, norm=norm)
-                ax_past.set_title(f"Sample {idx} - Past Self-Attention")
-                ax_past.set_xlabel("Token Position")
-                ax_past.set_ylabel("Stacked Timesteps")
-                if boundaries_past:
-                    for b in boundaries_past[:-1]:
-                        ax_past.axhline(y=b-0.5, color="white", linestyle="--", linewidth=0.8, alpha=0.6)
-            
-        if attn_weights_future is not None:
-            # Future column
-            ax_fut = axes[row_i][col_i]
-            col_i += 1
-
-            attn_fut_1 = attn_weights_future[idx:idx+1]  # shape [1, T, M, M]
-            meals_fut_1 = meal_ids_future[idx:idx+1]     # shape [1, T, M]
-
-            packed_fut, boundaries_future = pack_valid_attn_subblocks(attn_fut_1, meals_fut_1)
-            if packed_fut is None:
-                # no valid future meals
-                ax_fut.text(0.5, 0.5, "No valid Future Meals", ha="center", va="center")
-            else:
-                im_fut = ax_fut.imshow(packed_fut, aspect="auto", cmap=cmap, norm=norm)
-                ax_fut.set_title(f"Sample {idx} - Future Self-Attention")
-                ax_fut.set_xlabel("Token Position")
-                ax_fut.set_ylabel("Stacked Timesteps")
-                if boundaries_future:
-                    for b in boundaries_future[:-1]:
-                        ax_fut.axhline(y=b-0.5, color="white", linestyle="--", linewidth=0.8, alpha=0.6)
-
-    fig.suptitle("Meal Self-Attention for Selected Samples", fontsize=14, fontweight='bold')
-    # We'll just add one colorbar for the entire figure (on the last axes we used).
-    # If you want separate colorbars for each subplot, you can do so, but that can get busy.
-    # Here, we'll do a single cbar spanning all:
-    fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=axes, fraction=0.02, pad=0.02, aspect=30)
     
-    # Log to W&B
-    logger.experiment.log({"meal_self_attention_samples": wandb.Image(fig), "global_step": global_step})
-    plt.close(fig)
-    return fig
+    # Process each sample
+    for batch_idx in indices:
+        # Figure out the total number of timesteps we have
+        T_past = attn_weights_past.shape[1] if attn_weights_past is not None else 0
+        T_future = attn_weights_future.shape[1] if attn_weights_future is not None else 0
+        
+        # Create a large empty grid to hold all timesteps
+        # Shape: [22, 11 * (T_past + T_future)]
+        # Top 11 rows for past meals, bottom 11 rows for future meals
+        MAX_TOKENS = 11  # Maximum number of food tokens per meal
+        grid_height = 2 * MAX_TOKENS
+        grid_width = MAX_TOKENS * (T_past + T_future)
+        
+        # Initialize with NaN to distinguish from zero attention
+        attention_grid = np.full((grid_height, grid_width), np.nan)
+        
+        # Create a mask to track valid meal positions (for better visualization)
+        valid_mask = np.zeros((grid_height, grid_width), dtype=bool)
+        
+        # Helper function to insert an attention matrix into the grid
+        def insert_attention_matrix(grid, mask, attn_matrix, row_start, col_start, max_size=MAX_TOKENS):
+            actual_size = min(attn_matrix.shape[0], max_size)
+            
+            # Insert the attention matrix (or a subset if it's larger than max_size)
+            grid[row_start:row_start+actual_size, col_start:col_start+actual_size] = \
+                attn_matrix[:actual_size, :actual_size]
+            
+            # Update the mask
+            mask[row_start:row_start+actual_size, col_start:col_start+actual_size] = True
+        
+        # Fill in past meals attention
+        if attn_weights_past is not None:
+            for t in range(T_past):
+                # Skip if this timestep has no valid meals
+                if meal_ids_past is None or not (meal_ids_past[batch_idx, t] != 0).any():
+                    continue
+                
+                # Get the number of valid tokens
+                n_tokens = (meal_ids_past[batch_idx, t] != 0).sum().item()
+                if n_tokens == 0:
+                    continue
+                
+                # Extract attention matrix for this timestep
+                attn = attn_weights_past[batch_idx, t]
+                
+                # Handle case with start token (if shape is larger than valid tokens)
+                if attn.shape[0] > n_tokens:
+                    attn = attn[1:n_tokens+1, 1:n_tokens+1]  # Remove start token
+                else:
+                    attn = attn[:n_tokens, :n_tokens]
+                
+                # Place in the top half of the grid
+                col_start = t * MAX_TOKENS
+                insert_attention_matrix(attention_grid, valid_mask, attn.cpu().numpy(), 0, col_start)
+        
+        # Fill in future meals attention
+        if attn_weights_future is not None:
+            for t in range(T_future):
+                # Skip if this timestep has no valid meals
+                if meal_ids_future is None or not (meal_ids_future[batch_idx, t] != 0).any():
+                    continue
+                
+                # Get the number of valid tokens
+                n_tokens = (meal_ids_future[batch_idx, t] != 0).sum().item()
+                if n_tokens == 0:
+                    continue
+                
+                # Extract attention matrix for this timestep
+                attn = attn_weights_future[batch_idx, t]
+                
+                # Handle case with start token (if shape is larger than valid tokens)
+                if attn.shape[0] > n_tokens:
+                    attn = attn[1:n_tokens+1, 1:n_tokens+1]  # Remove start token
+                else:
+                    attn = attn[:n_tokens, :n_tokens]
+                
+                # Place in the bottom half of the grid
+                col_start = (T_past + t) * MAX_TOKENS
+                insert_attention_matrix(attention_grid, valid_mask, attn.cpu().numpy(), MAX_TOKENS, col_start)
+        
+        # Create the figure - set size based on grid dimensions
+        # Scaling factors for better visibility
+        w_scale = max(0.2, min(1.0, 20 / grid_width))
+        h_scale = max(0.4, min(1.0, 10 / grid_height))
+        
+        fig = plt.figure(figsize=(grid_width * w_scale, grid_height * h_scale))
+        fig.suptitle(f"Sample {batch_idx} - Meal Self-Attention Grid", fontsize=14)
+        
+        # Create a custom colormap that masks NaN values
+        cmap = plt.cm.viridis.copy()
+        cmap.set_bad('lightgray')  # NaN values will be light gray
+        
+        # Plot the grid
+        ax = plt.gca()
+        im = ax.imshow(attention_grid, cmap=cmap, vmin=0, vmax=1)
+        
+        # Add a horizontal line separating past and future meals
+        ax.axhline(y=MAX_TOKENS-0.5, color='red', linestyle='-', linewidth=2)
+        
+        # Add timestep labels
+        # Top x-axis for past meal timesteps
+        past_timesteps = []
+        future_timesteps = []
+        
+        if attn_weights_past is not None:
+            for t in range(T_past):
+                if meal_ids_past is not None and (meal_ids_past[batch_idx, t] != 0).any():
+                    past_timesteps.append(t)
+        
+        if attn_weights_future is not None:
+            for t in range(T_future):
+                if meal_ids_future is not None and (meal_ids_future[batch_idx, t] != 0).any():
+                    future_timesteps.append(t)
+        
+        # Add vertical lines separating timesteps
+        for t in range(1, T_past + T_future):
+            ax.axvline(x=t*MAX_TOKENS-0.5, color='white', linestyle='--', linewidth=0.5, alpha=0.7)
+        
+        # Add timestep labels at the top of each 11x11 block
+        for t in past_timesteps:
+            col_center = t * MAX_TOKENS + MAX_TOKENS // 2
+            ax.text(col_center, -0.5, f"P{t}", ha='center', va='bottom', fontsize=10, 
+                   bbox=dict(facecolor='white', alpha=0.7))
+        
+        for t in future_timesteps:
+            col_center = (T_past + t) * MAX_TOKENS + MAX_TOKENS // 2
+            ax.text(col_center, -0.5, f"F{t}", ha='center', va='bottom', fontsize=10,
+                   bbox=dict(facecolor='white', alpha=0.7))
+        
+        # Add labels for sections
+        ax.text(-1, MAX_TOKENS//2, "Past\nMeals", ha='right', va='center', fontsize=12, fontweight='bold')
+        ax.text(-1, MAX_TOKENS + MAX_TOKENS//2, "Future\nMeals", ha='right', va='center', fontsize=12, fontweight='bold')
+        
+        # Clean up ticks - only show token indices
+        token_positions = np.arange(MAX_TOKENS)
+        
+        # Y-ticks for both past and future sections
+        ax.set_yticks(np.concatenate([token_positions, token_positions + MAX_TOKENS]))
+        ax.set_yticklabels(np.concatenate([token_positions + 1, token_positions + 1]))
+        
+        # X-ticks would be too crowded - skip them
+        ax.set_xticks([])
+        
+        # Add a colorbar
+        cbar = plt.colorbar(im, ax=ax, fraction=0.02, pad=0.04)
+        cbar.set_label('Attention Strength')
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.95])  # Make room for the title
+        
+        # Log to W&B
+        logger.experiment.log({
+            f"meal_self_attention_grid_{batch_idx}": wandb.Image(fig),
+            "global_step": global_step
+        })
+        plt.close(fig)
+    
+    # Create a summary figure
+    summary_fig = plt.figure(figsize=(8, 6))
+    ax = summary_fig.add_subplot(111)
+    ax.text(0.5, 0.5, f"Generated attention grids for {len(indices)} samples\nSee individual plots for details", 
+           ha='center', va='center', fontsize=14)
+    ax.axis('off')
+    
+    logger.experiment.log({
+        "meal_self_attention_grid_summary": wandb.Image(summary_fig),
+        "global_step": global_step
+    })
+    plt.close(summary_fig)
+    
+    return summary_fig
