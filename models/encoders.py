@@ -164,6 +164,11 @@ class MealEncoder(nn.Module):
         filtered_meal_token_emb = meal_token_emb[non_empty_indices]  # (N_non_empty, M, hidden_dim)
         filtered_meal_ids = meal_ids_flat[non_empty_indices]  # (N_non_empty, M)
         
+        # Create simple average representation for residual connection
+        # Mask out padding tokens (where meal_id is 0)
+        item_mask = (filtered_meal_ids != 0).float().unsqueeze(-1)  # (N_non_empty, M, 1)
+        avg_meal_emb = (filtered_meal_token_emb * item_mask).sum(dim=1) / (item_mask.sum(dim=1) + 1e-10)  # (N_non_empty, hidden_dim)
+        
         # Insert aggregator token at position 0
         N_non_empty = filtered_meal_token_emb.size(0)
         start_token_expanded = self.start_token.expand(N_non_empty, -1, -1)  # => (N_non_empty, 1, hidden_dim)
@@ -197,7 +202,10 @@ class MealEncoder(nn.Module):
         )
 
         # Use the aggregator token's output as the "meal embedding"
-        filtered_meal_emb = meal_attn_out[:, 0, :]  # => (N_non_empty, hidden_dim)
+        transformer_meal_emb = meal_attn_out[:, 0, :]  # => (N_non_empty, hidden_dim)
+        
+        # Apply residual connection: combine transformer output with average embedding
+        filtered_meal_emb = transformer_meal_emb + avg_meal_emb  # (N_non_empty, hidden_dim)
         
         # Create the full meal embeddings tensor filled with zeros
         meal_timestep_emb = torch.zeros(B * T, self.hidden_dim, device=meal_token_emb.device)
