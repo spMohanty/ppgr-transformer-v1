@@ -77,7 +77,7 @@ def get_dataloaders(config: ExperimentConfig):
         num_workers=config.dataloader_num_workers, 
         pin_memory=True, 
         persistent_workers=True, 
-        prefetch_factor=4,
+        prefetch_factor=config.dataloader_prefetch_factor,
         shuffle=True,
         collate_fn=meal_glucose_collate_fn
     )
@@ -87,7 +87,7 @@ def get_dataloaders(config: ExperimentConfig):
         num_workers=config.dataloader_num_workers, 
         pin_memory=True, 
         persistent_workers=True,
-        prefetch_factor=4,
+        prefetch_factor=config.dataloader_prefetch_factor,
         shuffle=False,
         collate_fn=meal_glucose_collate_fn
     )
@@ -97,7 +97,7 @@ def get_dataloaders(config: ExperimentConfig):
         num_workers=config.dataloader_num_workers, 
         pin_memory=True, 
         persistent_workers=True,
-        prefetch_factor=4,
+        prefetch_factor=config.dataloader_prefetch_factor,
         shuffle=False,
         collate_fn=meal_glucose_collate_fn
     )

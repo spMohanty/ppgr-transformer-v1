@@ -11,7 +11,8 @@ class ExperimentConfig:
     cache_dir: str = "/scratch/mohanty/food/ppgr-v1/datasets-cache"
     use_cache: bool = True
     debug_mode: bool = False
-    dataloader_num_workers: int = 7 
+    dataloader_num_workers: int = 4
+    dataloader_prefetch_factor: int = 8
 
     # Data splitting & sequence parameters
     min_encoder_length: int = 8 * 4    # e.g., 8hrs * 4
@@ -93,7 +94,7 @@ class ExperimentConfig:
     food_embedding_projection_batch_size: int = 1024 * 4
 
     # Plots (default: plots enabled)
-    disable_plots: bool = False
+    disable_plots: bool = True
 
     def __post_init__(self):
         # Set default lists if not provided.

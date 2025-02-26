@@ -32,6 +32,51 @@ import random
 import torch
 import torch.nn as nn   
 
+def process_user_group(user_data, training_percentage, validation_percentage):
+    """Process a single user's data for time series splitting."""
+    user_id, group = user_data
+    
+    # Get indices where food intake occurred
+    food_intake_indices = group[group["food_intake_row"] == 1].index.tolist()
+    n_samples = len(food_intake_indices)
+    
+    if n_samples == 0:
+        return [], [], []  # Return empty lists for this user
+    
+    # Calculate split points (in terms of the food intake rows)
+    train_end = int(training_percentage * n_samples)
+    val_end = int((training_percentage + validation_percentage) * n_samples)
+    
+    # Get the boundary indices for each split
+    train_boundary = food_intake_indices[train_end-1] if train_end > 0 else group.index[0]
+    val_boundary = food_intake_indices[val_end-1] if val_end > train_end else train_boundary
+    
+    # Split all rows based on these boundaries
+    training_data_slices = group.loc[:train_boundary]
+    validation_data_slices = group.loc[train_boundary+1:val_boundary]
+    test_data_slices = group.loc[val_boundary+1:]
+    
+    # Add checks to ensure that the data is in the correct order
+    assert training_data_slices["read_at"].is_monotonic_increasing
+    assert validation_data_slices["read_at"].is_monotonic_increasing
+    assert test_data_slices["read_at"].is_monotonic_increasing
+    
+    # Add checks to ensure that the validation data is later than the training data
+    # and test data is later than validation data
+    try:
+        assert validation_data_slices["read_at"].max() > training_data_slices["read_at"].max()
+        assert test_data_slices["read_at"].max() > validation_data_slices["read_at"].max()
+    except Exception as e:
+        print(f"Error for user {user_id}: {e}")
+        return [], [], []  # Skip this user on error
+    
+    # Return the splits for this user
+    return (
+        [] if training_data_slices.empty else [training_data_slices],
+        [] if validation_data_slices.empty else [validation_data_slices],
+        [] if test_data_slices.empty else [test_data_slices]
+    )
+
 def split_timeseries_df_based_on_food_intake_rows(
     df: pd.DataFrame,
     validation_percentage: float,
@@ -41,67 +86,39 @@ def split_timeseries_df_based_on_food_intake_rows(
     Create time-series slices anchored around food intake rows and split them
     into training, validation, and test sets.
     """
-    training_data = []
-    validation_data = []
-    test_data = []
-    
     training_percentage = 1 - validation_percentage - test_percentage
     
     df["read_at"] = pd.to_datetime(df["read_at"])
     
-    # sort dataframe by user_id and read_at to ensure that the data is in the correct order
+    # Sort dataframe by user_id and read_at to ensure that the data is in the correct order
     df = df.sort_values(by=["user_id", "read_at"]).reset_index(drop=True)
     
-    for user_id, group in tqdm(df.groupby("user_id"), total=len(df["user_id"].unique())):
-        # Get indices where food intake occurred
-        food_intake_indices = group[group["food_intake_row"] == 1].index.tolist()
-        n_samples = len(food_intake_indices)
-        
-        if n_samples == 0:
-            continue
-        
-        # Calculate split points (in terms of the food intake rows)
-        train_end = int(training_percentage * n_samples)
-        val_end = int((training_percentage + validation_percentage) * n_samples)
-        
-        # Get the boundary indices for each split
-        train_boundary = food_intake_indices[train_end-1] if train_end > 0 else group.index[0]
-        val_boundary = food_intake_indices[val_end-1] if val_end > train_end else train_boundary
-        
-        # Split all rows based on these boundaries
-        training_data_slices = group.loc[:train_boundary]
-        validation_data_slices = group.loc[train_boundary+1:val_boundary]
-        test_data_slices = group.loc[val_boundary+1:]
-        
-        # Add checks to ensure that the data is in the correct order
-        assert training_data_slices["read_at"].is_monotonic_increasing
-        assert validation_data_slices["read_at"].is_monotonic_increasing
-        assert test_data_slices["read_at"].is_monotonic_increasing
-        
-        # Add checks to ensure that the validation data is later than the training data
-        # and test data is later than validation data
-        try:
-            assert validation_data_slices["read_at"].max() > training_data_slices["read_at"].max()
-            assert test_data_slices["read_at"].max() > validation_data_slices["read_at"].max()
-        except Exception as e:
-            print(f"Error: {e}")
-            breakpoint()
-        
-        # Add the splits to their respective lists
-        if not training_data_slices.empty:
-            training_data.append(training_data_slices)
-        if not validation_data_slices.empty:
-            validation_data.append(validation_data_slices)
-        if not test_data_slices.empty:
-            test_data.append(test_data_slices)
+    # Prepare user data for parallel processing
+    user_groups = list(df.groupby("user_id"))
     
-        
+    # Process all user groups in parallel
+    results = p_tqdm.p_map(
+        lambda x: process_user_group(x, training_percentage, validation_percentage),
+        user_groups,
+        desc="Splitting timeseries by block-ids"
+    )
+    
+    # Unpack results
+    training_data = []
+    validation_data = []
+    test_data = []
+    
+    for train_slices, val_slices, test_slices in results:
+        training_data.extend(train_slices)
+        validation_data.extend(val_slices)
+        test_data.extend(test_slices)
+    
     # Combine all users' data
-    training_df = pd.concat(training_data)
-    validation_df = pd.concat(validation_data)
-    test_df = pd.concat(test_data)
+    training_df = pd.concat(training_data) if training_data else pd.DataFrame()
+    validation_df = pd.concat(validation_data) if validation_data else pd.DataFrame()
+    test_df = pd.concat(test_data) if test_data else pd.DataFrame()
         
-    return training_df, validation_df, test_df        
+    return training_df, validation_df, test_df
     
 
 class PPGRTimeSeriesSliceMetadata:
@@ -467,134 +484,160 @@ class PPGRTimeSeriesDataset(Dataset):
         self.user_id_to_microbiome_idx = {user_id: idx for idx, user_id in enumerate(self.microbiome_embeddings_df.index)}
         
     
+    def process_group_sliding_window(self, group_data):
+        _, group = group_data
+        block_start = group.index[0]
+        block_end = group.index[-1]
+        
+        # Get microbiome index if needed
+        microbiome_idx = None
+        if self.use_microbiome_embeddings:
+            if "user_id" in self.categorical_encoders:
+                user_id = int(self.categorical_encoders["user_id"].inverse_transform(group["user_id"].iloc[0]))
+            else:
+                user_id = int(group["user_id"].iloc[0])
+            microbiome_idx = self.user_id_to_microbiome_idx[user_id]
+        
+        slices = []
+        for row_idx in range(block_start, block_end + 1, self.sliding_window_stride):
+            slice_start = row_idx - self.min_encoder_length + 1
+            slice_end = row_idx + self.prediction_length
+            
+            # Ignore fringe points where slice is not fully within the block
+            if slice_start < block_start or slice_end > block_end:
+                continue
+            
+            slices.append(
+                PPGRTimeSeriesSliceMetadata(
+                    slice_start=slice_start,
+                    slice_end=slice_end,
+                    anchor_row_idx=row_idx,
+                    block_start=block_start,
+                    block_end=block_end,
+                    microbiome_idx=microbiome_idx
+                )
+            )
+        return slices
+
     def prepare_sliding_window_data(self):
-        # Iterate over each of the timeseries_block_ids 
-        groups = self.df_scaled.groupby(self.group_by_columns)
-        for _, group in tqdm(groups, total=len(groups)):
+        groups = list(self.df_scaled.groupby(self.group_by_columns))
+        all_slices = p_tqdm.p_map(
+            lambda group_data: self.process_group_sliding_window(group_data),
+            groups,
+            desc="Processing sliding windows"
+        )
+        # Flatten the list of lists
+        self.timeseries_slices_indices = [slice_metadata for group_slices in all_slices for slice_metadata in group_slices]
+    
+    def prepare_food_anchored_data(self):
+        """Prepare time series slices anchored around food intake rows."""
+        # Pre-extract all the necessary group metadata first
+        group_metadata = []
+        
+        for name, group in tqdm(self.df_scaled.groupby(self.group_by_columns), 
+                               desc="Preparing group metadata"):
             block_start = group.index[0]
             block_end = group.index[-1]
             
-            # 3. Keep a record of the microbiome index for this slice            
+            # Get microbiome index if needed
+            microbiome_idx = None
             if self.use_microbiome_embeddings:
                 if "user_id" in self.categorical_encoders:
-                    # When user_id is a provided covariate
                     user_id = int(self.categorical_encoders["user_id"].inverse_transform(group["user_id"].iloc[0]))
                 else:
-                    # When user_id is directly available from the dataframe
-                    # CAREFUL: if the user_id is a categorical variable, this this value is an encoded version
-                    # and doesnt not match the user_id in the whole dataset
                     user_id = int(group["user_id"].iloc[0])
                 microbiome_idx = self.user_id_to_microbiome_idx[user_id]
-            else:
-                microbiome_idx = None
             
-            # Iterate over the whole timeseries block            
-            for row_idx in tqdm(range(block_start, block_end + 1, self.sliding_window_stride), total=len(range(block_start, block_end + 1, self.sliding_window_stride))):
-                # 1. Identify the start and end of the context and prediction window
+            # Find food intake rows with enough past and future data
+            food_intake_mask = group["food_intake_row"] == 1
+            food_intake_mask.iloc[:self.min_encoder_length] = False
+            food_intake_mask.iloc[-self.prediction_length:] = False
+            food_intake_rows = group.index[food_intake_mask].tolist()
+            
+            # Only store the minimal necessary data
+            if food_intake_rows:
+                group_metadata.append({
+                    'block_start': block_start,
+                    'block_end': block_end,
+                    'food_intake_row_indices': food_intake_rows,
+                    'microbiome_idx': microbiome_idx
+                })
+        
+        # Process with minimal data transfer
+        all_slices = []
+        for meta in tqdm(group_metadata, desc="Processing food-anchored data"):
+            block_start = meta['block_start']
+            block_end = meta['block_end']
+            microbiome_idx = meta['microbiome_idx']
+            
+            for row_idx in meta['food_intake_row_indices']:
                 slice_start = row_idx - self.min_encoder_length + 1
                 slice_end = row_idx + self.prediction_length
                 
-                # 2. Ignore the fringe points where the slice is not fully within the block
-                if slice_start < block_start or slice_end > block_end: continue 
-                
-                # print(f"slice_start: {slice_start}, slice_end: {slice_end}")
-                # 3. Keep a record of the slice metadata to be used later in __getitem__
-                self.timeseries_slices_indices.append(
+                all_slices.append(
                     PPGRTimeSeriesSliceMetadata(
-                        slice_start = slice_start, # recommended slice start  (using the minimum encoder length)
-                        slice_end = slice_end, # recommended slice end (using the minimum prediction length)
-                        anchor_row_idx = row_idx, # anchor row for this slice (usually the food intake row, but not necessarily)
-                        block_start = block_start, # start of the timeseries block
-                        block_end = block_end, # end of the timeseries block
-                        microbiome_idx = microbiome_idx # keep track of the microbiome index for this slice
-                    ))
-            
-    
-    def prepare_food_anchored_data(self):
-        # 1. Iterate over each of the timeseries_block_ids 
-        groups = self.df_scaled.groupby(self.group_by_columns)
-        for _, group in tqdm(groups, total=len(groups)):            
-            # 2 Keep a record of the block_start so that we can randomize the encoder lengths during the training
-            block_start = group.index[0]
-            block_end = group.index[-1]
-            
-            # 3. Keep a record of the microbiome index for this slice            
-            if self.use_microbiome_embeddings:
-                if "user_id" in self.categorical_encoders:
-                    # When user_id is a provided covariate
-                    user_id = int(self.categorical_encoders["user_id"].inverse_transform(group["user_id"].iloc[0]))
-                else:
-                    # When user_id is directly available from the dataframe
-                    # CAREFUL: if the user_id is a categorical variable, this this value is an encoded version
-                    # and doesnt not match the user_id in the whole dataset
-                    user_id = int(group["user_id"].iloc[0])
-                microbiome_idx = self.user_id_to_microbiome_idx[user_id]
-            else:
-                microbiome_idx = None
+                        slice_start=slice_start,
+                        slice_end=slice_end,
+                        anchor_row_idx=row_idx,
+                        block_start=block_start,
+                        block_end=block_end,
+                        microbiome_idx=microbiome_idx
+                    )
+                )
+        
+        self.timeseries_slices_indices = all_slices
 
-            # 4. For each timeseries_block_id, identify the food intake rows
-            food_intake_mask = group["food_intake_row"] == 1
-            
-            # 5. Ensure that the there is enough past and future data for all potential slices
-            food_intake_mask.iloc[:self.min_encoder_length] = False
-            food_intake_mask.iloc[-self.prediction_length:] = False
-            
-            # 6. Get all the rows that have enough past and future data
-            food_intake_rows = group[food_intake_mask]
 
-            # 7. Iterate over all the food intake rows
-            for row_idx, _ in food_intake_rows.iterrows():
-                # 8. For each food intake row, identify the start and end of the context and prediction window
-                slice_start = row_idx - self.min_encoder_length + 1 # row_idx is the food anchor, and we want the encoder slice to end with it
-                slice_end = row_idx + self.prediction_length
-                
-                # 9. Store slice start, and slice end to be retrieved later in __getitem__
-                self.timeseries_slices_indices.append(
-                    PPGRTimeSeriesSliceMetadata(
-                        slice_start = slice_start, # recommended slice start  (using the minimum encoder length)
-                        slice_end = slice_end, # recommended slice end (using the minimum prediction length)
-                        anchor_row_idx = row_idx, # anchor row for this slice (usually the food intake row, but not necessarily)
-                        block_start = block_start, # start of the timeseries block
-                        block_end = block_end, # end of the timeseries block
-                        microbiome_idx = microbiome_idx # keep track of the microbiome index for this slice
-                    ))
-    
     def prepare_cross_index_of_ppgr_df_and_dishes_df(self):
-        """
-        This function prepares a cross index of the ppgr_df and the dishes_df
-        """
-    
-        # For all the rows in ppgr_df, we want to identify the exact index number of the corresponding
-        # dish items, so that it is easy to access them in __getitem__        
-
-        # This assumes that ppgr_df, df_scaled, dishes_df will not change their indices
-        # or be reset etc after
-        
-        
+        """This function prepares a cross index of the ppgr_df and the dishes_df"""
         if not self.use_meal_level_food_covariates:
-            # This function is not needed when not using the meal level food covariates
-            return 
-                
-        # rows with non-null dish ids
+            # This function is not needed when not using meal level food covariates
+            return
+        
+        logger.info("Building dish cross-index...")
+        
+        # Rows with non-null dish ids
         ppgr_df_with_dish_ids = self.ppgr_df[~self.ppgr_df["dish_id"].isna()]
         
+        # Pre-compute a mapping from dish_id to indices in dishes_df_scaled
+        dish_id_to_indices_map = {}
+        for _, row in tqdm(self.dishes_df_scaled.iterrows(), 
+                        total=len(self.dishes_df_scaled), 
+                        desc="Building dish_id lookup map"):
+            dish_id = int(row["dish_id"])
+            if dish_id not in dish_id_to_indices_map:
+                dish_id_to_indices_map[dish_id] = []
+            dish_id_to_indices_map[dish_id].append(row.name)
         
-        self.ppgr_df_row_idx_to_dishes_df_idxs = {} # Dictionary which will store a mapping of ppgr_df index to dishes_df_scaled indices
+        # Dictionary to store mapping of ppgr_df index to dishes_df_scaled indices
+        self.ppgr_df_row_idx_to_dishes_df_idxs = {}
         
-        # Iterate over each of the rows
-        for idx, row in tqdm(ppgr_df_with_dish_ids.iterrows(), total=len(ppgr_df_with_dish_ids)):
+        # Process each row serially
+        for _, row in tqdm(ppgr_df_with_dish_ids.iterrows(), 
+                        total=len(ppgr_df_with_dish_ids), 
+                        desc="Mapping dishes to rows"):
             row_index = row.name
+            dish_id_str = row["dish_id"]
             
-            # currently multiple dish ids are stored as: "123 || 456"
-            mfr_dish_ids = [int(x) for x in str(row["dish_id"]).split("||")]
+            # Handle multiple dish ids stored as: "123 || 456"
+            try:
+                mfr_dish_ids = [int(x.strip()) for x in str(dish_id_str).split("||") if x.strip()]
+            except ValueError:
+                # Handle cases where dish_id might not be convertible to int
+                continue
             
-            internal_dish_idxs = [] # These will store the indices of the dishes_df_scaled tensor
+            # Use the pre-computed mapping
+            all_indices = []
             for mfr_dish_id in mfr_dish_ids:
-                internal_dish_idx = self.dishes_df_scaled[self.dishes_df_scaled["dish_id"] == mfr_dish_id].index.values
-                internal_dish_idxs.append(internal_dish_idx)
+                if mfr_dish_id in dish_id_to_indices_map:
+                    all_indices.extend(dish_id_to_indices_map[mfr_dish_id])
+            
+            # Only create tensor if we have indices
+            if all_indices:
+                self.ppgr_df_row_idx_to_dishes_df_idxs[row_index] = torch.tensor(all_indices).to(self.device)
         
-            self.ppgr_df_row_idx_to_dishes_df_idxs[row_index] = torch.tensor(np.concatenate(internal_dish_idxs)).to(self.device)
-        
+        logger.info(f"Created dish mappings for {len(self.ppgr_df_row_idx_to_dishes_df_idxs)} rows")
+
     def __len__(self):
         return len(self.timeseries_slices_indices)
     
@@ -1225,24 +1268,59 @@ class PPGRToMealGlucoseWrapper(Dataset):
         self.cache_misses = 0
         self.total_requests = 0
         
-    def warmup_cache(self, indices=None):
+    def warmup_cache(self, indices=None, num_workers=8, batch_size=1024*20):
         """
-        Warmup the cache with specific indices or the entire dataset.
+        Warmup the cache with specific indices using PyTorch DataLoader for efficient parallel processing.
         
         Args:
             indices (list, optional): List of indices to preload. If None, 
-                                     preloads the entire dataset. Default: None.
+                                    preloads the entire dataset. Default: None.
+            num_workers (int, optional): Number of parallel workers. Default: 8.
+            batch_size (int, optional): Batch size for the DataLoader. Default: 2048.
         """
+        import concurrent.futures
+        
         if indices is None:
-            indices = range(len(self))
+            indices = list(range(len(self)))
+        
+        # Filter out indices that are already in the cache
+        indices_to_compute = [i for i in indices if i not in self.cache]
+        
+        # Don't process if there's nothing to do or we've reached cache size limit
+        if not indices_to_compute or (self.cache_size is not None and len(self.cache) >= self.cache_size):
+            logger.info("No items to cache or cache is full.")
+            return
+        
+        # Limit the number of items to compute based on remaining cache space
+        if self.cache_size is not None:
+            remaining_space = self.cache_size - len(self.cache)
+            indices_to_compute = indices_to_compute[:remaining_space]
+        
+        logger.info(f"Warming up cache for {len(indices_to_compute)} items using {num_workers} workers")
+        
+        # Process in batches for better progress tracking
+        batch_indices = [indices_to_compute[i:i+batch_size] for i in range(0, len(indices_to_compute), batch_size)]
+        
+        for batch_idx, batch in enumerate(batch_indices):
+            logger.info(f"Processing batch {batch_idx+1}/{len(batch_indices)} ({len(batch)} items)")
             
-        for i in tqdm(indices, desc="Preloading cache"):
-            if i not in self.cache:
-                if self.cache_size is None or len(self.cache) < self.cache_size:
-                    self.cache[i] = self._compute_item(i)
-                else:
-                    # Cache is full
-                    break
+            # Create a ThreadPoolExecutor to process items in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                # Submit all computations to the executor
+                future_to_idx = {executor.submit(self._compute_item, idx): idx for idx in batch}
+                
+                # Process results as they complete
+                for future in tqdm(concurrent.futures.as_completed(future_to_idx), 
+                                total=len(batch), 
+                                desc=f"Warming up Cache::Batch {batch_idx+1}/{len(batch_indices)}"):
+                    idx = future_to_idx[future]
+                    try:
+                        item = future.result()
+                        self.cache[idx] = item
+                    except Exception as exc:
+                        logger.error(f"Item {idx} generated an exception: {exc}")
+        
+        logger.info(f"Cache warmup complete. Total items in cache: {len(self.cache)}")
 
 def meal_glucose_collate_fn(batch):
     """
@@ -1625,6 +1703,7 @@ if __name__ == "__main__":
 
     # main_df_scaled_all_categorical_columns = user_static_categoricals + food_categoricals + temporal_categoricals
     # main_df_scaled_all_real_columns = user_static_reals + food_reals + temporal_reals + targets
+    
     
     
     
