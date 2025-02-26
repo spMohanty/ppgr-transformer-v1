@@ -3,6 +3,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import wandb
+import argparse
+from typing import Optional, Union, Dict, List, Tuple
 
 def plot_forecast_examples(
     forecasts, 
@@ -140,7 +142,7 @@ def plot_forecast_examples(
                 ax_ts.axvline(x=relative_time, color="purple", linestyle="--", alpha=0.7)
 
         ax_ts.set_xlabel("Relative Timestep")
-        ax_ts.set_ylabel("Glucose Level")
+        ax_ts.set_ylabel("Glucose Level (mmol/L)")
         ax_ts.set_title(f"Forecast Example {i} (Idx: {idx})")
         ax_ts.legend(fontsize="small")
         
@@ -540,4 +542,440 @@ def plot_meal_self_attention(
         plt.close(fig)
     
     return fixed_indices
+
+if __name__ == "__main__":
+    import random
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import torch
+    import argparse
+    from typing import Optional, Union, Dict, List, Tuple
+    
+    # Mock logger for Weights & Biases logging
+    class MockLogger:
+        class MockExperiment:
+            def log(self, data):
+                print(f"[MOCK W&B LOG] Logged data with keys: {list(data.keys())}")
+        
+        def __init__(self):
+            self.experiment = self.MockExperiment()
+    
+    # Create command-line arguments to select which function to test
+    parser = argparse.ArgumentParser(description="Test plot helper functions with mock data")
+    parser.add_argument("--function", type=str, choices=["forecast", "iauc", "attention", "all"], 
+                        default="all", help="Which plotting function to test")
+    args = parser.parse_args()
+    
+    # Set random seeds for reproducibility
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+    
+    # ===== Mock data generation utilities =====
+    
+    def generate_mock_glucose_data(batch_size: int = 8, 
+                                  past_len: int = 32, 
+                                  forecast_len: int = 16,
+                                  num_quantiles: int = 9,
+                                  past_meal_len: int = 8,
+                                  future_meal_len: int = 4,
+                                  meal_embedding_dim: int = 5) -> Dict[str, torch.Tensor]:
+        """
+        Generate mock data for glucose forecasting visualization.
+        
+        Args:
+            batch_size: Number of samples in batch
+            past_len: Length of historical glucose values
+            forecast_len: Length of forecast horizon
+            num_quantiles: Number of quantiles in prediction
+            past_meal_len: Number of past meal timepoints
+            future_meal_len: Number of future meal timepoints
+            meal_embedding_dim: Dimension of meal embeddings
+            
+        Returns:
+            Dictionary with mock forecast data
+        """
+        # Generate realistic glucose values in mmol/L (normal range ~4-10)
+        base_glucose = 5.5 + 1.0 * torch.randn(batch_size, 1)  # Different baseline for each patient
+        
+        # Historical glucose with some trends and noise
+        past_time = torch.linspace(0, 1, past_len).unsqueeze(0).repeat(batch_size, 1)
+        past_glucose = base_glucose + 1.5 * torch.sin(6 * past_time) + 0.5 * torch.randn(batch_size, past_len)
+        
+        # Future true glucose continues the pattern (with slight increase for meal effect)
+        future_time = torch.linspace(1, 1.5, forecast_len).unsqueeze(0).repeat(batch_size, 1)
+        future_glucose = base_glucose + 1.5 * torch.sin(6 * future_time) + 0.7 * torch.randn(batch_size, forecast_len)
+        
+        # Add meal effects to some samples (create realistic postprandial glucose rise)
+        for b in range(batch_size):
+            if random.random() < 0.7:  # 70% chance of meal effect
+                # Add rising glucose after a meal - peak at ~2 mmol/L higher
+                peak_time = random.randint(4, forecast_len-2)  # Random peak position
+                peak_height = 1.5 + 0.8 * random.random()  # Peak height 1.5-2.3 mmol/L
+                
+                # Create a bell curve for the meal response
+                for t in range(forecast_len):
+                    dist_from_peak = abs(t - peak_time)
+                    meal_effect = peak_height * np.exp(-0.3 * dist_from_peak)
+                    future_glucose[b, t] += meal_effect
+        
+        # Predicted glucose - make it less accurate and vary by example
+        # Shape: [batch_size, forecast_len, num_quantiles]
+        median_idx = num_quantiles // 2
+        
+        # Make predictions somewhat shifted and with increasing error over time
+        # This creates more separation between the forecast and ground truth
+        future_pred_median = torch.zeros_like(future_glucose)
+        for b in range(batch_size):
+            forecast_error = 0.3 + 0.6 * random.random()  # Varying forecast error
+            time_factor = torch.linspace(0.5, 1.5, forecast_len)  # Error grows with time
+            
+            # Add systematic error (trend direction bias) for realism
+            trend_bias = 0.4 * (2 * random.random() - 1)  # Between -0.4 and 0.4
+            
+            # Combine various error components into a realistic forecast
+            error = (forecast_error * torch.randn(forecast_len) + 
+                    trend_bias * time_factor + 
+                    0.15 * torch.sin(3 * torch.tensor(range(forecast_len))))
+            
+            future_pred_median[b] = future_glucose[b] + error
+        
+        # Create quantiles with appropriate spread
+        # The spread should increase with forecast horizon
+        quantile_offsets = torch.zeros(forecast_len, num_quantiles)
+        for t in range(forecast_len):
+            # Wider spreads for farther horizons
+            width_factor = 0.5 + 0.8 * (t / forecast_len)
+            quantile_offsets[t] = torch.linspace(-width_factor*2.0, width_factor*2.0, num_quantiles)
+        
+        # Expand dimensions for broadcasting
+        future_pred = future_pred_median.unsqueeze(-1) + quantile_offsets.unsqueeze(0)
+        
+        # Create meal data - sparse binary indicators (1 = meal present, 0 = no meal)
+        past_meals = torch.zeros(batch_size, past_meal_len, meal_embedding_dim)
+        future_meals = torch.zeros(batch_size, future_meal_len, meal_embedding_dim)
+        
+        # Add some random meals (10-20% of timesteps will have meals)
+        for b in range(batch_size):
+            # Add 1-3 past meals
+            for _ in range(random.randint(1, 3)):
+                t = random.randint(0, past_meal_len - 1)
+                meal_type = random.randint(1, meal_embedding_dim-1)  # 0 is reserved for no meal
+                past_meals[b, t, 0] = 1  # Meal presence indicator
+                past_meals[b, t, meal_type] = 1  # Meal type
+            
+            # Add 0-2 future meals
+            for _ in range(random.randint(0, 2)):
+                t = random.randint(0, future_meal_len - 1)
+                meal_type = random.randint(1, meal_embedding_dim-1)
+                future_meals[b, t, 0] = 1  # Meal presence indicator
+                future_meals[b, t, meal_type] = 1  # Meal type
+        
+        return {
+            "past": past_glucose,
+            "pred": future_pred,
+            "truth": future_glucose,
+            "past_meal_ids": past_meals,
+            "future_meal_ids": future_meals
+        }
+    
+    def generate_mock_attention(batch_size: int, 
+                               context_len: int, 
+                               past_meal_len: int, 
+                               future_meal_len: int,
+                               meal_embedding_dim: int = 5) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generate mock self-attention weights for meal data.
+        
+        Args:
+            batch_size: Number of samples
+            context_len: Length of context window
+            past_meal_len: Number of past meal timepoints
+            future_meal_len: Number of future meal timepoints
+            meal_embedding_dim: Dimension of meal embeddings
+            
+        Returns:
+            Tuple of:
+                past_attn: Past attention weights [batch, context_len, past_meal_len]
+                future_attn: Future attention weights [batch, context_len, future_meal_len]
+        """
+        # Generate meal-to-meal self-attention (for each meal timestep with meals)
+        # Create attention matrices with reasonable patterns
+        
+        # Past meals attention
+        # Shape: [batch_size, past_meal_len, past_meal_len]
+        past_meals_attn = torch.zeros(batch_size, past_meal_len, past_meal_len)
+        
+        # Future meals attention
+        # Shape: [batch_size, future_meal_len, future_meal_len]
+        future_meals_attn = torch.zeros(batch_size, future_meal_len, future_meal_len)
+        
+        # For meal self-attention, create plausible patterns:
+        # 1. Strong diagonal (self-attention)
+        # 2. Attention to nearby meals
+        # 3. Some meals might get more attention overall
+        
+        for b in range(batch_size):
+            # Past meals self-attention
+            for i in range(past_meal_len):
+                for j in range(past_meal_len):
+                    # Strong diagonal
+                    if i == j:
+                        past_meals_attn[b, i, j] = 0.7 + 0.3 * torch.rand(1).item()
+                    else:
+                        # Attention decays with distance
+                        dist = abs(i - j)
+                        past_meals_attn[b, i, j] = max(0, 0.5 - 0.1 * dist) * torch.rand(1).item()
+            
+            # Normalize rows to sum to 1
+            row_sums = past_meals_attn[b].sum(dim=1, keepdim=True)
+            nonzero_rows = row_sums > 0
+            if nonzero_rows.any():
+                past_meals_attn[b, nonzero_rows.squeeze(), :] /= row_sums[nonzero_rows]
+            
+            # Future meals self-attention
+            for i in range(future_meal_len):
+                for j in range(future_meal_len):
+                    # Strong diagonal
+                    if i == j:
+                        future_meals_attn[b, i, j] = 0.7 + 0.3 * torch.rand(1).item()
+                    else:
+                        # Attention decays with distance
+                        dist = abs(i - j)
+                        future_meals_attn[b, i, j] = max(0, 0.5 - 0.1 * dist) * torch.rand(1).item()
+            
+            # Normalize rows to sum to 1
+            row_sums = future_meals_attn[b].sum(dim=1, keepdim=True)
+            nonzero_rows = row_sums > 0
+            if nonzero_rows.any():
+                future_meals_attn[b, nonzero_rows.squeeze(), :] /= row_sums[nonzero_rows]
+        
+        return past_meals_attn, future_meals_attn
+    
+    def generate_mock_iauc_data(num_samples: int = 200) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generate mock iAUC (incremental Area Under Curve) data.
+        
+        Args:
+            num_samples: Number of data points
+            
+        Returns:
+            Tuple of predicted and true iAUC values
+        """
+        # True iAUC values in the range of 0-30
+        true_iauc = 15 + 7 * torch.randn(num_samples)
+        
+        # Add constraints to keep values in a realistic range
+        true_iauc = torch.clamp(true_iauc, min=0, max=30)
+        
+        # Predicted iAUC - correlated with true but with noise
+        # Create correlation of about 0.7
+        correlation = 0.7
+        noise = torch.randn(num_samples)
+        pred_iauc = correlation * true_iauc + (1 - correlation) * 5 * noise
+        
+        # Ensure predictions are in the same range
+        pred_iauc = torch.clamp(pred_iauc, min=0, max=30)
+        
+        return pred_iauc, true_iauc
+    
+    # ===== Test plot_forecast_examples =====
+    
+    def test_plot_forecast_examples():
+        print("\n===== Testing plot_forecast_examples =====")
+        
+        # Create mock data
+        batch_size = 8
+        past_len = 32  # 8 hours with 4 readings per hour
+        forecast_len = 16  # 4 hours with 4 readings per hour
+        quantiles = torch.tensor([0.05, 0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9, 0.95])
+        num_quantiles = len(quantiles)
+        past_meal_len = 8  # Number of past meal timepoints
+        future_meal_len = 4  # Number of future meal timepoints
+        meal_embedding_dim = 5  # Dimension of meal embeddings
+        
+        # Generate mock glucose and meal data
+        forecasts = generate_mock_glucose_data(
+            batch_size=batch_size, 
+            past_len=past_len,
+            forecast_len=forecast_len,
+            num_quantiles=num_quantiles,
+            past_meal_len=past_meal_len,
+            future_meal_len=future_meal_len
+        )
+        
+        # Generate mock attention weights
+        past_attn, future_attn = generate_mock_attention(
+            batch_size=batch_size,
+            context_len=past_len,  # For contextual attention
+            past_meal_len=past_meal_len,
+            future_meal_len=future_meal_len
+        )
+        
+        # Create a mock logger
+        logger = MockLogger()
+        global_step = 1000
+        
+        print(f"Generated mock data:")
+        print(f"- past glucose shape: {forecasts['past'].shape}")
+        print(f"- predicted glucose shape: {forecasts['pred'].shape}")
+        print(f"- true future glucose shape: {forecasts['truth'].shape}")
+        print(f"- past meal IDs shape: {forecasts['past_meal_ids'].shape}")
+        print(f"- future meal IDs shape: {forecasts['future_meal_ids'].shape}")
+        print(f"- past attention weights shape: {past_attn.shape}")
+        print(f"- future attention weights shape: {future_attn.shape}")
+        
+        # Call the plotting function with updated axis labels
+        fixed_indices, fig = plot_forecast_examples(
+            forecasts=forecasts,
+            attn_weights_past=past_attn,
+            attn_weights_future=future_attn,
+            quantiles=quantiles,
+            logger=logger,
+            global_step=global_step,
+            fixed_indices=None  # Let the function randomly select examples
+        )
+        
+        # Update all axis labels to include units
+        for ax_row in fig.axes:
+            if hasattr(ax_row, 'set_ylabel'):  # Check if it's a main plot axes
+                if ax_row.get_ylabel() == 'Glucose Level':
+                    ax_row.set_ylabel('Glucose Level (mmol/L)')
+        
+        # Save figure instead of showing it
+        output_path = "forecast_examples_test.png"
+        fig.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Plot saved to {output_path}")
+        
+        return fixed_indices, fig
+    
+    # ===== Test plot_iAUC_scatter =====
+    
+    def test_plot_iauc_scatter():
+        print("\n===== Testing plot_iAUC_scatter =====")
+        
+        # Generate mock iAUC data
+        pred_iauc, true_iauc = generate_mock_iauc_data(num_samples=200)
+        
+        print(f"Generated mock iAUC data:")
+        print(f"- predicted iAUC shape: {pred_iauc.shape}")
+        print(f"- true iAUC shape: {true_iauc.shape}")
+        
+        # Call the function
+        fig, corr = plot_iAUC_scatter(
+            all_pred_iAUC=pred_iauc,
+            all_true_iAUC=true_iauc,
+            disable_plots=False
+        )
+        
+        # Save figure instead of showing it
+        output_path = "iauc_scatter_test.png"
+        fig.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"iAUC scatter plot created with correlation: {corr.item():.4f}")
+        print(f"Plot saved to {output_path}")
+        
+        return fig, corr
+    
+    # ===== Test plot_meal_self_attention =====
+    
+    def test_plot_meal_self_attention():
+        print("\n===== Testing plot_meal_self_attention =====")
+        
+        # Create mock data
+        batch_size = 8
+        past_len = 8  # Number of past meal timepoints
+        future_len = 4  # Number of future meal timepoints
+        meal_embedding_dim = 5  # Dimension of meal embeddings
+        
+        # Generate mock meal data
+        mock_data = generate_mock_glucose_data(
+            batch_size=batch_size,
+            past_len=32,  # Not directly used in this test
+            forecast_len=16,  # Not directly used in this test
+            past_meal_len=past_len,
+            future_meal_len=future_len,
+            meal_embedding_dim=meal_embedding_dim
+        )
+        
+        # Extract meal IDs
+        meal_ids_past = mock_data["past_meal_ids"]
+        meal_ids_future = mock_data["future_meal_ids"]
+        
+        # Generate mock self-attention matrices
+        # Shape: [batch_size, T, M, M]
+        # Where T is the number of timesteps and M is the meal embedding dimension
+        # We need attention across meal types for each timestep
+        
+        # For past meals: [batch_size, past_len, meal_embedding_dim, meal_embedding_dim]
+        attn_weights_past = torch.zeros(batch_size, past_len, meal_embedding_dim, meal_embedding_dim)
+        
+        # For future meals: [batch_size, future_len, meal_embedding_dim, meal_embedding_dim]
+        attn_weights_future = torch.zeros(batch_size, future_len, meal_embedding_dim, meal_embedding_dim)
+        
+        # Fill with some plausible attention patterns for each timestep with a meal
+        for b in range(batch_size):
+            for t in range(past_len):
+                if meal_ids_past[b, t, 0] > 0:  # If there's a meal at this timestep
+                    # Create a random attention matrix
+                    attn_matrix = torch.rand(meal_embedding_dim, meal_embedding_dim)
+                    # Make diagonal stronger (fixed version)
+                    for i in range(meal_embedding_dim):
+                        attn_matrix[i, i] += 0.5
+                    # Normalize
+                    attn_matrix = attn_matrix / attn_matrix.sum(dim=1, keepdim=True)
+                    attn_weights_past[b, t] = attn_matrix
+            
+            for t in range(future_len):
+                if meal_ids_future[b, t, 0] > 0:  # If there's a meal at this timestep
+                    # Create a random attention matrix
+                    attn_matrix = torch.rand(meal_embedding_dim, meal_embedding_dim)
+                    # Make diagonal stronger (fixed version)
+                    for i in range(meal_embedding_dim):
+                        attn_matrix[i, i] += 0.5
+                    # Normalize
+                    attn_matrix = attn_matrix / attn_matrix.sum(dim=1, keepdim=True)
+                    attn_weights_future[b, t] = attn_matrix
+        
+        # Create a mock logger
+        logger = MockLogger()
+        global_step = 1000
+        
+        print(f"Generated mock data:")
+        print(f"- past meal IDs shape: {meal_ids_past.shape}")
+        print(f"- future meal IDs shape: {meal_ids_future.shape}")
+        print(f"- past attention weights shape: {attn_weights_past.shape}")
+        print(f"- future attention weights shape: {attn_weights_future.shape}")
+        
+        # Call the function
+        fixed_indices = plot_meal_self_attention(
+            attn_weights_past=attn_weights_past,
+            meal_ids_past=meal_ids_past,
+            attn_weights_future=attn_weights_future,
+            meal_ids_future=meal_ids_future,
+            logger=logger,
+            global_step=global_step,
+            fixed_indices=None,  # Let the function randomly select examples
+            max_examples=4,
+            random_samples=True
+        )
+        
+        print(f"Meal self-attention plots created and logged with indices: {fixed_indices}")
+        
+        return fixed_indices
+    
+    # Run the selected test(s)
+    if args.function == "all" or args.function == "forecast":
+        fixed_indices, forecast_fig = test_plot_forecast_examples()
+    
+    if args.function == "all" or args.function == "iauc":
+        iauc_fig, corr = test_plot_iauc_scatter()
+    
+    if args.function == "all" or args.function == "attention":
+        attention_indices = test_plot_meal_self_attention()
+    
+    # Remove the plt.show() call since we're saving files instead
+    # if args.function != "attention":  # Attention plots are saved to W&B, not displayed
+    #     plt.show()
     
