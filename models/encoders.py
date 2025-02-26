@@ -148,49 +148,83 @@ class MealEncoder(nn.Module):
         """Process using transformer-based set aggregator."""
         if self.encoder is None:
             raise ValueError("aggregator_type='set' requires a defined self.encoder, but it is None.")
-            
+        
+        # Find timesteps with at least one non-zero meal_id (non-empty meals)
+        has_meals = (meal_ids_flat != 0).any(dim=1)  # (B*T)
+        
+        # If all timesteps are empty, return zeros
+        if not has_meals.any():
+            meal_timestep_emb = torch.zeros(B, T, self.hidden_dim, device=meal_token_emb.device)
+            return meal_timestep_emb, None
+        
+        # Get indices of non-empty timesteps
+        non_empty_indices = has_meals.nonzero().squeeze(-1)  # (N_non_empty)
+        
+        # Filter meal_token_emb and meal_ids_flat to only include non-empty timesteps
+        filtered_meal_token_emb = meal_token_emb[non_empty_indices]  # (N_non_empty, M, hidden_dim)
+        filtered_meal_ids = meal_ids_flat[non_empty_indices]  # (N_non_empty, M)
+        
         # Insert aggregator token at position 0
-        start_token_expanded = self.start_token.expand(B * T, -1, -1)  # => (B*T, 1, hidden_dim)
-        meal_token_emb = torch.cat([start_token_expanded, meal_token_emb], dim=1)
-        # => shape (B*T, M+1, hidden_dim)
+        N_non_empty = filtered_meal_token_emb.size(0)
+        start_token_expanded = self.start_token.expand(N_non_empty, -1, -1)  # => (N_non_empty, 1, hidden_dim)
+        filtered_meal_token_emb = torch.cat([start_token_expanded, filtered_meal_token_emb], dim=1)
+        # => shape (N_non_empty, M+1, hidden_dim)
 
         # Build a padding mask: treat item_id=0 as padding
-        pad_mask = (meal_ids_flat == 0)  # shape (B*T, M)
-        zero_col = torch.zeros(B * T, 1, dtype=torch.bool, device=pad_mask.device)
-        pad_mask = torch.cat([zero_col, pad_mask], dim=1)  # => (B*T, M+1)
+        pad_mask = (filtered_meal_ids == 0)  # shape (N_non_empty, M)
+        zero_col = torch.zeros(N_non_empty, 1, dtype=torch.bool, device=pad_mask.device)
+        pad_mask = torch.cat([zero_col, pad_mask], dim=1)  # => (N_non_empty, M+1)
         
-        # Incorporate timestep mask if provided
+        # Incorporate timestep mask if provided (for non-empty timesteps)
         if mask is not None:
-            # Reshape mask to match the flattened structure
-            timestep_mask = mask.view(B * T).unsqueeze(1)  # (B*T, 1)
+            # Get timestep mask for the non-empty timesteps
+            flat_mask = mask.view(B * T)
+            filtered_timestep_mask = flat_mask[non_empty_indices].unsqueeze(1)  # (N_non_empty, 1)
             
             # Expand to match the meal items + aggregator token
-            timestep_mask = timestep_mask.expand(-1, pad_mask.size(1))  # (B*T, M+1)
+            filtered_timestep_mask = filtered_timestep_mask.expand(-1, pad_mask.size(1))  # (N_non_empty, M+1)
             
-            # Combine with padding mask: mark as padding if either original padding or invalid timestep
-            # For invalid timesteps, keep the aggregator token (first position) valid
-            timestep_mask_combined = ~timestep_mask  # True means positions to ignore
+            # Combine with padding mask
+            timestep_mask_combined = ~filtered_timestep_mask  # True means positions to ignore
             timestep_mask_combined[:, 0] = False  # Keep aggregator token valid
             pad_mask = pad_mask | timestep_mask_combined
 
-        # Forward pass through the Transformer
+        # Forward pass through the Transformer (only for non-empty timesteps)
         meal_attn_out, self_attn = self.encoder(
-            meal_token_emb,
+            filtered_meal_token_emb,
             src_key_padding_mask=pad_mask,
             need_weights=return_self_attn
         )
 
         # Use the aggregator token's output as the "meal embedding"
-        meal_timestep_emb = meal_attn_out[:, 0, :]  # => (B*T, hidden_dim)
+        filtered_meal_emb = meal_attn_out[:, 0, :]  # => (N_non_empty, hidden_dim)
+        
+        # Create the full meal embeddings tensor filled with zeros
+        meal_timestep_emb = torch.zeros(B * T, self.hidden_dim, device=meal_token_emb.device)
+        
+        # Place the computed embeddings in the right positions
+        meal_timestep_emb[non_empty_indices] = filtered_meal_emb
+        
+        # Reshape to (B, T, hidden_dim)
         meal_timestep_emb = meal_timestep_emb.view(B, T, self.hidden_dim)
         
-        # Apply timestep mask to zero out invalid timesteps
+        # Apply timestep mask if provided
         if mask is not None:
             meal_timestep_emb = meal_timestep_emb * mask.unsqueeze(-1).float()
         
-        if self_attn is not None:
-            # Reshape the attention weights to (B, T, M+1, M+1)
-            self_attn = self_attn.view(B, T, self_attn.size(-2), self_attn.size(-1))
+        # Process attention weights if needed
+        if self_attn is not None and return_self_attn:
+            # Create a full attention tensor filled with zeros
+            full_self_attn = torch.zeros(
+                B * T, self_attn.size(-2), self_attn.size(-1), 
+                device=self_attn.device
+            )
+            
+            # Place the computed attention weights in the right positions
+            full_self_attn[non_empty_indices] = self_attn
+            
+            # Reshape to (B, T, M+1, M+1)
+            self_attn = full_self_attn.view(B, T, self_attn.size(-2), self_attn.size(-1))
         
         return meal_timestep_emb, self_attn
 
