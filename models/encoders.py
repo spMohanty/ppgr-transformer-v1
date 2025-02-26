@@ -84,6 +84,7 @@ class MealEncoder(nn.Module):
         self,
         meal_ids: torch.LongTensor,
         meal_macros: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
         return_self_attn: bool = False
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -92,6 +93,7 @@ class MealEncoder(nn.Module):
         Args:
             meal_ids: (B, T, M) with each M being item indices in that meal
             meal_macros: (B, T, M, food_macro_dim) macro features for each item
+            mask: (B, T) boolean mask where True indicates valid timesteps
             return_self_attn: If True, returns self-attention weights (only works in "set" mode)
             
         Returns:
@@ -121,20 +123,26 @@ class MealEncoder(nn.Module):
         
         # Process with the chosen aggregator strategy
         if self.aggregator_type == "sum":
-            return self._process_sum_aggregator(meal_token_emb, B, T)
+            return self._process_sum_aggregator(meal_token_emb, B, T, mask)
         elif self.aggregator_type == "set":
-            return self._process_set_aggregator(meal_token_emb, meal_ids_flat, B, T, return_self_attn)
+            return self._process_set_aggregator(meal_token_emb, meal_ids_flat, B, T, mask, return_self_attn)
         else:
             raise ValueError(f"Invalid aggregator_type='{self.aggregator_type}'. Use 'set' or 'sum' only.")
 
-    def _process_sum_aggregator(self, meal_token_emb, B, T):
+    def _process_sum_aggregator(self, meal_token_emb, B, T, mask=None):
         """Process using simple summation aggregator."""
         # Simple sum over items
-        meal_timestep_emb = meal_token_emb.sum(dim=1)
+        meal_timestep_emb = meal_token_emb.sum(dim=1)  # (B*T, hidden_dim)
         meal_timestep_emb = meal_timestep_emb.view(B, T, self.hidden_dim)
+        
+        # Apply mask if provided
+        if mask is not None:
+            # Zero out invalid timesteps
+            meal_timestep_emb = meal_timestep_emb * mask.unsqueeze(-1).float()
+        
         return meal_timestep_emb, None
 
-    def _process_set_aggregator(self, meal_token_emb, meal_ids_flat, B, T, return_self_attn):
+    def _process_set_aggregator(self, meal_token_emb, meal_ids_flat, B, T, mask=None, return_self_attn=False):
         """Process using transformer-based set aggregator."""
         if self.encoder is None:
             raise ValueError("aggregator_type='set' requires a defined self.encoder, but it is None.")
@@ -148,6 +156,20 @@ class MealEncoder(nn.Module):
         pad_mask = (meal_ids_flat == 0)  # shape (B*T, M)
         zero_col = torch.zeros(B * T, 1, dtype=torch.bool, device=pad_mask.device)
         pad_mask = torch.cat([zero_col, pad_mask], dim=1)  # => (B*T, M+1)
+        
+        # Incorporate timestep mask if provided
+        if mask is not None:
+            # Reshape mask to match the flattened structure
+            timestep_mask = mask.view(B * T).unsqueeze(1)  # (B*T, 1)
+            
+            # Expand to match the meal items + aggregator token
+            timestep_mask = timestep_mask.expand(-1, pad_mask.size(1))  # (B*T, M+1)
+            
+            # Combine with padding mask: mark as padding if either original padding or invalid timestep
+            # For invalid timesteps, keep the aggregator token (first position) valid
+            timestep_mask_combined = ~timestep_mask  # True means positions to ignore
+            timestep_mask_combined[:, 0] = False  # Keep aggregator token valid
+            pad_mask = pad_mask | timestep_mask_combined
 
         # Forward pass through the Transformer
         meal_attn_out, self_attn = self.encoder(
@@ -160,10 +182,14 @@ class MealEncoder(nn.Module):
         meal_timestep_emb = meal_attn_out[:, 0, :]  # => (B*T, hidden_dim)
         meal_timestep_emb = meal_timestep_emb.view(B, T, self.hidden_dim)
         
+        # Apply timestep mask to zero out invalid timesteps
+        if mask is not None:
+            meal_timestep_emb = meal_timestep_emb * mask.unsqueeze(-1).float()
+        
         if self_attn is not None:
             # Reshape the attention weights to (B, T, M+1, M+1)
             self_attn = self_attn.view(B, T, self_attn.size(-2), self_attn.size(-1))
-            
+        
         return meal_timestep_emb, self_attn
 
     def _bootstrap_food_id_embeddings(self, bootstrap_food_id_embeddings: nn.Embedding, freeze_embeddings: bool = True):
@@ -189,14 +215,12 @@ class PatchedGlucoseEncoder(nn.Module):
         num_heads: int = 4, 
         num_layers: int = 1, 
         max_seq_len: int = 100, 
-        add_causal_mask: bool = True, 
         dropout_rate: float = 0.2
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.patch_size = patch_size
         self.patch_stride = patch_stride
-        self.add_causal_mask = add_causal_mask
 
         # Simple linear projection from each patch to embed_dim
         self.patch_proj = nn.Linear(patch_size, embed_dim)
@@ -217,10 +241,11 @@ class PatchedGlucoseEncoder(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(dropout_rate)
 
-    def forward(self, glucose_seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, glucose_seq: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             glucose_seq: (B, T) time series of glucose values
+            mask: (B, T) boolean mask where True indicates valid data points
             
         Returns:
             patch_emb: (B, N_patches, embed_dim) encoded patches
@@ -237,30 +262,51 @@ class PatchedGlucoseEncoder(nn.Module):
         if patches.size(1) == 0:
             patches = F.pad(glucose_seq, (0, self.patch_size - T))[:, None, :]
         
+        # Extract dimensions right away to ensure N_patches is defined
+        B_np, N_patches, _ = patches.shape
+        
         # Get patch indices for positional embeddings
         patch_indices = torch.arange(0, T - self.patch_size + 1, self.patch_stride, device=glucose_seq.device)
         if patch_indices.size(0) == 0:
             patch_indices = torch.tensor([0], device=glucose_seq.device)
+            
+        # 2) Handle masking if provided
+        key_padding_mask = None
+        if mask is not None:
+            # Patchify the mask
+            mask_patches = mask.unfold(1, self.patch_size, self.patch_stride)
+            
+            # Handle edge case where T < patch_size
+            if mask_patches.size(1) == 0:
+                mask_patches = F.pad(mask, (0, self.patch_size - T))[:, None, :]
+            
+            # A patch is valid only if at least one point in it is valid
+            patch_valid = mask_patches.any(dim=2)  # [B, N_patches]
+            
+            # Create key padding mask for transformer (True means positions to IGNORE)
+            key_padding_mask = ~patch_valid  # [B, N_patches]
+            
+            # Apply mask to patches (zero out invalid points)
+            patches = patches * mask_patches.float()
         
-        # 2) Project each patch into embed_dim
-        B_np, N_patches, _ = patches.shape
+        # 3) Project each patch into embed_dim
         patches = patches.reshape(B_np * N_patches, self.patch_size)
-        
-        # Linear projection
         patch_emb = self.patch_proj(patches)  # (B*N_patches, embed_dim)
         patch_emb = self.dropout(patch_emb)
-        patch_emb = patch_emb.view(B_np, N_patches, -1)  # => (B, N_patches, embed_dim)
+        patch_emb = patch_emb.view(B_np, N_patches, self.embed_dim)  # => (B, N_patches, embed_dim)
         
-        # Create a causal mask if needed
-        if self.add_causal_mask:
-            # The mask shape is (N_patches, N_patches)
-            causal_mask = torch.triu(
-                torch.full((N_patches, N_patches), float('-inf')), diagonal=1
-            ).to(glucose_seq.device)
-        else:
-            causal_mask = None
-            
-        # Transformer on patches
-        patch_emb = self.transformer(patch_emb, mask=causal_mask)  # => (B, N_patches, embed_dim)
+        # 4) Handle the masks
+        # Create a standard causal mask (non-batch dimension)
+        causal_mask = torch.triu(
+            torch.full((N_patches, N_patches), float('-inf')), diagonal=1
+        ).to(glucose_seq.device)
+        
+        # Pass only the causal mask - it will be broadcast to all batches automatically
+        # This is key: mask parameter expects shape [seq_len, seq_len] not [batch, seq_len, seq_len]
+        patch_emb = self.transformer(
+            patch_emb,
+            mask=causal_mask,
+            src_key_padding_mask=key_padding_mask.float()
+        )
         
         return patch_emb, patch_indices

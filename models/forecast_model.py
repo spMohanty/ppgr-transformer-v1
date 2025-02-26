@@ -23,6 +23,15 @@ from plot_helpers import plot_meal_self_attention, plot_forecast_examples, plot_
 from dataset import PPGRToMealGlucoseWrapper
 from .losses import quantile_loss, compute_iAUC, unscale_tensor
 
+class TimeEmbedding(nn.Module):
+    """Embedding layer that handles negative indices by adding an offset."""
+    def __init__(self, num_embeddings, embedding_dim, offset):
+        super().__init__()
+        self.offset = offset
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        
+    def forward(self, x):
+        return self.embedding(x + self.offset)
 
 class MealGlucoseForecastModel(pl.LightningModule):
     """
@@ -69,7 +78,9 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self._init_decoder(config)
         
         # Future time query embeddings for each forecast horizon step
-        self.future_time_queries = nn.Embedding(config.prediction_length, config.hidden_dim)
+        self.future_time_queries = nn.Embedding(config.prediction_length + 1, config.hidden_dim)
+        # NOTE: we are adding 1 to the prediction length, as we want to stay consistent and use 1-indexed values for future time points
+        # So basically, the embedding for 0 is not really used here. todo: see if refactoring this makes sense.
 
         # Final projection: hidden_dim -> num_quantiles
         self.forecast_linear = nn.Linear(config.hidden_dim, config.num_quantiles)
@@ -78,8 +89,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.register_buffer("quantiles", torch.linspace(0.05, 0.95, steps=config.num_quantiles))
         
         # Global time-based positional embedding
-        max_time = config.min_encoder_length + config.prediction_length + 2000  # a safe upper bound
-        self.time_emb = nn.Embedding(max_time, config.hidden_dim)
+        self._init_positional_embeddings(config)
         
         # Initialize tracking variables for plotting
         self.example_forecasts = None
@@ -88,6 +98,15 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.example_meal_self_attn_past = None
         self.example_meal_self_attn_future = None
         
+    def _init_positional_embeddings(self, config: ExperimentConfig) -> None:
+        """Initialize the positional embeddings."""
+        max_encoder_length = config.max_encoder_length
+        max_prediction_length = config.prediction_length
+        total_range = max_encoder_length + max_prediction_length + 100  # a safe upper bound
+        
+        # Center point will be at max_encoder_length, allowing for negative indices
+        self.time_emb = TimeEmbedding(total_range, config.hidden_dim, offset=max_encoder_length)
+                
     def _init_meal_encoder(self, config: ExperimentConfig) -> None:
         """Initialize the meal encoder component."""
         self.meal_encoder = MealEncoder(
@@ -117,7 +136,6 @@ class MealGlucoseForecastModel(pl.LightningModule):
             num_heads=config.num_heads,
             num_layers=config.transformer_encoder_layers,
             max_seq_len=config.min_encoder_length,
-            add_causal_mask=config.add_glucose_causal_mask,
             dropout_rate=config.dropout_rate
         )
         
@@ -166,28 +184,39 @@ class MealGlucoseForecastModel(pl.LightningModule):
         B = past_glucose.size(0)
         
         # 1) Encode glucose sequence => shape [B, G_patches, hidden_dim]
-        glucose_enc, patch_indices = self.glucose_encoder(past_glucose)
-        
-        # Add positional embeddings to glucose encodings
-        glucose_enc = glucose_enc + self.time_emb(patch_indices)
-        
+        glucose_enc, patch_indices = self.glucose_encoder(past_glucose, mask=encoder_padding_mask)
+                
         # 2) Encode past & future meals
         past_meal_enc, meal_self_attn_past = self.meal_encoder(
-            past_meal_ids, past_meal_macros, return_self_attn=return_meal_self_attn
+            past_meal_ids, past_meal_macros, mask=encoder_padding_mask, return_self_attn=return_meal_self_attn
         )
         future_meal_enc, meal_self_attn_future = self.meal_encoder(
             future_meal_ids, future_meal_macros, return_self_attn=return_meal_self_attn
-        )
+        ) # NOTE: no masks for the future meals
 
+        # Get sequence lengths
         T_past = past_meal_enc.size(1)
         T_future = future_meal_enc.size(1)
 
+
+        max_encoder_length = self.config.max_encoder_length
+
         # 3) Add positional time embeddings
-        # Create indices for each block, placing them contiguously in time
+        # Generate regular time indices
         past_indices = torch.arange(T_past, device=device).unsqueeze(0).expand(B, -1)
         future_indices = torch.arange(T_future, device=device).unsqueeze(0).expand(B, -1) + T_past
-
-        # Add time embeddings
+        # Center indices by subtracting (max_encoder_length - 1) for each batch item
+        # This makes the last valid position have index 0
+        centered_offset = (max_encoder_length - 1) * torch.ones((B, 1), device=device, dtype=torch.long)
+        
+        # Apply centering to all indices
+        past_indices = past_indices - centered_offset
+        patch_indices = patch_indices - centered_offset
+        future_indices = future_indices - centered_offset  # Future will start at index 1
+        
+        # 3) Add positional time embeddings
+        # TimeEmbedding class handles the offset internally
+        glucose_enc = glucose_enc + self.time_emb(patch_indices)
         past_meal_enc = past_meal_enc + self.time_emb(past_indices)
         future_meal_enc = future_meal_enc + self.time_emb(future_indices)
 
@@ -195,12 +224,13 @@ class MealGlucoseForecastModel(pl.LightningModule):
         memory = torch.cat([past_meal_enc, future_meal_enc, glucose_enc], dim=1)
 
         # 5) Prepare query embeddings for each forecast horizon step
-        t_future_indices = torch.arange(self.forecast_horizon, device=device).unsqueeze(0).expand(B, -1)
-        t_future_global_indices = t_future_indices + T_past
-
+        # Make query indices start at 1 (first future position)
+        query_indices = torch.arange(self.forecast_horizon, device=device).unsqueeze(0).expand(B, -1) + 1
+        # NOTE: query_indices also start at 1 (and is same as future_indices)
+        
         # Get query embeddings and add positional encoding
-        query_emb = self.future_time_queries(t_future_indices)  # [B, T_future, hidden_dim]
-        query_emb = query_emb + self.time_emb(t_future_global_indices)
+        query_emb = self.future_time_queries(query_indices)  # [B, T_future, hidden_dim]
+        query_emb = query_emb + self.time_emb(query_indices)
 
         # 6) Decoder: Process queries with the memory
         decoder_output, cross_attn = self.decoder(

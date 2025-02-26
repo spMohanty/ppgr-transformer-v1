@@ -25,7 +25,7 @@ class ExperimentConfig:
     
     # Aggregation
     patch_size: int = 1 * 4 # 1 hour patch size
-    patch_stride: int = 2  # 15 min stride
+    patch_stride: int = 2  # 30 min stride
     
     meal_aggregator_type: str = "set"
 
@@ -59,8 +59,6 @@ class ExperimentConfig:
     num_quantiles: int = 7
     loss_iauc_weight: float = 0.00
     
-    add_glucose_causal_mask: bool = True
-
     # New dropout hyperparameters
     dropout_rate: float = 0.1          # Used for projections, cross-attention, forecast MLP, etc.
     transformer_dropout: float = 0.1   # Used within Transformer layers
