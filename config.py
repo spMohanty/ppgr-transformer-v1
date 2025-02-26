@@ -21,7 +21,7 @@ class ExperimentConfig:
     validation_percentage: float = 0.1
     test_percentage: float = 0.1
     
-    encoder_length_randomization: str = "training_only" # "training_only", "all_sets", "none"
+    encoder_length_randomization: str = "none" # "training_only", "all_sets", "none"
     
     # Aggregation
     patch_size: int = 1 * 4 # 1 hour patch size
@@ -58,6 +58,7 @@ class ExperimentConfig:
     transformer_decoder_layers: int = 2
     transformer_decoder_layers_share_weights: bool = True
     add_residual_connection_before_predictions: bool = False
+    add_residual_connection_before_meal_timestep_embedding: bool = True
     num_quantiles: int = 7
     loss_iauc_weight: float = 0.00
     

@@ -32,7 +32,8 @@ class MealEncoder(nn.Module):
         aggregator_type: str = "set",  # Either "set" or "sum"
         ignore_food_macro_features: bool = False,
         bootstrap_food_id_embeddings: Optional[nn.Embedding] = None,
-        freeze_food_id_embeddings: bool = True
+        freeze_food_id_embeddings: bool = True,
+        add_residual_connection_before_meal_timestep_embedding: bool = True
     ):
         super().__init__()
         self.food_embed_dim = food_embed_dim
@@ -44,7 +45,7 @@ class MealEncoder(nn.Module):
         self.food_group_names = food_group_names
         self.aggregator_type = aggregator_type.lower().strip()
         self.ignore_food_macro_features = ignore_food_macro_features
-
+        self.add_residual_connection_before_meal_timestep_embedding = add_residual_connection_before_meal_timestep_embedding
         # --------------------
         #  Embedding Layers
         # --------------------
@@ -152,10 +153,11 @@ class MealEncoder(nn.Module):
             filtered_meal_emb = meal_token_emb.sum(dim=1)  # (N_non_empty, hidden_dim)
             
         elif self.aggregator_type == "set":
-            # Create simple average representation for residual connection
-            # Mask out padding tokens (where meal_id is 0)
-            item_mask = (filtered_meal_ids != 0).float().unsqueeze(-1)  # (N_non_empty, M, 1)
-            avg_meal_emb = (meal_token_emb * item_mask).sum(dim=1) / (item_mask.sum(dim=1) + 1e-10)  # (N_non_empty, hidden_dim)
+            if self.add_residual_connection_before_meal_timestep_embedding:
+                # Create simple average representation for residual connection
+                # Mask out padding tokens (where meal_id is 0)
+                item_mask = (filtered_meal_ids != 0).float().unsqueeze(-1)  # (N_non_empty, M, 1)
+                avg_meal_emb = (meal_token_emb * item_mask).sum(dim=1) / (item_mask.sum(dim=1) + 1e-10)  # (N_non_empty, hidden_dim)
             
             # Insert aggregator token at position 0
             N_non_empty = meal_token_emb.size(0)
@@ -189,7 +191,9 @@ class MealEncoder(nn.Module):
             transformer_meal_emb = meal_attn_out[:, 0, :]  # => (N_non_empty, hidden_dim)
             
             # Apply residual connection: combine transformer output with average embedding
-            filtered_meal_emb = transformer_meal_emb + avg_meal_emb  # (N_non_empty, hidden_dim)
+            filtered_meal_emb = transformer_meal_emb
+            if self.add_residual_connection_before_meal_timestep_embedding:
+                filtered_meal_emb += avg_meal_emb  # (N_non_empty, hidden_dim)
             
             # Process attention weights if needed
             if attn_weights is not None and return_self_attn:

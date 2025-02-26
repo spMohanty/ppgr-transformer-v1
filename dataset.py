@@ -1014,27 +1014,15 @@ class PPGRTimeSeriesDataset(Dataset):
 
 class PPGRToMealGlucoseWrapper(Dataset):
     """
-    A wrapper that converts a PPGRTimeSeriesDataset sample (returning a dictionary)
-    into the 6-tuple expected by the MealGlucoseForecastModel:
-    
-      (past_glucose, past_meal_ids, past_meal_macros, future_meal_ids, future_meal_macros, future_glucose)
-    
-    Additionally, it estimates:
-      - The maximum number of meals per timestep (`max_meals`)
-      - The total number of food IDs (`num_foods`), using the categorical encoder for "food_id"
-      - The number of nutrient dimensions (`num_nutrients`) from the underlying dataset's `food_reals` list.
-      
-    Assumptions:
-      - The PPGR sample uses meal-level food covariates.
-      - In the food categorical tensor, column index 1 holds the food ID.
-      - In the food real tensor, columns 2:5 (i.e. indices 2,3,4) are used for macronutrients.
-        (You can change these slices as needed, but `num_nutrients` will be derived from the full list
-         available in `ppgr_dataset.food_reals`.)
+    A wrapper that converts a PPGRTimeSeriesDataset sample into the 6-tuple
+    expected by the MealGlucoseForecastModel.
     """
-    def __init__(self, ppgr_dataset: Dataset):
+    def __init__(self, ppgr_dataset: Dataset, cache_size: int = None):
         """
         Args:
             ppgr_dataset (Dataset): An instance of PPGRTimeSeriesDataset.
+            cache_size (int, optional): Maximum number of items to cache. 
+                                       If None, cache all items. Default: None.
         """
         self.ppgr_dataset = ppgr_dataset
         
@@ -1043,6 +1031,19 @@ class PPGRToMealGlucoseWrapper(Dataset):
         
         # Then initialize all attributes
         self._initialize_attributes()
+        
+        self._setup_cache(cache_size=cache_size)
+        self.warmup_cache()
+    
+    def _setup_cache(self, cache_size: int):
+        # Initialize the cache
+        self.cache = {}
+        self.cache_size = cache_size
+        self.cache_hits = 0
+        self.cache_misses = 0
+        
+        # Add a method to report cache stats
+        self.total_requests = 0
 
     def _validate_dataset(self):
         """Validate that the dataset meets all requirements for this wrapper."""
@@ -1100,7 +1101,35 @@ class PPGRToMealGlucoseWrapper(Dataset):
             return x[tuple(slices)]
         
     def __getitem__(self, idx):
-        # Retrieve the original PPGR sample (a dict)
+        """Get a data sample from the dataset, using cache if available."""
+        self.total_requests += 1
+        
+        # Check if the item is in the cache
+        if idx in self.cache:
+            self.cache_hits += 1
+            return self.cache[idx]
+        
+        # If not in cache, compute the item
+        self.cache_misses += 1
+        item = self._compute_item(idx)
+        
+        # Add to cache if cache_size limit allows
+        if self.cache_size is None or len(self.cache) < self.cache_size:
+            self.cache[idx] = item
+        elif self.cache_size > 0:
+            # Optional: implement a replacement policy here if needed
+            # Simple approach: replace a random item
+            if len(self.cache) >= self.cache_size:
+                # Only replace if we've reached capacity
+                key_to_remove = random.choice(list(self.cache.keys()))
+                del self.cache[key_to_remove]
+                self.cache[idx] = item
+        
+        return item
+    
+    def _compute_item(self, idx):
+        """Compute a data sample at idx from scratch."""
+        # Original __getitem__ implementation
         item = self.ppgr_dataset[idx]
         device = self.ppgr_dataset.device
         
@@ -1172,6 +1201,48 @@ class PPGRToMealGlucoseWrapper(Dataset):
                 future_glucose.float(),         # [T_pred]
                 target_scales,         # [2]
                 encoder_length)         # [1]
+    
+    def get_cache_stats(self):
+        """Return statistics about the cache performance."""
+        if self.total_requests == 0:
+            hit_rate = 0
+        else:
+            hit_rate = self.cache_hits / self.total_requests * 100
+            
+        return {
+            "total_requests": self.total_requests,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "hit_rate": f"{hit_rate:.2f}%",
+            "cache_size": len(self.cache),
+            "max_cache_size": self.cache_size
+        }
+    
+    def clear_cache(self):
+        """Clear the cache and reset statistics."""
+        self.cache = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.total_requests = 0
+        
+    def warmup_cache(self, indices=None):
+        """
+        Warmup the cache with specific indices or the entire dataset.
+        
+        Args:
+            indices (list, optional): List of indices to preload. If None, 
+                                     preloads the entire dataset. Default: None.
+        """
+        if indices is None:
+            indices = range(len(self))
+            
+        for i in tqdm(indices, desc="Preloading cache"):
+            if i not in self.cache:
+                if self.cache_size is None or len(self.cache) < self.cache_size:
+                    self.cache[i] = self._compute_item(i)
+                else:
+                    # Cache is full
+                    break
 
 def meal_glucose_collate_fn(batch):
     """
