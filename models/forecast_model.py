@@ -355,7 +355,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             
             # Plot meal self-attention if available
             if hasattr(self, "example_meal_self_attn_past") and hasattr(self, "example_meal_self_attn_future"):
-                fig_meal = plot_meal_self_attention(
+                plotted_indices = plot_meal_self_attention(
                     self.example_meal_self_attn_past,
                     self.example_forecasts["past_meal_ids"],
                     self.example_meal_self_attn_future,
@@ -364,7 +364,6 @@ class MealGlucoseForecastModel(pl.LightningModule):
                     self.global_step,
                     fixed_indices=fixed_indices
                 )
-                plt.close(fig_meal)            
             
             # Plot forecast examples
             fixed_indices, fig = plot_forecast_examples(
