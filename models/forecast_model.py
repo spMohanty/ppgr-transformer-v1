@@ -434,13 +434,11 @@ class MealGlucoseForecastModel(pl.LightningModule):
         if fig_scatter is not None:
             self.logger.experiment.log({
                 f"{phase}_iAUC_eh{self.eval_window}_scatter": wandb.Image(fig_scatter),
-                f"{phase}_iAUC_eh{self.eval_window}_correlation": corr.item(),
             })
             plt.close(fig_scatter)
-        else:
-            self.logger.experiment.log({
-                f"{phase}_iAUC_eh{self.eval_window}_correlation": corr.item()
-            })
+        
+        # Log metrics
+        self.log(f"{phase}_iAUC_eh{self.eval_window}_correlation", corr.item())
         
         # Clear outputs for the next epoch
         setattr(self, f"{phase}_outputs", [])
@@ -647,7 +645,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         Returns:
             Model instance
         """
-        dataset_metadata = dataset[0][-1] # metadata is the last element in the tuple - todo: change this to dict 
+        dataset_metadata = dataset[0]["metadata"] # metadata is the last element in the tuple - todo: change this to dict 
                 
         model = cls(
             config=config,

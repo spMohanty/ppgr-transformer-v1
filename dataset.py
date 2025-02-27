@@ -1076,7 +1076,7 @@ class PPGRToMealGlucoseWrapper(Dataset):
         self._initialize_attributes()
         
         self._setup_cache(cache_size=cache_size)
-        self.warmup_cache()
+        # self.warmup_cache()
     
     def _setup_cache(self, cache_size: int):
         # Initialize the cache
@@ -1186,6 +1186,12 @@ class PPGRToMealGlucoseWrapper(Dataset):
         user_real = item["x_user_real"][0]
         user_microbiome_embedding = item["x_microbiome_embedding"]
         
+        # Temporal Data
+        x_temporal_cat = item["x_temporal_cat"]
+        x_temporal_real = item["x_temporal_real"]
+        y_temporal_cat = item["y_temporal_cat"]
+        y_temporal_real = item["y_temporal_real"]
+        
         # ---------------------------
         # Past (encoder) side:
         # ---------------------------
@@ -1249,6 +1255,10 @@ class PPGRToMealGlucoseWrapper(Dataset):
             "user_categoricals": user_cat, # [num_user_cat_features]
             "user_reals": user_real, # [num_user_real_features]
             "user_microbiome_embeddings": user_microbiome_embedding, # [num_microbiome_features]
+            "x_temporal_cat": x_temporal_cat, # [num_temporal_cat_features]
+            "x_temporal_real": x_temporal_real, # [num_temporal_real_features]
+            "y_temporal_cat": y_temporal_cat, # [num_temporal_cat_features]
+            "y_temporal_real": y_temporal_real, # [num_temporal_real_features]
             "past_glucose": past_glucose.float(),           # [T_enc]
             "past_meal_ids": past_meal_ids,          # [T_enc, max_meals]
             "past_meal_macros": past_meal_macros.float(),       # [T_enc, max_meals, num_nutrients]
@@ -1330,6 +1340,7 @@ def meal_glucose_collate_fn(batch):
     """
     # Extract all lists in a single pass
     keys = ["user_categoricals", "user_reals", "user_microbiome_embeddings", 
+            "x_temporal_cat", "x_temporal_real", "y_temporal_cat", "y_temporal_real",
             "past_glucose", "past_meal_ids", "past_meal_macros", 
             "future_meal_ids", "future_meal_macros", "future_glucose", 
             "target_scales", "encoder_length"]
@@ -1342,6 +1353,11 @@ def meal_glucose_collate_fn(batch):
         for k in keys:
             extracted_data[k].append(item[k])
     
+    # Convert encoder_lengths to a tensor and compute max length
+    encoder_lengths = torch.stack(extracted_data["encoder_length"])
+    max_encoder_len = max(encoder_lengths).item()
+    device = encoder_lengths[0].device    
+    
     # Metadata is the same for all items in the batch
     metadata = batch[0]["metadata"]
     
@@ -1350,12 +1366,21 @@ def meal_glucose_collate_fn(batch):
     user_reals = torch.stack(extracted_data["user_reals"])
     user_microbiome_embeddings = torch.stack(extracted_data["user_microbiome_embeddings"])
     
-    # Convert encoder_lengths to a tensor and compute max length
-    encoder_lengths = torch.stack(extracted_data["encoder_length"])
-    max_encoder_len = max(encoder_lengths).item()
-    device = encoder_lengths[0].device
+    # Pad temporal data
+    x_temporal_cat = torch.nn.utils.rnn.pad_sequence(
+        extracted_data["x_temporal_cat"], batch_first=True, padding_value=0, padding_side="left"
+    )
+    x_temporal_real = torch.nn.utils.rnn.pad_sequence(
+        extracted_data["x_temporal_real"], batch_first=True, padding_value=0, padding_side="left"
+    )
+    y_temporal_cat = torch.nn.utils.rnn.pad_sequence(
+        extracted_data["y_temporal_cat"], batch_first=True, padding_value=0, padding_side="right"
+    )
+    y_temporal_real = torch.nn.utils.rnn.pad_sequence(
+        extracted_data["y_temporal_real"], batch_first=True, padding_value=0, padding_side="right"
+    )
     
-    # Apply left padding directly using pad_sequence
+    # Apply left padding 
     past_glucose_batch = torch.nn.utils.rnn.pad_sequence(
         extracted_data["past_glucose"], batch_first=True, padding_value=0.0, padding_side="left"
     )
@@ -1385,6 +1410,10 @@ def meal_glucose_collate_fn(batch):
         "user_categoricals": user_categoricals,
         "user_reals": user_reals,
         "user_microbiome_embeddings": user_microbiome_embeddings,
+        "x_temporal_cat": x_temporal_cat,
+        "x_temporal_real": x_temporal_real,
+        "y_temporal_cat": y_temporal_cat,
+        "y_temporal_real": y_temporal_real,
         "past_glucose": past_glucose_batch, 
         "past_meal_ids": past_meal_ids_batch, 
         "past_meal_macros": past_meal_macros_batch, 
@@ -1643,6 +1672,12 @@ def create_cached_dataset(
     wrapped_training_dataset = PPGRToMealGlucoseWrapper(training_dataset)
     wrapped_validation_dataset = PPGRToMealGlucoseWrapper(validation_dataset)
     wrapped_test_dataset = PPGRToMealGlucoseWrapper(test_dataset)
+    
+    # Warm up the cache manually by using a dataloader
+    for dataset in [wrapped_training_dataset, wrapped_validation_dataset, wrapped_test_dataset]:
+        dataloader = DataLoader(dataset, batch_size=1024, num_workers=0, collate_fn=meal_glucose_collate_fn)
+        for batch in tqdm(dataloader, desc="Warming up cache"):
+            pass
 
     # Pack everything to cache using torch.save
     cache_dict = {
