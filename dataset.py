@@ -904,7 +904,8 @@ class PPGRTimeSeriesDataset(Dataset):
                 food_reals = self.food_reals,
                 target_columns = self.target_columns,
                 use_meal_level_food_covariates = self.use_meal_level_food_covariates,
-                max_meals_per_timestep = self.max_meals_per_timestep
+                max_meals_per_timestep = self.max_meals_per_timestep,
+                microbiome_embeddings_dim = x_microbiome_embedding.shape[-1] if x_microbiome_embedding is not None else None
             )
         )
                 
@@ -1187,10 +1188,10 @@ class PPGRToMealGlucoseWrapper(Dataset):
         user_microbiome_embedding = item["x_microbiome_embedding"]
         
         # Temporal Data
-        x_temporal_cat = item["x_temporal_cat"]
-        x_temporal_real = item["x_temporal_real"]
-        y_temporal_cat = item["y_temporal_cat"]
-        y_temporal_real = item["y_temporal_real"]
+        past_temporal_cat = item["x_temporal_cat"]
+        past_temporal_real = item["x_temporal_real"]
+        future_temporal_cat = item["y_temporal_cat"]
+        future_temporal_real = item["y_temporal_real"]
         
         # ---------------------------
         # Past (encoder) side:
@@ -1255,10 +1256,10 @@ class PPGRToMealGlucoseWrapper(Dataset):
             "user_categoricals": user_cat, # [num_user_cat_features]
             "user_reals": user_real, # [num_user_real_features]
             "user_microbiome_embeddings": user_microbiome_embedding, # [num_microbiome_features]
-            "x_temporal_cat": x_temporal_cat, # [num_temporal_cat_features]
-            "x_temporal_real": x_temporal_real, # [num_temporal_real_features]
-            "y_temporal_cat": y_temporal_cat, # [num_temporal_cat_features]
-            "y_temporal_real": y_temporal_real, # [num_temporal_real_features]
+            "past_temporal_categoricals": past_temporal_cat, # [num_temporal_cat_features]
+            "past_temporal_reals": past_temporal_real, # [num_temporal_real_features]
+            "future_temporal_categoricals": future_temporal_cat, # [num_temporal_cat_features]
+            "future_temporal_reals": future_temporal_real, # [num_temporal_real_features]
             "past_glucose": past_glucose.float(),           # [T_enc]
             "past_meal_ids": past_meal_ids,          # [T_enc, max_meals]
             "past_meal_macros": past_meal_macros.float(),       # [T_enc, max_meals, num_nutrients]
@@ -1340,7 +1341,7 @@ def meal_glucose_collate_fn(batch):
     """
     # Extract all lists in a single pass
     keys = ["user_categoricals", "user_reals", "user_microbiome_embeddings", 
-            "x_temporal_cat", "x_temporal_real", "y_temporal_cat", "y_temporal_real",
+            "past_temporal_categoricals", "past_temporal_reals", "future_temporal_categoricals", "future_temporal_reals",
             "past_glucose", "past_meal_ids", "past_meal_macros", 
             "future_meal_ids", "future_meal_macros", "future_glucose", 
             "target_scales", "encoder_length"]
@@ -1367,17 +1368,17 @@ def meal_glucose_collate_fn(batch):
     user_microbiome_embeddings = torch.stack(extracted_data["user_microbiome_embeddings"])
     
     # Pad temporal data
-    x_temporal_cat = torch.nn.utils.rnn.pad_sequence(
-        extracted_data["x_temporal_cat"], batch_first=True, padding_value=0, padding_side="left"
+    past_temporal_categoricals = torch.nn.utils.rnn.pad_sequence(
+        extracted_data["past_temporal_categoricals"], batch_first=True, padding_value=0, padding_side="left"
     )
-    x_temporal_real = torch.nn.utils.rnn.pad_sequence(
-        extracted_data["x_temporal_real"], batch_first=True, padding_value=0, padding_side="left"
+    past_temporal_reals = torch.nn.utils.rnn.pad_sequence(
+        extracted_data["past_temporal_reals"], batch_first=True, padding_value=0, padding_side="left"
     )
-    y_temporal_cat = torch.nn.utils.rnn.pad_sequence(
-        extracted_data["y_temporal_cat"], batch_first=True, padding_value=0, padding_side="right"
+    future_temporal_categoricals = torch.nn.utils.rnn.pad_sequence(
+        extracted_data["future_temporal_categoricals"], batch_first=True, padding_value=0, padding_side="right"
     )
-    y_temporal_real = torch.nn.utils.rnn.pad_sequence(
-        extracted_data["y_temporal_real"], batch_first=True, padding_value=0, padding_side="right"
+    future_temporal_reals = torch.nn.utils.rnn.pad_sequence(
+        extracted_data["future_temporal_reals"], batch_first=True, padding_value=0, padding_side="right"
     )
     
     # Apply left padding 
@@ -1410,10 +1411,10 @@ def meal_glucose_collate_fn(batch):
         "user_categoricals": user_categoricals,
         "user_reals": user_reals,
         "user_microbiome_embeddings": user_microbiome_embeddings,
-        "x_temporal_cat": x_temporal_cat,
-        "x_temporal_real": x_temporal_real,
-        "y_temporal_cat": y_temporal_cat,
-        "y_temporal_real": y_temporal_real,
+        "past_temporal_categoricals": past_temporal_categoricals,
+        "past_temporal_reals": past_temporal_reals,
+        "future_temporal_categoricals": future_temporal_categoricals,
+        "future_temporal_reals": future_temporal_reals,
         "past_glucose": past_glucose_batch, 
         "past_meal_ids": past_meal_ids_batch, 
         "past_meal_macros": past_meal_macros_batch, 

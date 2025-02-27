@@ -16,7 +16,7 @@ from loguru import logger
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-from .encoders import UserEncoder, MealEncoder, PatchedGlucoseEncoder
+from .encoders import UserEncoder, MealEncoder, PatchedGlucoseEncoder, TemporalEncoder
 from .transformer_blocks import TransformerDecoderLayer, TransformerDecoder
 from config import ExperimentConfig
 from plot_helpers import plot_meal_self_attention, plot_forecast_examples, plot_iAUC_scatter
@@ -77,6 +77,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # Initialize component models
         self._init_user_encoder(config, dataset_metadata)
+        self._init_temporal_encoder(config, dataset_metadata)
         self._init_meal_encoder(config)
         self._init_glucose_encoder(config)
         self._init_decoder(config)
@@ -115,6 +116,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Get sizes of categorical variables        
         user_static_categoricals = dataset_metadata["user_static_categoricals"]
         user_static_reals = dataset_metadata["user_static_reals"]
+        # user_microbiome_embeddings_dim = dataset_metadata["user_microbiome_embeddings_dim"]
 
         categorical_variable_sizes = {}
         for cat in user_static_categoricals:
@@ -124,11 +126,31 @@ class MealGlucoseForecastModel(pl.LightningModule):
             categorical_variable_sizes=categorical_variable_sizes,
             real_variables=user_static_reals,
             hidden_dim=config.hidden_dim,
+            output_dim=config.hidden_dim,
+            dropout_rate=config.dropout_rate,
+            use_batch_norm=True,
+        )
+
+    def _init_temporal_encoder(self, config: ExperimentConfig, dataset_metadata: Dict[str, Any]) -> None:
+        """Initialize the temporal encoder component."""
+        # Get sizes of temporal categorical variables
+        temporal_categoricals = dataset_metadata.get("temporal_categoricals", [])
+        temporal_reals = dataset_metadata.get("temporal_reals", [])
+        
+        categorical_variable_sizes = {}
+        for cat in temporal_categoricals:
+            categorical_variable_sizes[cat] = len(dataset_metadata["categorical_encoders"][cat].classes_)
+        
+        self.temporal_encoder = TemporalEncoder(
+            categorical_variable_sizes=categorical_variable_sizes,
+            real_variables=temporal_reals,
+            hidden_dim=config.hidden_dim,
             dropout_rate=config.dropout_rate,
             use_batch_norm=True
         )
         
-                
+
+           
     def _init_meal_encoder(self, config: ExperimentConfig) -> None:
         """Initialize the meal encoder component."""
         self.meal_encoder = MealEncoder(
@@ -207,6 +229,11 @@ class MealGlucoseForecastModel(pl.LightningModule):
         encoder_padding_mask = batch["encoder_padding_mask"] # [B, T_past]
         metadata = batch["metadata"] # Dict with metadata
         
+        # Unpack temporal features if available
+        past_temporal_categoricals = batch["past_temporal_categoricals"]  # [B, T_past, num_temporal_cat_features]
+        past_temporal_reals = batch["past_temporal_reals"]                # [B, T_past, num_temporal_real_features]
+        future_temporal_categoricals = batch["future_temporal_categoricals"]  # [B, T_future, num_temporal_cat_features]
+        future_temporal_reals = batch["future_temporal_reals"]                # [B, T_future, num_temporal_real_features]
         
         device = past_glucose.device
         B = past_glucose.size(0)
@@ -226,6 +253,19 @@ class MealGlucoseForecastModel(pl.LightningModule):
             future_meal_ids, future_meal_macros, return_self_attn=return_meal_self_attn
         ) # NOTE: no masks for the future meals
 
+        # 3) Encode temporal features if available
+        # have_temporal_features = (past_temporal_categoricals is not None and past_temporal_reals is not None and
+        #                          future_temporal_categoricals is not None and future_temporal_reals is not None)
+        past_temporal_enc = self.temporal_encoder(
+            past_temporal_categoricals,
+            past_temporal_reals,
+            mask=encoder_padding_mask
+        )
+        future_temporal_enc = self.temporal_encoder(
+            future_temporal_categoricals,
+            future_temporal_reals
+        ) # No mask for future
+        
         # Get sequence lengths
         T_past = past_meal_enc.size(1)
         T_future = future_meal_enc.size(1)
@@ -242,9 +282,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         future_meal_enc = future_meal_enc + user_emb_future  # Add user context to future meals
         glucose_enc = glucose_enc + user_emb_patches  # Add user context to glucose patches
 
-
-        # 3) Add positional time embeddings
-        # Generate regular time indices
+        # 4) Generate time indices for positional embeddings
+        # Regular time indices
         past_indices = torch.arange(T_past, device=device).unsqueeze(0).expand(B, -1)
         future_indices = torch.arange(T_future, device=device).unsqueeze(0).expand(B, -1) + T_past
         # Center indices by subtracting (max_encoder_length - 1) for each batch item
@@ -256,32 +295,36 @@ class MealGlucoseForecastModel(pl.LightningModule):
         patch_indices = patch_indices - centered_offset
         future_indices = future_indices - centered_offset  # Future will start at index 1
                 
-        # 3) Add positional time embeddings
+        # 5) Add positional time embeddings
         # TimeEmbedding class handles the offset internally
         glucose_enc = glucose_enc + self.time_emb(patch_indices)
         past_meal_enc = past_meal_enc + self.time_emb(past_indices)
         future_meal_enc = future_meal_enc + self.time_emb(future_indices)
+        
+        # 6) Combine all encodings in a single "memory" sequence
+        memory = torch.cat([
+            past_meal_enc, future_meal_enc, 
+            past_temporal_enc,
+            glucose_enc
+        ], dim=1)
 
-        # 4) Combine all encodings in a single "memory" sequence
-        memory = torch.cat([past_meal_enc, future_meal_enc, glucose_enc], dim=1)
-
-        # 5) Prepare query embeddings for each forecast horizon step
+        # 7) Prepare query embeddings for each forecast horizon step
         # Make query indices start at 1 (first future position)
         query_indices = torch.arange(self.forecast_horizon, device=device).unsqueeze(0).expand(B, -1) + 1
         # NOTE: query_indices also start at 1 (and is same as future_indices)
         
         # Get query embeddings and add positional encoding
         query_emb = self.future_time_queries(query_indices)  # [B, T_future, hidden_dim]
-        query_emb = query_emb + self.time_emb(query_indices)
+        query_emb = query_emb + self.time_emb(query_indices) + future_temporal_enc
 
-        # 6) Decoder: Process queries with the memory
+        # 8) Decoder: Process queries with the memory
         decoder_output, cross_attn = self.decoder(
             tgt=query_emb,
             memory=memory,
             return_attn=return_attn
         )
 
-        # 7) Extract attention weights for past and future if needed
+        # 9) Extract attention weights for past and future if needed
         attn_past = None
         attn_future = None
         if cross_attn is not None:
@@ -291,11 +334,9 @@ class MealGlucoseForecastModel(pl.LightningModule):
             attn_past = cross_attn[:, :, :past_len]  # => [B, T_future, past_len]
             attn_future = cross_attn[:, :, past_len : past_len + future_len]
 
-
         # Force full precision for the residual connection
         with torch.amp.autocast("cuda", enabled=False):
-
-            # 8) Final projection to get quantile predictions
+            # 10) Final projection to get quantile predictions
             pred_future = self.forecast_linear(decoder_output)
 
             # Add residual connection if configured
@@ -333,7 +374,11 @@ class MealGlucoseForecastModel(pl.LightningModule):
         user_categoricals = batch["user_categoricals"]
         user_reals = batch["user_reals"]
         user_microbiome_embeddings = batch["user_microbiome_embeddings"]        
-        past_glucose = batch["past_glucose"]         
+        past_temporal_categoricals = batch["past_temporal_categoricals"]
+        past_temporal_reals = batch["past_temporal_reals"]
+        future_temporal_categoricals = batch["future_temporal_categoricals"]
+        future_temporal_reals = batch["future_temporal_reals"]
+        past_glucose = batch["past_glucose"]
         past_meal_ids = batch["past_meal_ids"]
         past_meal_macros = batch["past_meal_macros"]
         future_meal_ids = batch["future_meal_ids"]
@@ -438,7 +483,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             plt.close(fig_scatter)
         
         # Log metrics
-        self.log(f"{phase}_iAUC_eh{self.eval_window}_correlation", corr.item())
+        self.logger.experiment.log({f"{phase}_iAUC_eh{self.eval_window}_correlation": corr.item()})
         
         # Clear outputs for the next epoch
         setattr(self, f"{phase}_outputs", [])
@@ -475,6 +520,10 @@ class MealGlucoseForecastModel(pl.LightningModule):
         user_categoricals = batch["user_categoricals"]
         user_reals = batch["user_reals"]
         user_microbiome_embeddings = batch["user_microbiome_embeddings"]
+        past_temporal_categoricals = batch["past_temporal_categoricals"]
+        past_temporal_reals = batch["past_temporal_reals"]
+        future_temporal_categoricals = batch["future_temporal_categoricals"]
+        future_temporal_reals = batch["future_temporal_reals"]
         past_glucose = batch["past_glucose"]         
         past_meal_ids = batch["past_meal_ids"]
         past_meal_macros = batch["past_meal_macros"]

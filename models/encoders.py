@@ -28,6 +28,7 @@ class UserEncoder(nn.Module):
         categorical_variable_sizes: Dict[str, int],
         real_variables: List[str],
         hidden_dim: int,
+        output_dim: int,
         dropout_rate: float = 0.1,
         use_batch_norm: bool = True
     ):
@@ -36,6 +37,7 @@ class UserEncoder(nn.Module):
         self.categorical_variable_sizes = categorical_variable_sizes
         self.real_variables = real_variables
         self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
         self.num_cat_features = len(categorical_variable_sizes)
         self.num_real_features = len(real_variables)
         
@@ -54,8 +56,8 @@ class UserEncoder(nn.Module):
             nn.Linear(hidden_dim * (self.num_cat_features + 1), hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim)
+            nn.Linear(hidden_dim, output_dim),
+            nn.LayerNorm(output_dim)
         )
         
         self.dropout = nn.Dropout(dropout_rate)
@@ -431,3 +433,123 @@ class PatchedGlucoseEncoder(nn.Module):
         )
         
         return patch_emb, attn_weights, patch_indices
+
+class TemporalEncoder(nn.Module):
+    """
+    Encodes temporal features (both categorical and real-valued) at each timestep.
+    
+    Args:
+        categorical_variable_sizes: Dictionary mapping categorical variable names to their vocabulary sizes
+        real_variables: List of names for real-valued variables
+        hidden_dim: Dimension of the output embeddings
+        dropout_rate: Dropout rate for regularization
+        use_batch_norm: Whether to apply batch normalization to real variables
+    """
+    def __init__(
+        self,
+        categorical_variable_sizes: Dict[str, int],
+        real_variables: List[str],
+        hidden_dim: int,
+        dropout_rate: float = 0.1,
+        use_batch_norm: bool = True
+    ):
+        super().__init__()
+        
+        self.categorical_variable_sizes = categorical_variable_sizes
+        self.real_variables = real_variables
+        self.hidden_dim = hidden_dim
+        self.num_cat_features = len(categorical_variable_sizes)
+        self.num_real_features = len(real_variables)
+        
+        # Individual embeddings for each categorical feature
+        self.cat_embeddings = nn.ModuleList([
+            nn.Embedding(size, hidden_dim)
+            for size in categorical_variable_sizes.values()
+        ])
+        
+        # Simple processing for real variables
+        self.real_projection = nn.Linear(self.num_real_features, hidden_dim)
+        self.batch_norm = nn.BatchNorm1d(hidden_dim) if use_batch_norm else nn.Identity()
+        
+        # Simple feed-forward network for final projection
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_dim * (self.num_cat_features + 1), hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim)
+        )
+        
+        self.dropout = nn.Dropout(dropout_rate)
+        
+    def forward(self, 
+                temporal_categoricals: Optional[torch.Tensor] = None, 
+                temporal_reals: Optional[torch.Tensor] = None,
+                mask: Optional[torch.Tensor] = None
+               ) -> torch.Tensor:
+        """
+        Forward pass of the temporal encoder.
+        
+        Args:
+            temporal_categoricals: Tensor of shape (batch_size, seq_length, num_categorical_features) or None
+            temporal_reals: Tensor of shape (batch_size, seq_length, num_real_features) or None
+            mask: Optional mask of shape (batch_size, seq_length) where True indicates valid timesteps
+            
+        Returns:
+            temporal_embeddings: Tensor of shape (batch_size, seq_length, hidden_dim)
+        """
+        # Check if at least one input is provided
+        if temporal_categoricals is None and temporal_reals is None:
+            raise ValueError("Both temporal_categoricals and temporal_reals cannot be None")
+        
+        # Determine batch_size and seq_length from non-None input
+        if temporal_categoricals is not None:
+            batch_size, seq_length, _ = temporal_categoricals.size()
+            device = temporal_categoricals.device
+        else:
+            batch_size, seq_length, _ = temporal_reals.size()
+            device = temporal_reals.device
+        
+        # Process categorical variables
+        cat_embeddings_list = []
+        if temporal_categoricals is not None:
+            # Reshape to process all timesteps at once
+            cat_flat = temporal_categoricals.reshape(batch_size * seq_length, -1)
+            
+            for i, embedding_layer in enumerate(self.cat_embeddings):
+                cat_feature = cat_flat[:, i].long()
+                cat_embeddings_list.append(embedding_layer(cat_feature))
+        
+        # Process real variables
+        if self.num_real_features > 0 and temporal_reals is not None:
+            real_flat = temporal_reals.reshape(batch_size * seq_length, -1)
+            real_values = real_flat.float()  # [batch_size * seq_length, num_reals]
+            real_embeddings = self.real_projection(real_values)
+            
+            # For batch norm, reshape to [batch_size * seq_length, hidden_dim]
+            if isinstance(self.batch_norm, nn.BatchNorm1d):
+                real_embeddings = self.batch_norm(real_embeddings)
+        else:
+            real_embeddings = torch.zeros(batch_size * seq_length, self.hidden_dim, device=device)
+        
+        # Combine all embeddings
+        if not cat_embeddings_list:
+            # If no categorical embeddings, just use real embeddings
+            combined = real_embeddings
+        else:
+            # Otherwise combine categorical and real embeddings
+            all_embeddings = cat_embeddings_list + [real_embeddings]
+            combined = torch.cat(all_embeddings, dim=1)
+        
+        # Project to final embedding
+        temporal_embeddings_flat = self.projection(combined)
+        temporal_embeddings_flat = self.dropout(temporal_embeddings_flat)
+        
+        # Reshape back to sequence form
+        temporal_embeddings = temporal_embeddings_flat.reshape(batch_size, seq_length, self.hidden_dim)
+        
+        # Apply mask if provided
+        if mask is not None:
+            temporal_embeddings = temporal_embeddings * mask.unsqueeze(-1).float()
+        
+        return temporal_embeddings
