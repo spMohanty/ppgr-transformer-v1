@@ -1283,59 +1283,39 @@ class PPGRToMealGlucoseWrapper(Dataset):
         self.cache_misses = 0
         self.total_requests = 0
         
-    def warmup_cache(self, indices=None, num_workers=8, batch_size=1024*20):
+    def warmup_cache(self, indices=None):
         """
-        Warmup the cache with specific indices using PyTorch DataLoader for efficient parallel processing.
+        Simple serial warmup of the cache.
         
         Args:
             indices (list, optional): List of indices to preload. If None, 
                                     preloads the entire dataset. Default: None.
-            num_workers (int, optional): Number of parallel workers. Default: 8.
-            batch_size (int, optional): Batch size for the DataLoader. Default: 2048.
         """
-        import concurrent.futures
-        
         if indices is None:
             indices = list(range(len(self)))
         
         # Filter out indices that are already in the cache
         indices_to_compute = [i for i in indices if i not in self.cache]
         
-        # Don't process if there's nothing to do or we've reached cache size limit
-        if not indices_to_compute or (self.cache_size is not None and len(self.cache) >= self.cache_size):
-            logger.info("No items to cache or cache is full.")
+        # Skip if nothing to compute or cache is full
+        if not indices_to_compute:
+            logger.info("No items to cache.")
             return
         
-        # Limit the number of items to compute based on remaining cache space
+        # Limit number of items if we have a cache size limit
         if self.cache_size is not None:
             remaining_space = self.cache_size - len(self.cache)
+            if remaining_space <= 0:
+                logger.info("Cache is full.")
+                return
             indices_to_compute = indices_to_compute[:remaining_space]
         
-        logger.info(f"Warming up cache for {len(indices_to_compute)} items using {num_workers} workers")
+        # Simple progress bar
+        logger.info(f"Warming up cache for {len(indices_to_compute)} items")
+        for idx in tqdm(indices_to_compute, desc="Warming up cache"):
+            self.cache[idx] = self._compute_item(idx)
         
-        # Process in batches for better progress tracking
-        batch_indices = [indices_to_compute[i:i+batch_size] for i in range(0, len(indices_to_compute), batch_size)]
-        
-        for batch_idx, batch in enumerate(batch_indices):
-            logger.info(f"Processing batch {batch_idx+1}/{len(batch_indices)} ({len(batch)} items)")
-            
-            # Create a ThreadPoolExecutor to process items in parallel
-            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-                # Submit all computations to the executor
-                future_to_idx = {executor.submit(self._compute_item, idx): idx for idx in batch}
-                
-                # Process results as they complete
-                for future in tqdm(concurrent.futures.as_completed(future_to_idx), 
-                                total=len(batch), 
-                                desc=f"Warming up Cache::Batch {batch_idx+1}/{len(batch_indices)}"):
-                    idx = future_to_idx[future]
-                    try:
-                        item = future.result()
-                        self.cache[idx] = item
-                    except Exception as exc:
-                        logger.error(f"Item {idx} generated an exception: {exc}")
-        
-        logger.info(f"Cache warmup complete. Total items in cache: {len(self.cache)}")
+        logger.info(f"Cache warmup complete. {len(self.cache)} items in cache.")
 
 def meal_glucose_collate_fn(batch):
     """
