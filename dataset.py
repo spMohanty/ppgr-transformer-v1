@@ -1245,19 +1245,20 @@ class PPGRToMealGlucoseWrapper(Dataset):
     
         metadata = item["metadata"]
         # Return the 6-tuple.
-        return (
-                user_cat, # [num_user_cat_features]
-                user_real, # [num_user_real_features]
-                user_microbiome_embedding, # [num_microbiome_features]
-                past_glucose.float(),           # [T_enc]
-                past_meal_ids,          # [T_enc, max_meals]
-                past_meal_macros.float(),       # [T_enc, max_meals, num_nutrients]
-                future_meal_ids,        # [T_pred, max_meals]
-                future_meal_macros.float(),     # [T_pred, max_meals, num_nutrients]
-                future_glucose.float(),         # [T_pred]
-                target_scales,         # [2]
-                encoder_length,         # [1]
-                metadata)         # Dict with metadata
+        return {
+            "user_categoricals": user_cat, # [num_user_cat_features]
+            "user_reals": user_real, # [num_user_real_features]
+            "user_microbiome_embeddings": user_microbiome_embedding, # [num_microbiome_features]
+            "past_glucose": past_glucose.float(),           # [T_enc]
+            "past_meal_ids": past_meal_ids,          # [T_enc, max_meals]
+            "past_meal_macros": past_meal_macros.float(),       # [T_enc, max_meals, num_nutrients]
+            "future_meal_ids": future_meal_ids,        # [T_pred, max_meals]
+            "future_meal_macros": future_meal_macros.float(),     # [T_pred, max_meals, num_nutrients]
+            "future_glucose": future_glucose.float(),         # [T_pred]
+            "target_scales": target_scales,         # [2]
+            "encoder_length": encoder_length,         # [1]
+            "metadata": metadata         # Dict with metadata
+        }
     
     def get_cache_stats(self):
         """Return statistics about the cache performance."""
@@ -1342,59 +1343,65 @@ def meal_glucose_collate_fn(batch):
     encoder sequences with left padding.
     
     Args:
-        batch: A list of tuples from PPGRToMealGlucoseWrapper.__getitem__
+        batch: A list of dictionaries from PPGRToMealGlucoseWrapper.__getitem__
         
     Returns:
-        A tuple of padded tensors ready for the model.
+        A dictionary of padded tensors ready for the model.
     """
-    # Unpack the batch into separate lists
-    user_cat_list, user_real_list, user_microbiome_embedding_list, past_glucose_list, past_meal_ids_list, past_meal_macros_list, future_meal_ids_list, \
-    future_meal_macros_list, future_glucose_list, target_scales_list, encoder_lengths, metadata_list = zip(*batch)
+    # Extract all lists in a single pass
+    keys = ["user_categoricals", "user_reals", "user_microbiome_embeddings", 
+            "past_glucose", "past_meal_ids", "past_meal_macros", 
+            "future_meal_ids", "future_meal_macros", "future_glucose", 
+            "target_scales", "encoder_length"]
     
-    # Metadata
-    metadata = metadata_list[0] # metadata is the same for all items in the batch
+    # Initialize empty lists for each key
+    extracted_data = {k: [] for k in keys}
     
-    # Stack user data
-    user_categoricals = torch.stack(user_cat_list)
-    user_reals = torch.stack(user_real_list)
-    user_microbiome_embeddings = torch.stack(user_microbiome_embedding_list)
-    # Convert encoder_lengths to a tensor
-    encoder_lengths = torch.stack(encoder_lengths)
+    # Extract values in a single loop
+    for item in batch:
+        for k in keys:
+            extracted_data[k].append(item[k])
+    
+    # Metadata is the same for all items in the batch
+    metadata = batch[0]["metadata"]
+    
+    # Convert back to individual variables for clarity
+    user_categoricals = torch.stack(extracted_data["user_categoricals"])
+    user_reals = torch.stack(extracted_data["user_reals"])
+    user_microbiome_embeddings = torch.stack(extracted_data["user_microbiome_embeddings"])
+    
+    # Convert encoder_lengths to a tensor and compute max length
+    encoder_lengths = torch.stack(extracted_data["encoder_length"])
     max_encoder_len = max(encoder_lengths).item()
     device = encoder_lengths[0].device
-        
+    
     # Apply left padding directly using pad_sequence
     past_glucose_batch = torch.nn.utils.rnn.pad_sequence(
-        past_glucose_list, batch_first=True, padding_value=0.0, padding_side="left"
+        extracted_data["past_glucose"], batch_first=True, padding_value=0.0, padding_side="left"
     )
     
     past_meal_ids_batch = torch.nn.utils.rnn.pad_sequence(
-        past_meal_ids_list, batch_first=True, padding_value=0, padding_side="left"
+        extracted_data["past_meal_ids"], batch_first=True, padding_value=0, padding_side="left"
     )
     
     past_meal_macros_batch = torch.nn.utils.rnn.pad_sequence(
-        past_meal_macros_list, batch_first=True, padding_value=0, padding_side="left"
-    )    
-            
+        extracted_data["past_meal_macros"], batch_first=True, padding_value=0, padding_side="left"
+    )
+    
     # Future sequences should all have the same length, so we can just stack them
-    future_glucose_batch = torch.stack(future_glucose_list)
-    future_meal_ids_batch = torch.stack(future_meal_ids_list)
-    future_meal_macros_batch = torch.stack(future_meal_macros_list)
+    future_glucose_batch = torch.stack(extracted_data["future_glucose"])
+    future_meal_ids_batch = torch.stack(extracted_data["future_meal_ids"])
+    future_meal_macros_batch = torch.stack(extracted_data["future_meal_macros"])
     
     # Stack target scales
-    target_scales_batch = torch.stack(target_scales_list)
+    target_scales_batch = torch.stack(extracted_data["target_scales"])
     
     # Create encoder padding mask (1 = valid data, 0 = padding)
-    # Create position indices along the time dimension
     positions = torch.arange(max_encoder_len).to(device)
-    
-    # For left padding: mask positions where position_index >= (max_len - sequence_length)
-    # This creates a [batch_size, max_encoder_len] boolean mask
     start_positions = max_encoder_len - encoder_lengths.unsqueeze(1)
     encoder_padding_mask = positions.unsqueeze(0) >= start_positions
     
-    
-    _response = {
+    return {
         "user_categoricals": user_categoricals,
         "user_reals": user_reals,
         "user_microbiome_embeddings": user_microbiome_embeddings,
@@ -1409,8 +1416,7 @@ def meal_glucose_collate_fn(batch):
         "encoder_padding_mask": encoder_padding_mask,
         "metadata": metadata
     }
-    return _response
-    
+
 
 # -----------------------------------------------------------------------------
 # create_cached_dataset function that caches all splits + encoders/scalers
