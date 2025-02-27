@@ -77,7 +77,7 @@ class ExperimentConfig:
 
 
     # Checkpoint Settings
-    disable_checkpoints: bool = True
+    disable_checkpoints: bool = False
     checkpoint_base_dir: str = "/scratch/mohanty/checkpoints/ppgr-meal-representation"  # Directory to save checkpoints
     checkpoint_monitor: str = "val_q_loss"  # Metric to monitor
     checkpoint_mode: str = "min"  # "min" or "max"
@@ -95,7 +95,7 @@ class ExperimentConfig:
     food_embedding_projection_batch_size: int = 1024 * 4
 
     # Plots (default: plots enabled)
-    disable_plots: bool = True
+    disable_plots: bool = False
 
     def __post_init__(self):
         # Set default lists if not provided.

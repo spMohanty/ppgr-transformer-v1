@@ -1,7 +1,7 @@
 """
 Encoders for meal and glucose data.
 """
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import torch
 import torch.nn as nn
@@ -10,6 +10,92 @@ from loguru import logger
 
 from .transformer_blocks import TransformerEncoderLayer, TransformerEncoder
 
+from pytorch_forecasting.models.nn import MultiEmbedding
+
+class UserEncoder(nn.Module):
+    """
+    Simple MLP-based user encoder for static features.
+    
+    Args:
+        categorical_variable_sizes: Dictionary mapping categorical variable names to their vocabulary sizes
+        real_variables: List of names for real-valued variables
+        hidden_dim: Dimension of the output embeddings
+        dropout_rate: Dropout rate for regularization
+        use_batch_norm: Whether to apply batch normalization to real variables
+    """
+    def __init__(
+        self,
+        categorical_variable_sizes: Dict[str, int],
+        real_variables: List[str],
+        hidden_dim: int,
+        dropout_rate: float = 0.1,
+        use_batch_norm: bool = True
+    ):
+        super().__init__()
+        
+        self.categorical_variable_sizes = categorical_variable_sizes
+        self.real_variables = real_variables
+        self.hidden_dim = hidden_dim
+        self.num_cat_features = len(categorical_variable_sizes)
+        self.num_real_features = len(real_variables)
+        
+        # Individual embeddings for each categorical feature
+        self.cat_embeddings = nn.ModuleList([
+            nn.Embedding(size, hidden_dim)
+            for size in categorical_variable_sizes.values()
+        ])
+        
+        # Simple processing for real variables
+        self.real_projection = nn.Linear(self.num_real_features, hidden_dim)
+        self.batch_norm = nn.BatchNorm1d(hidden_dim) if use_batch_norm else nn.Identity()
+        
+        # Simple feed-forward network for final projection
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_dim * (self.num_cat_features + 1), hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim)
+        )
+        
+        self.dropout = nn.Dropout(dropout_rate)
+        
+    def forward(self, user_categoricals: torch.Tensor, user_reals: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the user encoder.
+        
+        Args:
+            user_categoricals: Tensor of shape (batch_size, num_categorical_features)
+            user_reals: Tensor of shape (batch_size, num_real_features)
+            
+        Returns:
+            user_embeddings: Tensor of shape (batch_size, hidden_dim)
+        """
+        batch_size = user_categoricals.size(0)
+        device = user_categoricals.device
+        
+        # Process categorical variables
+        cat_embeddings_list = []
+        for i, embedding_layer in enumerate(self.cat_embeddings):
+            cat_feature = user_categoricals[:, i].long()
+            cat_embeddings_list.append(embedding_layer(cat_feature))
+        
+        # Process real variables
+        if self.num_real_features > 0:
+            real_values = user_reals.float()  # [batch_size, num_reals]
+            real_embeddings = self.real_projection(real_values)
+            real_embeddings = self.batch_norm(real_embeddings)
+        else:
+            real_embeddings = torch.zeros(batch_size, self.hidden_dim, device=device)
+        
+        # Combine all embeddings
+        all_embeddings = cat_embeddings_list + [real_embeddings]
+        combined = torch.cat(all_embeddings, dim=1)
+        
+        # Project to final embedding
+        user_embeddings = self.projection(combined)
+        
+        return self.dropout(user_embeddings)
 
 class MealEncoder(nn.Module):
     """

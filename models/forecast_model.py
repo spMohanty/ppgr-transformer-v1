@@ -16,7 +16,7 @@ from loguru import logger
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-from .encoders import MealEncoder, PatchedGlucoseEncoder
+from .encoders import UserEncoder, MealEncoder, PatchedGlucoseEncoder
 from .transformer_blocks import TransformerDecoderLayer, TransformerDecoder
 from config import ExperimentConfig
 from plot_helpers import plot_meal_self_attention, plot_forecast_examples, plot_iAUC_scatter
@@ -40,6 +40,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
     def __init__(
         self, 
         config: ExperimentConfig, 
+        dataset_metadata: Dict[str, Any],
         num_foods: int, 
         food_macro_dim: int, 
         food_names: List[str], 
@@ -49,10 +50,12 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Save hyperparameters correctly
         self.save_hyperparameters({
             'config': asdict(config),
+            'dataset_metadata': dataset_metadata,
             'num_foods': num_foods,
             'food_macro_dim': food_macro_dim
         })
         self.config = config
+        self.dataset_metadata = dataset_metadata
         self.num_foods = num_foods
         self.food_macro_dim = food_macro_dim
         self.food_names = food_names
@@ -73,6 +76,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.disable_plots = config.disable_plots
         
         # Initialize component models
+        self._init_user_encoder(config, dataset_metadata)
         self._init_meal_encoder(config)
         self._init_glucose_encoder(config)
         self._init_decoder(config)
@@ -105,6 +109,25 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # Center point will be at max_encoder_length, allowing for negative indices
         self.time_emb = TimeEmbedding(total_range, config.hidden_dim, offset=max_encoder_length)
+        
+    def _init_user_encoder(self, config: ExperimentConfig, dataset_metadata: Dict[str, Any]) -> None:
+        """Initialize the user encoder component."""        
+        # Get sizes of categorical variables        
+        user_static_categoricals = dataset_metadata["user_static_categoricals"]
+        user_static_reals = dataset_metadata["user_static_reals"]
+
+        categorical_variable_sizes = {}
+        for cat in user_static_categoricals:
+            categorical_variable_sizes[cat] = len(dataset_metadata["categorical_encoders"][cat].classes_)
+        
+        self.user_encoder = UserEncoder(
+            categorical_variable_sizes=categorical_variable_sizes,
+            real_variables=user_static_reals,
+            hidden_dim=config.hidden_dim,
+            dropout_rate=config.dropout_rate,
+            use_batch_norm=True
+        )
+        
                 
     def _init_meal_encoder(self, config: ExperimentConfig) -> None:
         """Initialize the meal encoder component."""
@@ -169,7 +192,10 @@ class MealGlucoseForecastModel(pl.LightningModule):
         or a tuple if return_attn=True with the following elements:
           (pred_future, past_meal_enc, attn_past, future_meal_enc, attn_future, meal_self_attn_past, meal_self_attn_future)
         """        
-        # Unpack batch         
+        # Unpack batch
+        user_categoricals = batch["user_categoricals"] # [B, num_user_cat_features]
+        user_reals = batch["user_reals"]               # [B, num_user_real_features]
+        user_microbiome_embeddings = batch["user_microbiome_embeddings"] # [B, num_microbiome_features]
         past_glucose = batch["past_glucose"]         # [B, T_past]
         past_meal_ids = batch["past_meal_ids"]       # [B, T_past, M]
         past_meal_macros = batch["past_meal_macros"] # [B, T_past, M, food_macro_dim]
@@ -179,11 +205,14 @@ class MealGlucoseForecastModel(pl.LightningModule):
         target_scales = batch["target_scales"]       # [B, 2]
         encoder_lengths = batch["encoder_lengths"]   # [B]
         encoder_padding_mask = batch["encoder_padding_mask"] # [B, T_past]
-        
+        metadata = batch["metadata"] # Dict with metadata
         
         
         device = past_glucose.device
         B = past_glucose.size(0)
+        
+        # 0) Get user embeddings (shape: [batch_size, hidden_dim])
+        user_embeddings = self.user_encoder(user_categoricals, user_reals)
         
         # 1) Encode glucose sequence => shape [B, G_patches, hidden_dim]
         glucose_enc, glucose_attn_weights, patch_indices = self.glucose_encoder(past_glucose, mask=encoder_padding_mask, return_self_attn=False)
@@ -200,7 +229,19 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Get sequence lengths
         T_past = past_meal_enc.size(1)
         T_future = future_meal_enc.size(1)
+        N_patches = glucose_enc.size(1)
         max_encoder_length = self.config.max_encoder_length
+        
+        # Add user embeddings to meal embeddings
+        user_emb_past = user_embeddings.unsqueeze(1).expand(-1, T_past, -1)  # (B, T_past, hidden_dim)
+        user_emb_future = user_embeddings.unsqueeze(1).expand(-1, T_future, -1)  # (B, T_future, hidden_dim)
+        user_emb_patches = user_embeddings.unsqueeze(1).expand(-1, N_patches, -1)  # (B, N_patches, hidden_dim)
+        
+        # Combine with other embeddings
+        past_meal_enc = past_meal_enc + user_emb_past  # Add user context to past meals
+        future_meal_enc = future_meal_enc + user_emb_future  # Add user context to future meals
+        glucose_enc = glucose_enc + user_emb_patches  # Add user context to glucose patches
+
 
         # 3) Add positional time embeddings
         # Generate regular time indices
@@ -252,7 +293,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
 
 
         # Force full precision for the residual connection
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
 
             # 8) Final projection to get quantile predictions
             pred_future = self.forecast_linear(decoder_output)
@@ -289,6 +330,9 @@ class MealGlucoseForecastModel(pl.LightningModule):
             Loss tensor
         """
         # Unpack batch         
+        user_categoricals = batch["user_categoricals"]
+        user_reals = batch["user_reals"]
+        user_microbiome_embeddings = batch["user_microbiome_embeddings"]        
         past_glucose = batch["past_glucose"]         
         past_meal_ids = batch["past_meal_ids"]
         past_meal_macros = batch["past_meal_macros"]
@@ -298,7 +342,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         target_scales = batch["target_scales"]
         encoder_lengths = batch["encoder_lengths"]
         encoder_padding_mask = batch["encoder_padding_mask"]
-         
+        metadata = batch["metadata"]
         # Ensure target_scales has the right shape
         if target_scales.dim() > 2:
             target_scales = target_scales.view(target_scales.size(0), -1)
@@ -429,7 +473,10 @@ class MealGlucoseForecastModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         """Training step."""
-        # Unpack batch         
+        # Unpack batch
+        user_categoricals = batch["user_categoricals"]
+        user_reals = batch["user_reals"]
+        user_microbiome_embeddings = batch["user_microbiome_embeddings"]
         past_glucose = batch["past_glucose"]         
         past_meal_ids = batch["past_meal_ids"]
         past_meal_macros = batch["past_meal_macros"]
@@ -439,7 +486,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         target_scales = batch["target_scales"]
         encoder_lengths = batch["encoder_lengths"]
         encoder_padding_mask = batch["encoder_padding_mask"]        
-        
+        metadata = batch["metadata"]
         # Forward pass
         preds = self(batch)
         
@@ -600,8 +647,11 @@ class MealGlucoseForecastModel(pl.LightningModule):
         Returns:
             Model instance
         """
+        dataset_metadata = dataset[0][-1] # metadata is the last element in the tuple - todo: change this to dict 
+                
         model = cls(
             config=config,
+            dataset_metadata=dataset_metadata,
             num_foods=dataset.num_foods,
             food_macro_dim=dataset.num_nutrients,
             food_names=dataset.food_names,

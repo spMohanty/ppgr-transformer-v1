@@ -132,7 +132,7 @@ def get_trainer(config: ExperimentConfig, callbacks):
     trainer = pl.Trainer(
         profiler="simple",
         max_epochs=config.max_epochs,
-        enable_checkpointing=False,
+        enable_checkpointing=enable_checkpointing,
         logger=wandb_logger,
         callbacks=callbacks,
         precision=precision_value,
@@ -257,13 +257,8 @@ def main(**kwargs):
     with torch.no_grad():
         batch = next(iter(test_loader))
         
-        # Move batch to device
-        batch = {k: v.to(model.device) for k, v in batch.items()}
-        
-        # Unpack batch
-        (past_glucose, past_meal_ids, past_meal_macros,
-         future_meal_ids, future_meal_macros, future_glucose, target_scale, encoder_lengths, encoder_padding_mask) = batch
-        
+        # Move batch to device, excluding metadata
+        batch = {k: v.to(model.device) if k != "metadata" else v for k, v in batch.items()}        
         preds = model(
             batch,
             return_attn=True,

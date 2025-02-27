@@ -1179,6 +1179,13 @@ class PPGRToMealGlucoseWrapper(Dataset):
         # Store the actual encoder length for this sample
         encoder_length = torch.tensor(item["encoder_length"].item(), dtype=torch.int32).to(device)
         
+        # User Data
+        # ---------------------------
+        # we select 0th index as the user data does not change over time currently
+        user_cat = item["x_user_cat"][0]
+        user_real = item["x_user_real"][0]
+        user_microbiome_embedding = item["x_microbiome_embedding"]
+        
         # ---------------------------
         # Past (encoder) side:
         # ---------------------------
@@ -1235,15 +1242,22 @@ class PPGRToMealGlucoseWrapper(Dataset):
         
         target_scales = item["target_scales"].squeeze() # TODO: check the provenance of this tensor and if we really need to do this squeeze here
     
+    
+        metadata = item["metadata"]
         # Return the 6-tuple.
-        return (past_glucose.float(),           # [T_enc]
+        return (
+                user_cat, # [num_user_cat_features]
+                user_real, # [num_user_real_features]
+                user_microbiome_embedding, # [num_microbiome_features]
+                past_glucose.float(),           # [T_enc]
                 past_meal_ids,          # [T_enc, max_meals]
                 past_meal_macros.float(),       # [T_enc, max_meals, num_nutrients]
                 future_meal_ids,        # [T_pred, max_meals]
                 future_meal_macros.float(),     # [T_pred, max_meals, num_nutrients]
                 future_glucose.float(),         # [T_pred]
                 target_scales,         # [2]
-                encoder_length)         # [1]
+                encoder_length,         # [1]
+                metadata)         # Dict with metadata
     
     def get_cache_stats(self):
         """Return statistics about the cache performance."""
@@ -1334,10 +1348,16 @@ def meal_glucose_collate_fn(batch):
         A tuple of padded tensors ready for the model.
     """
     # Unpack the batch into separate lists
-    past_glucose_list, past_meal_ids_list, past_meal_macros_list, future_meal_ids_list, \
-    future_meal_macros_list, future_glucose_list, target_scales_list, encoder_lengths = zip(*batch)
-
+    user_cat_list, user_real_list, user_microbiome_embedding_list, past_glucose_list, past_meal_ids_list, past_meal_macros_list, future_meal_ids_list, \
+    future_meal_macros_list, future_glucose_list, target_scales_list, encoder_lengths, metadata_list = zip(*batch)
     
+    # Metadata
+    metadata = metadata_list[0] # metadata is the same for all items in the batch
+    
+    # Stack user data
+    user_categoricals = torch.stack(user_cat_list)
+    user_reals = torch.stack(user_real_list)
+    user_microbiome_embeddings = torch.stack(user_microbiome_embedding_list)
     # Convert encoder_lengths to a tensor
     encoder_lengths = torch.stack(encoder_lengths)
     max_encoder_len = max(encoder_lengths).item()
@@ -1375,6 +1395,9 @@ def meal_glucose_collate_fn(batch):
     
     
     _response = {
+        "user_categoricals": user_categoricals,
+        "user_reals": user_reals,
+        "user_microbiome_embeddings": user_microbiome_embeddings,
         "past_glucose": past_glucose_batch, 
         "past_meal_ids": past_meal_ids_batch, 
         "past_meal_macros": past_meal_macros_batch, 
@@ -1383,7 +1406,8 @@ def meal_glucose_collate_fn(batch):
         "future_glucose": future_glucose_batch, 
         "target_scales": target_scales_batch,
         "encoder_lengths": encoder_lengths,
-        "encoder_padding_mask": encoder_padding_mask
+        "encoder_padding_mask": encoder_padding_mask,
+        "metadata": metadata
     }
     return _response
     
