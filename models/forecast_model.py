@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 
 from .encoders import (
     UserEncoder, MealEncoder, PatchedGlucoseEncoder, 
-    TemporalEncoder, GlucosePatcher, PatchEncoder
+    TemporalEncoder, GlucosePatcher, PatchEncoder, MicrobiomeEncoder
 )
 from .transformer_blocks import TransformerDecoderLayer, TransformerDecoder
 from config import ExperimentConfig
@@ -188,7 +188,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.example_meal_self_attn_future = None
                 
         # Create learnable type embeddings for each sequence type
-        self.type_embeddings = nn.Embedding(4, config.hidden_dim)  # 4 types: past_meals, future_meals, glucose, user
+        self.type_embeddings = nn.Embedding(5, config.hidden_dim)  # 4 types: past_meals, future_meals, glucose, user, microbiome
         
     def _init_positional_embeddings(self, config: ExperimentConfig) -> None:
         """Initialize the positional embeddings."""
@@ -210,7 +210,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Get sizes of categorical variables        
         user_static_categoricals = dataset_metadata["user_static_categoricals"]
         user_static_reals = dataset_metadata["user_static_reals"]
-        # user_microbiome_embeddings_dim = dataset_metadata["user_microbiome_embeddings_dim"]
+        user_microbiome_embeddings_dim = dataset_metadata["microbiome_embeddings_dim"]
 
         categorical_variable_sizes = {}
         for cat in user_static_categoricals:
@@ -224,6 +224,16 @@ class MealGlucoseForecastModel(pl.LightningModule):
             dropout_rate=config.dropout_rate,
             use_batch_norm=True,
         )
+        
+        # Initialize microbiome encoder
+        self.microbiome_encoder = MicrobiomeEncoder(
+            input_dim=user_microbiome_embeddings_dim,
+            hidden_dim=config.hidden_dim * 2,  # Double hidden dim for projection
+            output_dim=config.hidden_dim,
+            dropout_rate=config.dropout_rate,
+            use_batch_norm=True,
+        )
+        
 
     def _init_temporal_encoder(self, config: ExperimentConfig, dataset_metadata: Dict[str, Any]) -> None:
         """Initialize the temporal encoder component."""
@@ -330,6 +340,9 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # 0) Get user embeddings (shape: [batch_size, hidden_dim])
         user_embeddings = self.user_encoder(user_categoricals, user_reals)
         
+        # Encode microbiome data
+        microbiome_embeddings = self.microbiome_encoder(user_microbiome_embeddings)
+        
         # Get sequence lengths for positional encoding
         T_past = past_meal_ids.size(1)
         T_future = future_meal_ids.size(1)
@@ -429,20 +442,23 @@ class MealGlucoseForecastModel(pl.LightningModule):
         glucose_enc = glucose_enc + past_temporal_emb[:, centered_patch_indices, :]  # [B, N_patches, hidden_dim]
         
         # Prepare user embeddings as a separate token for memory
-        user_embeddings_token = user_embeddings.unsqueeze(1)        
+        user_embeddings_token = user_embeddings.unsqueeze(1)
+        # Prepare microbiome embeddings as a separate token for memory
+        microbiome_embeddings_token = microbiome_embeddings.unsqueeze(1)
         
         # Create type IDs for each sequence
         past_meal_type_id = torch.zeros((B, T_past), device=device, dtype=torch.long)
         future_meal_type_id = torch.ones((B, T_future), device=device, dtype=torch.long)
         glucose_type_id = 2 * torch.ones((B, N_patches), device=device, dtype=torch.long)
         user_type_id = 3 * torch.ones((B, 1), device=device, dtype=torch.long)
+        microbiome_type_id = 4 * torch.ones((B, 1), device=device, dtype=torch.long)
         
         # Add type embeddings to each sequence
         past_meal_enc = past_meal_enc + self.type_embeddings(past_meal_type_id)
         future_meal_enc = future_meal_enc + self.type_embeddings(future_meal_type_id)
         glucose_enc = glucose_enc + self.type_embeddings(glucose_type_id)
         user_embeddings_token = user_embeddings_token + self.type_embeddings(user_type_id)
-        
+        microbiome_embeddings_token = microbiome_embeddings_token + self.type_embeddings(microbiome_type_id)
         # 5) Combine all encodings in a single "memory" sequence
         # Print shape information for debugging
         # print(f"past_meal_enc: {past_meal_enc.shape}")
@@ -454,7 +470,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
             past_meal_enc,
             future_meal_enc,
             glucose_enc,
-            user_embeddings_token
+            user_embeddings_token,
+            microbiome_embeddings_token
         ]
         memory = torch.cat(memory, dim=1)
 

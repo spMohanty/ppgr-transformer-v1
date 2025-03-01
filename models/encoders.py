@@ -12,6 +12,46 @@ from .transformer_blocks import TransformerEncoderLayer, TransformerEncoder
 
 from pytorch_forecasting.models.nn import MultiEmbedding
 
+class MicrobiomeEncoder(nn.Module):
+    """
+    Encoder for microbiome features.
+    
+    Takes microbiome features and projects them to the hidden dimension
+    using two linear layers with activation.
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        dropout_rate: float = 0.1,
+        use_batch_norm: bool = True,
+    ):
+        super().__init__()
+        
+        self.projection = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity(),
+            nn.BatchNorm1d(hidden_dim) if use_batch_norm else nn.Identity(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        
+    def forward(self, microbiome_features: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the microbiome encoder.
+        
+        Args:
+            microbiome_features: Microbiome features [B, num_microbiome_features]
+            
+        Returns:
+            Encoded microbiome features [B, output_dim]
+        """
+        # Ensure microbiome features have the same dtype as model parameters
+        microbiome_features = microbiome_features.to(dtype=self.projection[0].weight.dtype)        
+        return self.projection(microbiome_features)
+
+
 class UserEncoder(nn.Module):
     """
     Simple MLP-based user encoder for static features.
