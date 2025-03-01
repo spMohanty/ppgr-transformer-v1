@@ -23,15 +23,97 @@ from plot_helpers import plot_meal_self_attention, plot_forecast_examples, plot_
 from dataset import PPGRToMealGlucoseWrapper
 from .losses import quantile_loss, compute_iAUC, unscale_tensor
 
-class TimeEmbedding(nn.Module):
-    """Embedding layer that handles negative indices by adding an offset."""
-    def __init__(self, num_embeddings, embedding_dim, offset):
+
+class RotaryPositionalEmbeddings(nn.Module):
+    """
+    Rotary Positional Embeddings (RoPE) as proposed in https://arxiv.org/abs/2104.09864.
+    
+    This implementation supports offset indices to handle negative positions,
+    similar to TimeEmbedding.
+    """
+    def __init__(
+        self,
+        dim: int,
+        max_seq_len: int = 4096,
+        base: int = 10_000,
+        offset: int = 0
+    ) -> None:
         super().__init__()
+        self.dim = dim
+        self.base = base
+        self.max_seq_len = max_seq_len
         self.offset = offset
-        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.rope_init()
+
+    def rope_init(self):
+        # Precompute frequency bands
+        theta = 1.0 / (
+            self.base
+            ** (torch.arange(0, self.dim, 2)[: (self.dim // 2)].float() / self.dim)
+        )
+        self.register_buffer("theta", theta, persistent=False)
+        self.build_rope_cache(self.max_seq_len)
+
+    def build_rope_cache(self, max_seq_len: int = 4096) -> None:
+        # Create position indexes from 0 to max_seq_len-1
+        seq_idx = torch.arange(
+            max_seq_len, dtype=torch.float, device=self.theta.device
+        )
+
+        # Outer product of theta and position index
+        idx_theta = torch.einsum("i, j -> ij", seq_idx, self.theta)
         
-    def forward(self, x):
-        return self.embedding(x + self.offset)
+        # Cache includes both the cos and sin components
+        # Shape: [max_seq_len, dim//2, 2]
+        cache = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1)
+        self.register_buffer("cache", cache, persistent=False)
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """
+        Apply rotary positional embeddings to input tensor.
+        
+        Args:
+            x: Input tensor of shape [batch_size, seq_len, dim]
+            positions: Position indices of shape [batch_size, seq_len]
+            
+        Returns:
+            Tensor with rotary embeddings applied
+        """
+        # Ensure positions include offset (for negative positions handling)
+        positions = positions + self.offset
+        
+        # Ensure position indices are within bounds
+        positions = torch.clamp(positions, 0, self.max_seq_len - 1)
+        
+        # Get batch size and sequence length
+        batch_size, seq_len = positions.shape
+        
+        # Get cached embeddings for the given positions
+        # Shape after indexing: [batch_size, seq_len, dim//2, 2]
+        rope_cache = self.cache[positions]
+        
+        # Reshape input for rotation
+        # From [batch_size, seq_len, dim] to [batch_size, seq_len, dim//2, 2]
+        x_reshaped = x.float().reshape(batch_size, seq_len, -1, 2)
+        
+        # Apply rotary transformation using the cached values
+        # cos(θ)x - sin(θ)y and sin(θ)x + cos(θ)y
+        x_out = torch.stack(
+            [
+                x_reshaped[..., 0] * rope_cache[..., 0] - 
+                x_reshaped[..., 1] * rope_cache[..., 1],
+                
+                x_reshaped[..., 1] * rope_cache[..., 0] + 
+                x_reshaped[..., 0] * rope_cache[..., 1],
+            ],
+            dim=-1,
+        )
+        
+        # Reshape back to original shape - ensure this matches the input shape
+        x_out = x_out.reshape(batch_size, seq_len, self.dim)
+        
+        # Return with the same dtype as the input
+        return x_out.type_as(x)
 
 class MealGlucoseForecastModel(pl.LightningModule):
     """
@@ -76,12 +158,12 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.disable_plots = config.disable_plots
         
         # Initialize component models
+        self._init_positional_embeddings(config)
         self._init_user_encoder(config, dataset_metadata)
         self._init_temporal_encoder(config, dataset_metadata)
         self._init_meal_encoder(config)
         self._init_glucose_encoder(config)
         self._init_decoder(config)
-        self._init_positional_embeddings(config)
         
         
         # Future time query embeddings for each forecast horizon step
@@ -110,9 +192,15 @@ class MealGlucoseForecastModel(pl.LightningModule):
         max_encoder_length = config.max_encoder_length
         max_prediction_length = config.prediction_length
         total_range = max_encoder_length + max_prediction_length + 100  # a safe upper bound
-        
-        # Center point will be at max_encoder_length, allowing for negative indices
-        self.time_emb = TimeEmbedding(total_range, config.hidden_dim, offset=max_encoder_length)
+                
+        # Use rotary position embeddings
+        # The offset is max_encoder_length to center positions around the last valid position
+        self.rope_emb = RotaryPositionalEmbeddings(
+            dim=config.hidden_dim,
+            max_seq_len=total_range,
+            base=10000,
+            offset=max_encoder_length 
+        )
         
     def _init_user_encoder(self, config: ExperimentConfig, dataset_metadata: Dict[str, Any]) -> None:
         """Initialize the user encoder component."""        
@@ -181,12 +269,13 @@ class MealGlucoseForecastModel(pl.LightningModule):
             embed_dim=config.hidden_dim,
             patch_size=config.patch_size,
             patch_stride=config.patch_stride,
+            positional_embedding=self.rope_emb,
             num_heads=config.num_heads,
             num_layers=config.transformer_encoder_layers,
             layers_share_weights=config.transformer_encoder_layers_share_weights,
             max_seq_len=config.min_encoder_length,
             dropout_rate=config.dropout_rate
-        )
+        )        
         
     def _init_decoder(self, config: ExperimentConfig) -> None:
         """Initialize the transformer decoder component."""
@@ -255,19 +344,6 @@ class MealGlucoseForecastModel(pl.LightningModule):
         future_meal_enc, meal_self_attn_future = self.meal_encoder(
             future_meal_ids, future_meal_macros, return_self_attn=return_meal_self_attn
         ) # NOTE: no masks for the future meals
-
-        # 3) Encode temporal features if available
-        # have_temporal_features = (past_temporal_categoricals is not None and past_temporal_reals is not None and
-        #                          future_temporal_categoricals is not None and future_temporal_reals is not None)
-        # past_temporal_enc = self.temporal_encoder(
-        #     past_temporal_categoricals,
-        #     past_temporal_reals,
-        #     mask=encoder_padding_mask
-        # )
-        # future_temporal_enc = self.temporal_encoder(
-        #     future_temporal_categoricals,
-        #     future_temporal_reals
-        # ) # No mask for future
         
         # Get sequence lengths
         T_past = past_meal_enc.size(1)
@@ -303,11 +379,10 @@ class MealGlucoseForecastModel(pl.LightningModule):
         patch_indices = patch_indices - centered_offset
         future_indices = future_indices - centered_offset  # Future will start at index 1
                 
-        # 5) Add positional time embeddings
-        # TimeEmbedding class handles the offset internally
-        glucose_enc = glucose_enc + self.time_emb(patch_indices)
-        past_meal_enc = past_meal_enc + self.time_emb(past_indices)
-        future_meal_enc = future_meal_enc + self.time_emb(future_indices)
+        # 5) Apply rotary positional embeddings
+        glucose_enc = self.rope_emb(glucose_enc, patch_indices)
+        past_meal_enc = self.rope_emb(past_meal_enc, past_indices)
+        future_meal_enc = self.rope_emb(future_meal_enc, future_indices)
                 
         # Create type IDs for each sequence
         past_meal_type_id = torch.zeros((B, T_past), device=device, dtype=torch.long)
@@ -335,7 +410,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # Get query embeddings and add positional encoding
         query_emb = self.future_time_queries(query_indices)  # [B, T_future, hidden_dim]
-        query_emb = query_emb + self.time_emb(query_indices)
+        query_emb = query_emb + self.rope_emb(query_emb, query_indices)
 
         # 8) Decoder: Process queries with the memory
         decoder_output, cross_attn = self.decoder(

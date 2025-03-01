@@ -331,6 +331,7 @@ class PatchedGlucoseEncoder(nn.Module):
         embed_dim: int, 
         patch_size: int, 
         patch_stride: int, 
+        positional_embedding: nn.Module,  # Pass in the positional embedding
         num_heads: int = 4, 
         num_layers: int = 1, 
         layers_share_weights: bool = False,
@@ -341,6 +342,7 @@ class PatchedGlucoseEncoder(nn.Module):
         self.embed_dim = embed_dim
         self.patch_size = patch_size
         self.patch_stride = patch_stride
+        self.positional_embedding = positional_embedding
 
         # Simple linear projection from each patch to embed_dim
         self.patch_proj = nn.Linear(patch_size, embed_dim)
@@ -423,8 +425,11 @@ class PatchedGlucoseEncoder(nn.Module):
             torch.full((N_patches, N_patches), float('-inf')), diagonal=1
         ).to(glucose_seq.device)
         
-        # Pass only the causal mask - it will be broadcast to all batches automatically
-        # This is key: mask parameter expects shape [seq_len, seq_len] not [batch, seq_len, seq_len]
+        # Apply positional embeddings before transformer processing
+        patch_positions = patch_indices.unsqueeze(0).expand(B_np, -1)  # [B, N_patches]
+        patch_emb = self.positional_embedding(patch_emb, patch_positions)
+        
+        # Pass through transformer with positional information included
         patch_emb, attn_weights = self.transformer(
             patch_emb,
             mask=causal_mask,
