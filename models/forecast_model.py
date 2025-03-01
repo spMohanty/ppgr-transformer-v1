@@ -16,7 +16,10 @@ from loguru import logger
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-from .encoders import UserEncoder, MealEncoder, PatchedGlucoseEncoder, TemporalEncoder
+from .encoders import (
+    UserEncoder, MealEncoder, PatchedGlucoseEncoder, 
+    TemporalEncoder, GlucosePatcher, PatchEncoder
+)
 from .transformer_blocks import TransformerDecoderLayer, TransformerDecoder
 from config import ExperimentConfig
 from plot_helpers import plot_meal_self_attention, plot_forecast_examples, plot_iAUC_scatter
@@ -241,7 +244,6 @@ class MealGlucoseForecastModel(pl.LightningModule):
         )
         
 
-           
     def _init_meal_encoder(self, config: ExperimentConfig) -> None:
         """Initialize the meal encoder component."""
         self.meal_encoder = MealEncoder(
@@ -251,6 +253,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             food_macro_dim=self.food_macro_dim,
             food_names=self.food_names,
             food_group_names=self.food_group_names,
+            positional_embedding=self.rope_emb,
             max_meals=config.max_meals,
             num_heads=config.num_heads,
             num_layers=config.transformer_encoder_layers,
@@ -273,9 +276,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
             num_heads=config.num_heads,
             num_layers=config.transformer_encoder_layers,
             layers_share_weights=config.transformer_encoder_layers_share_weights,
-            max_seq_len=config.min_encoder_length,
             dropout_rate=config.dropout_rate
-        )        
+        )
         
     def _init_decoder(self, config: ExperimentConfig) -> None:
         """Initialize the transformer decoder component."""
@@ -321,69 +323,82 @@ class MealGlucoseForecastModel(pl.LightningModule):
         encoder_padding_mask = batch["encoder_padding_mask"] # [B, T_past]
         metadata = batch["metadata"] # Dict with metadata
         
-        # Unpack temporal features if available
-        # past_temporal_categoricals = batch["past_temporal_categoricals"]  # [B, T_past, num_temporal_cat_features]
-        # past_temporal_reals = batch["past_temporal_reals"]                # [B, T_past, num_temporal_real_features]
-        # future_temporal_categoricals = batch["future_temporal_categoricals"]  # [B, T_future, num_temporal_cat_features]
-        # future_temporal_reals = batch["future_temporal_reals"]                # [B, T_future, num_temporal_real_features]
-        
         device = past_glucose.device
         B = past_glucose.size(0)
         
         # 0) Get user embeddings (shape: [batch_size, hidden_dim])
         user_embeddings = self.user_encoder(user_categoricals, user_reals)
         
-        # 1) Encode glucose sequence => shape [B, G_patches, hidden_dim]
-        glucose_enc, glucose_attn_weights, patch_indices = self.glucose_encoder(past_glucose, mask=encoder_padding_mask, return_self_attn=False)
-        # We dont need the self attention of glucose encoder
-                
-        # 2) Encode past & future meals
-        past_meal_enc, meal_self_attn_past = self.meal_encoder(
-            past_meal_ids, past_meal_macros, mask=encoder_padding_mask, return_self_attn=return_meal_self_attn
-        )
-        future_meal_enc, meal_self_attn_future = self.meal_encoder(
-            future_meal_ids, future_meal_macros, return_self_attn=return_meal_self_attn
-        ) # NOTE: no masks for the future meals
-        
-        # Get sequence lengths
-        T_past = past_meal_enc.size(1)
-        T_future = future_meal_enc.size(1)
-        N_patches = glucose_enc.size(1)
+        # Get sequence lengths for positional encoding
+        T_past = past_meal_ids.size(1)
+        T_future = future_meal_ids.size(1)
         max_encoder_length = self.config.max_encoder_length
         
-        
-        # Prepare user embeddings as a separate token for memory
-        # Reshape to [B, 1, hidden_dim] to include in sequence dimension
-        user_embeddings_token = user_embeddings.unsqueeze(1)        
-        
-        # Add user embeddings to meal embeddings
-        user_emb_past = user_embeddings.unsqueeze(1).expand(-1, T_past, -1)  # (B, T_past, hidden_dim)
-        user_emb_future = user_embeddings.unsqueeze(1).expand(-1, T_future, -1)  # (B, T_future, hidden_dim)
-        user_emb_patches = user_embeddings.unsqueeze(1).expand(-1, N_patches, -1)  # (B, N_patches, hidden_dim)        
-        
-        # Concat user context to past meals and project back to hidden_dim
-        past_meal_enc = past_meal_enc + user_emb_past  # [B, T_past, hidden_dim]
-        future_meal_enc = future_meal_enc + user_emb_future  # [B, T_future, hidden_dim] 
-        glucose_enc = glucose_enc + user_emb_patches  # [B, N_patches, hidden_dim]
-        
-        # 4) Generate time indices for positional embeddings
+        # 1) Generate time indices for positional embeddings FIRST
         # Regular time indices
         past_indices = torch.arange(T_past, device=device).unsqueeze(0).expand(B, -1)
         future_indices = torch.arange(T_future, device=device).unsqueeze(0).expand(B, -1) + T_past
+        
         # Center indices by subtracting (max_encoder_length - 1) for each batch item
         # This makes the last valid position have index 0
         centered_offset = (max_encoder_length - 1) * torch.ones((B, 1), device=device, dtype=torch.long)
         
         # Apply centering to all indices
         past_indices = past_indices - centered_offset
-        patch_indices = patch_indices - centered_offset
         future_indices = future_indices - centered_offset  # Future will start at index 1
-                
-        # 5) Apply rotary positional embeddings
-        glucose_enc = self.rope_emb(glucose_enc, patch_indices)
-        past_meal_enc = self.rope_emb(past_meal_enc, past_indices)
-        future_meal_enc = self.rope_emb(future_meal_enc, future_indices)
-                
+        
+        # 2) Generate glucose patch position indices and center them
+        # We need to estimate where patch indices will be based on patching parameters
+        # This creates an approximation of the patch indices that will be generated inside the glucose encoder
+        patch_size = self.config.patch_size
+        patch_stride = self.config.patch_stride
+        T_glucose = past_glucose.size(1)
+        
+        # Create an estimate of patch indices (matches what's generated in glucose encoder)
+        estimated_patch_indices = torch.arange(
+            0, T_glucose - patch_size + 1, patch_stride, device=device
+        ).unsqueeze(0).expand(B, -1)
+        
+        # Apply centering to estimated patch indices
+        estimated_patch_indices = estimated_patch_indices - centered_offset
+        
+        # 3) Encode glucose sequence with positional information
+        glucose_enc, glucose_attn_weights, _ = self.glucose_encoder(
+            past_glucose, 
+            positions=estimated_patch_indices,  # Pass centered patch indices
+            mask=encoder_padding_mask, 
+            return_self_attn=False
+        )
+        
+        # 4) Encode past & future meals with positional information
+        past_meal_enc, meal_self_attn_past = self.meal_encoder(
+            past_meal_ids, past_meal_macros, 
+            positions=past_indices,  # Pass past position indices
+            mask=encoder_padding_mask, 
+            return_self_attn=return_meal_self_attn
+        )
+        future_meal_enc, meal_self_attn_future = self.meal_encoder(
+            future_meal_ids, future_meal_macros, 
+            positions=future_indices,  # Pass future position indices
+            return_self_attn=return_meal_self_attn
+        )
+        
+        # Get number of glucose patches for further processing
+        N_patches = glucose_enc.size(1)
+        
+        # Add user embeddings to meal encodings
+        user_emb_past = user_embeddings.unsqueeze(1).expand(-1, T_past, -1)  # (B, T_past, hidden_dim)
+        user_emb_future = user_embeddings.unsqueeze(1).expand(-1, T_future, -1)  # (B, T_future, hidden_dim)
+        user_emb_patches = user_embeddings.unsqueeze(1).expand(-1, N_patches, -1)  # (B, N_patches, hidden_dim)        
+        
+        # Concat user context to embeddings
+        past_meal_enc = past_meal_enc + user_emb_past  # [B, T_past, hidden_dim]
+        future_meal_enc = future_meal_enc + user_emb_future  # [B, T_future, hidden_dim] 
+        glucose_enc = glucose_enc + user_emb_patches  # [B, N_patches, hidden_dim]
+        
+        # Prepare user embeddings as a separate token for memory
+        user_embeddings_token = user_embeddings.unsqueeze(1)        
+        
         # Create type IDs for each sequence
         past_meal_type_id = torch.zeros((B, T_past), device=device, dtype=torch.long)
         future_meal_type_id = torch.ones((B, T_future), device=device, dtype=torch.long)
@@ -396,14 +411,14 @@ class MealGlucoseForecastModel(pl.LightningModule):
         glucose_enc = glucose_enc + self.type_embeddings(glucose_type_id)
         user_embeddings_token = user_embeddings_token + self.type_embeddings(user_type_id)
         
-        # 6) Combine all encodings in a single "memory" sequence
+        # 5) Combine all encodings in a single "memory" sequence
         memory = torch.cat([
             past_meal_enc, future_meal_enc, 
             glucose_enc,
             user_embeddings_token
         ], dim=1)
 
-        # 7) Prepare query embeddings for each forecast horizon step
+        # 6) Prepare query embeddings for each forecast horizon step
         # Make query indices start at 1 (first future position)
         query_indices = torch.arange(self.forecast_horizon, device=device).unsqueeze(0).expand(B, -1) + 1
         # NOTE: query_indices also start at 1 (and is same as future_indices)
@@ -412,14 +427,14 @@ class MealGlucoseForecastModel(pl.LightningModule):
         query_emb = self.future_time_queries(query_indices)  # [B, T_future, hidden_dim]
         query_emb = query_emb + self.rope_emb(query_emb, query_indices)
 
-        # 8) Decoder: Process queries with the memory
+        # 7) Decoder: Process queries with the memory
         decoder_output, cross_attn = self.decoder(
             tgt=query_emb,
             memory=memory,
             return_attn=return_attn
         )
 
-        # 9) Extract attention weights for past and future if needed
+        # 8) Extract attention weights for past and future if needed
         attn_past = None
         attn_future = None
         if cross_attn is not None:
@@ -431,7 +446,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
 
         # Force full precision for the residual connection
         with torch.amp.autocast("cuda", enabled=False):
-            # 10) Final projection to get quantile predictions
+            # 9) Final projection to get quantile predictions
             pred_future = self.forecast_linear(decoder_output)
 
             # Add residual connection if configured

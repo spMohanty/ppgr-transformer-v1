@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
+import copy
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -57,6 +58,15 @@ class TransformerEncoderLayer(nn.Module):
         return src, attn_weights
 
 
+def _get_clones(module, N, share_weights=False):
+    """
+    Create N identical layers or reuse the same one if share_weights=True
+    """
+    if share_weights:
+        return nn.ModuleList([module for _ in range(N)])
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
+
+
 class TransformerEncoder(nn.Module):
     """
     Stacks multiple TransformerEncoderLayer blocks. 
@@ -66,30 +76,28 @@ class TransformerEncoder(nn.Module):
     """
     def __init__(self, encoder_layer, num_layers, norm=None, layers_share_weights=False):
         super().__init__()
-        if layers_share_weights:
-            # Use the same layer instance for all positions
-            self.layers = nn.ModuleList([encoder_layer for _ in range(num_layers)])
-        else:
-            # Create independent copies of the layer for each position
-            self.layers = nn.ModuleList([deepcopy(encoder_layer) for _ in range(num_layers)])
+        self.layers = _get_clones(encoder_layer, num_layers, layers_share_weights)
+        self.num_layers = num_layers
         self.norm = norm
 
     def forward(self, src, mask=None, src_key_padding_mask=None, need_weights=False):
         output = src
         attn_weights = None
-
-        for layer_idx, layer in enumerate(self.layers):
-            is_last = (layer_idx == len(self.layers) - 1)
-            output, attn_weights = layer(
-                output,
-                src_mask=mask,
-                src_key_padding_mask=src_key_padding_mask,
-                need_weights=(need_weights and is_last)
+        
+        for layer in self.layers:
+            # If need_weights, get them from the last layer only
+            output, attn_weights_layer = layer(
+                output, 
+                src_mask=mask, 
+                src_key_padding_mask=src_key_padding_mask, 
+                need_weights=(need_weights and layer is self.layers[-1])
             )
-
+            if need_weights and layer is self.layers[-1]:
+                attn_weights = attn_weights_layer
+        
         if self.norm is not None:
             output = self.norm(output)
-
+            
         return output, attn_weights
 
 

@@ -111,6 +111,7 @@ class MealEncoder(nn.Module):
         food_macro_dim: int,
         food_names: List[str],
         food_group_names: List[str],
+        positional_embedding: nn.Module,  # Add positional embedding parameter
         max_meals: int = 11,
         num_heads: int = 4,
         num_layers: int = 1,
@@ -134,6 +135,8 @@ class MealEncoder(nn.Module):
         self.aggregator_type = aggregator_type.lower().strip()
         self.ignore_food_macro_features = ignore_food_macro_features
         self.add_residual_connection_before_meal_timestep_embedding = add_residual_connection_before_meal_timestep_embedding
+        self.positional_embedding = positional_embedding  # Store the positional embedding
+        
         # --------------------
         #  Embedding Layers
         # --------------------
@@ -175,6 +178,7 @@ class MealEncoder(nn.Module):
         self,
         meal_ids: torch.LongTensor,
         meal_macros: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
         return_self_attn: bool = False
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -184,6 +188,7 @@ class MealEncoder(nn.Module):
         Args:
             meal_ids: (B, T, M) with each M being item indices in that meal
             meal_macros: (B, T, M, food_macro_dim) macro features for each item
+            positions: (B, T) position indices for each timestep - important for distinguishing past/future meals
             mask: (B, T) boolean mask where True indicates valid timesteps
             return_self_attn: If True, returns self-attention weights (only works in "set" mode)
             
@@ -219,6 +224,12 @@ class MealEncoder(nn.Module):
         if mask is not None:
             flat_mask = mask.view(B * T)
             filtered_mask = flat_mask[non_empty_indices]  # (N_non_empty)
+        
+        # Get filtered positions for non-empty timesteps
+        filtered_positions = None
+        if positions is not None:
+            flat_positions = positions.view(B * T)
+            filtered_positions = flat_positions[non_empty_indices]  # (N_non_empty)
         
         # 1) Embed items only for non-empty timesteps
         food_emb = self.food_emb(filtered_meal_ids)              # (N_non_empty, M, food_embed_dim)
@@ -267,6 +278,19 @@ class MealEncoder(nn.Module):
                 timestep_mask_combined = ~filtered_timestep_mask  # True means positions to ignore
                 timestep_mask_combined[:, 0] = False  # Keep aggregator token valid
                 pad_mask = pad_mask | timestep_mask_combined
+            
+            # Generate position indices for each token in each meal
+            if filtered_positions is not None:
+                # Use provided positions - each meal token gets the timestep position
+                # This expands the timestep position [N_non_empty] to [N_non_empty, M+1]
+                # so all tokens (including aggregator) in same meal get same position
+                positions = filtered_positions.unsqueeze(1).expand(-1, meal_token_emb_with_agg.size(1))
+            else:
+                # Fall back to using non-empty indices as positions
+                positions = non_empty_indices.unsqueeze(1).expand(-1, meal_token_emb_with_agg.size(1))
+            
+            # Apply positional embeddings - ALL tokens in the same meal get the same position
+            meal_token_emb_with_agg = self.positional_embedding(meal_token_emb_with_agg, positions)
 
             # Forward pass through the Transformer
             meal_attn_out, attn_weights = self.encoder(
@@ -322,80 +346,49 @@ class MealEncoder(nn.Module):
                 logger.warning(f"Food id embeddings have been frozen")
 
 
-class PatchedGlucoseEncoder(nn.Module):
+class GlucosePatcher(nn.Module):
     """
-    Encodes glucose time series data using a patched approach with transformer encoder.
+    Module that handles patching of 1D glucose time series data.
+    This module has no trainable parameters and simply transforms the data.
     """
-    def __init__(
-        self, 
-        embed_dim: int, 
-        patch_size: int, 
-        patch_stride: int, 
-        positional_embedding: nn.Module,  # Pass in the positional embedding
-        num_heads: int = 4, 
-        num_layers: int = 1, 
-        layers_share_weights: bool = False,
-        max_seq_len: int = 100, 
-        dropout_rate: float = 0.2
-    ):
+    def __init__(self, patch_size: int, patch_stride: int):
         super().__init__()
-        self.embed_dim = embed_dim
         self.patch_size = patch_size
         self.patch_stride = patch_stride
-        self.positional_embedding = positional_embedding
-
-        # Simple linear projection from each patch to embed_dim
-        self.patch_proj = nn.Linear(patch_size, embed_dim)
-
-        # Encoder Layer
-        encoder_layer = TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=embed_dim * 2,
-            dropout=dropout_rate,
-            activation="relu"
-        )
-        # Encoder
-        self.transformer = TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers,
-            norm=nn.LayerNorm(embed_dim),
-            layers_share_weights=layers_share_weights
-        )
-        # Dropout
-        self.dropout = nn.Dropout(dropout_rate)
-
-    def forward(self, glucose_seq: torch.Tensor, mask: Optional[torch.Tensor] = None, return_self_attn: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+    def forward(self, glucose_seq: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
+        Transform glucose time series into patches.
+        
         Args:
             glucose_seq: (B, T) time series of glucose values
             mask: (B, T) boolean mask where True indicates valid data points
             
         Returns:
-            patch_emb: (B, N_patches, embed_dim) encoded patches
-            patch_indices: (N_patches,) indices of patches for positional embeddings
+            patches: (B, N_patches, patch_size) patched data
+            patch_indices: (N_patches,) indices where each patch starts
+            patch_mask: (B, N_patches) boolean mask for valid patches
         """
-        glucose_seq = glucose_seq.to(next(self.parameters()).dtype)
+        glucose_seq = glucose_seq.float()  # Ensure float type
         B, T = glucose_seq.size()
         
-        # 1) Patchify using unfold for efficient sliding window
-        # shape => (B, N_patches, patch_size)
+        # Create patches using unfold
         patches = glucose_seq.unfold(1, self.patch_size, self.patch_stride)
         
         # Handle edge case where T < patch_size
         if patches.size(1) == 0:
             patches = F.pad(glucose_seq, (0, self.patch_size - T))[:, None, :]
         
-        # Extract dimensions right away to ensure N_patches is defined
-        B_np, N_patches, _ = patches.shape
+        # Get dimensions
+        _, N_patches, _ = patches.shape
         
-        # Get patch indices for positional embeddings
+        # Calculate patch indices
         patch_indices = torch.arange(0, T - self.patch_size + 1, self.patch_stride, device=glucose_seq.device)
         if patch_indices.size(0) == 0:
             patch_indices = torch.tensor([0], device=glucose_seq.device)
-            
-        # 2) Handle masking if provided
-        key_padding_mask = None
+        
+        # Handle masking if provided
+        patch_mask = None
         if mask is not None:
             # Patchify the mask
             mask_patches = mask.unfold(1, self.patch_size, self.patch_stride)
@@ -405,39 +398,202 @@ class PatchedGlucoseEncoder(nn.Module):
                 mask_patches = F.pad(mask, (0, self.patch_size - T))[:, None, :]
             
             # A patch is valid only if at least one point in it is valid
-            patch_valid = mask_patches.any(dim=2)  # [B, N_patches]
-            
-            # Create key padding mask for transformer (True means positions to IGNORE)
-            key_padding_mask = ~patch_valid  # [B, N_patches]
+            patch_mask = mask_patches.any(dim=2)  # [B, N_patches]
             
             # Apply mask to patches (zero out invalid points)
             patches = patches * mask_patches.float()
         
-        # 3) Project each patch into embed_dim
-        patches = patches.reshape(B_np * N_patches, self.patch_size)
-        patch_emb = self.patch_proj(patches)  # (B*N_patches, embed_dim)
-        patch_emb = self.dropout(patch_emb)
-        patch_emb = patch_emb.view(B_np, N_patches, self.embed_dim)  # => (B, N_patches, embed_dim)
+        return patches, patch_indices, patch_mask
+
+
+class PatchEncoder(nn.Module):
+    """
+    Encodes pre-patched data using a transformer.
+    """
+    def __init__(
+        self,
+        patch_size: int,
+        embed_dim: int,
+        positional_embedding: nn.Module,
+        num_heads: int = 4,
+        num_layers: int = 1,
+        layers_share_weights: bool = False,
+        dropout_rate: float = 0.2
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        self.positional_embedding = positional_embedding
         
-        # 4) Handle the masks
-        # Create a standard causal mask (non-batch dimension)
-        causal_mask = torch.triu(
-            torch.full((N_patches, N_patches), float('-inf')), diagonal=1
-        ).to(glucose_seq.device)
+        # Linear projection from patches to embedding space
+        self.patch_proj = nn.Linear(patch_size, embed_dim)
         
-        # Apply positional embeddings before transformer processing
-        patch_positions = patch_indices.unsqueeze(0).expand(B_np, -1)  # [B, N_patches]
-        patch_emb = self.positional_embedding(patch_emb, patch_positions)
-        
-        # Pass through transformer with positional information included
-        patch_emb, attn_weights = self.transformer(
-            patch_emb,
-            mask=causal_mask,
-            src_key_padding_mask=key_padding_mask.float(),
-            need_weights=return_self_attn
+        # Encoder layer
+        encoder_layer = TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 2,
+            dropout=dropout_rate,
+            activation="relu"
         )
         
-        return patch_emb, attn_weights, patch_indices
+        # Encoder
+        self.transformer = TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            norm=nn.LayerNorm(embed_dim),
+            layers_share_weights=layers_share_weights
+        )
+        
+        # Dropout
+        self.dropout = nn.Dropout(dropout_rate)
+    
+    def forward(
+        self, 
+        patches: torch.Tensor, 
+        positions: torch.Tensor,
+        patch_mask: Optional[torch.Tensor] = None,
+        return_attn: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Encode patches into the embedding space.
+        
+        Args:
+            patches: (B, N_patches, patch_size) patched data
+            positions: (B, N_patches) position indices for each patch
+            patch_mask: (B, N_patches) boolean mask where True indicates valid patches
+            return_attn: If True, returns attention weights
+            
+        Returns:
+            encodings: (B, N_patches, embed_dim) encoded patches
+            attn_weights: Optional attention weights if requested
+        """
+        B, N_patches, _ = patches.shape
+        
+        # Reshape for linear projection
+        flat_patches = patches.reshape(B * N_patches, self.patch_size)
+        
+        # Project patches to embedding dimension
+        patch_emb = self.patch_proj(flat_patches)  # (B*N_patches, embed_dim)
+        patch_emb = self.dropout(patch_emb)
+        patch_emb = patch_emb.view(B, N_patches, self.embed_dim)  # (B, N_patches, embed_dim)
+        
+        # Apply positional embeddings
+        patch_emb = self.positional_embedding(patch_emb, positions)
+        
+        # Create causal mask for transformer
+        causal_mask = torch.triu(
+            torch.full((N_patches, N_patches), float('-inf')), diagonal=1
+        ).to(patches.device)
+        
+        # Create key padding mask if patch mask is provided
+        key_padding_mask = None
+        if patch_mask is not None:
+            # In transformer, key_padding_mask=True means positions to IGNORE
+            key_padding_mask = ~patch_mask
+            # Convert to float to match mask type - this was missing
+            key_padding_mask = key_padding_mask.float()
+        
+        # Pass through transformer
+        encodings, attn_weights = self.transformer(
+            patch_emb,
+            mask=causal_mask,
+            src_key_padding_mask=key_padding_mask,
+            need_weights=return_attn
+        )
+        
+        return encodings, attn_weights
+
+
+class PatchedGlucoseEncoder(nn.Module):
+    """
+    Encodes glucose time series data using a patched approach with transformer encoder.
+    This is the main interface that composes the GlucosePatcher and PatchEncoder.
+    """
+    def __init__(
+        self, 
+        embed_dim: int, 
+        patch_size: int, 
+        patch_stride: int, 
+        positional_embedding: nn.Module, 
+        num_heads: int = 4, 
+        num_layers: int = 1, 
+        layers_share_weights: bool = False,
+        dropout_rate: float = 0.2
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        self.patch_stride = patch_stride
+        
+        # Create components
+        self.patcher = GlucosePatcher(patch_size, patch_stride)
+        self.encoder = PatchEncoder(
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            positional_embedding=positional_embedding,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            layers_share_weights=layers_share_weights,
+            dropout_rate=dropout_rate
+        )
+    
+    def forward(
+        self, 
+        glucose_seq: torch.Tensor, 
+        positions: Optional[torch.Tensor] = None, 
+        mask: Optional[torch.Tensor] = None, 
+        return_self_attn: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        """
+        Encode glucose time series data.
+        
+        Args:
+            glucose_seq: (B, T) time series of glucose values
+            positions: (B, T) position indices for each time point
+            mask: (B, T) boolean mask where True indicates valid data points
+            return_self_attn: If True, returns self-attention weights
+            
+        Returns:
+            encodings: (B, N_patches, embed_dim) encoded patches
+            attn_weights: Optional attention weights if requested
+            patch_indices: (N_patches,) indices where each patch starts
+        """
+        # Step 1: Create patches
+        patches, patch_indices, patch_mask = self.patcher(glucose_seq, mask)
+        
+        # Step 2: Handle positions for patches
+        B, N_patches, _ = patches.shape
+        
+        if positions is not None:
+            # Simplify position handling - just use provided positions
+            # Make sure dimensions match
+            if positions.size(1) != N_patches:
+                # Ensure positions matches the number of patches by interpolation
+                if positions.size(1) > N_patches:
+                    # Subsample positions if we have too many
+                    indices = torch.linspace(0, positions.size(1)-1, N_patches, device=positions.device).long()
+                    patch_positions = positions[:, indices]
+                else:
+                    # Upsample positions if we have too few
+                    # Just repeat the last position for any missing positions
+                    last_pos = positions[:, -1:].expand(-1, N_patches - positions.size(1))
+                    patch_positions = torch.cat([positions, last_pos], dim=1)
+            else:
+                patch_positions = positions
+        else:
+            # If no positions provided, use patch indices directly
+            patch_positions = patch_indices.unsqueeze(0).expand(B, -1)
+        
+        # Step 3: Encode patches
+        encodings, attn_weights = self.encoder(
+            patches=patches,
+            positions=patch_positions,
+            patch_mask=patch_mask,
+            return_attn=return_self_attn
+        )
+        
+        return encodings, attn_weights, patch_indices
 
 class TemporalEncoder(nn.Module):
     """
