@@ -605,6 +605,7 @@ class TemporalEncoder(nn.Module):
         hidden_dim: Dimension of the output embeddings
         dropout_rate: Dropout rate for regularization
         use_batch_norm: Whether to apply batch normalization to real variables
+        positional_embedding: Optional positional embedding module
     """
     def __init__(
         self,
@@ -612,7 +613,8 @@ class TemporalEncoder(nn.Module):
         real_variables: List[str],
         hidden_dim: int,
         dropout_rate: float = 0.1,
-        use_batch_norm: bool = True
+        use_batch_norm: bool = True,
+        positional_embedding: Optional[nn.Module] = None
     ):
         super().__init__()
         
@@ -621,6 +623,7 @@ class TemporalEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_cat_features = len(categorical_variable_sizes)
         self.num_real_features = len(real_variables)
+        self.positional_embedding = positional_embedding
         
         # Individual embeddings for each categorical feature
         self.cat_embeddings = nn.ModuleList([
@@ -642,10 +645,11 @@ class TemporalEncoder(nn.Module):
         )
         
         self.dropout = nn.Dropout(dropout_rate)
-        
+    
     def forward(self, 
                 temporal_categoricals: Optional[torch.Tensor] = None, 
                 temporal_reals: Optional[torch.Tensor] = None,
+                positions: Optional[torch.Tensor] = None,
                 mask: Optional[torch.Tensor] = None
                ) -> torch.Tensor:
         """
@@ -654,6 +658,7 @@ class TemporalEncoder(nn.Module):
         Args:
             temporal_categoricals: Tensor of shape (batch_size, seq_length, num_categorical_features) or None
             temporal_reals: Tensor of shape (batch_size, seq_length, num_real_features) or None
+            positions: Optional tensor of shape (batch_size, seq_length) with position indices
             mask: Optional mask of shape (batch_size, seq_length) where True indicates valid timesteps
             
         Returns:
@@ -708,6 +713,10 @@ class TemporalEncoder(nn.Module):
         
         # Reshape back to sequence form
         temporal_embeddings = temporal_embeddings_flat.reshape(batch_size, seq_length, self.hidden_dim)
+        
+        # Apply positional embeddings if provided
+        if self.positional_embedding is not None and positions is not None:
+            temporal_embeddings = self.positional_embedding(temporal_embeddings, positions)
         
         # Apply mask if provided
         if mask is not None:
