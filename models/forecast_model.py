@@ -450,11 +450,13 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # print(f"glucose_enc: {glucose_enc.shape}")
         # print(f"user_embeddings_token: {user_embeddings_token.shape}")
         
-        memory = torch.cat([
-            past_meal_enc, future_meal_enc, 
+        memory = [
+            past_meal_enc,
+            future_meal_enc,
             glucose_enc,
             user_embeddings_token
-        ], dim=1)
+        ]
+        memory = torch.cat(memory, dim=1)
 
         # 6) Prepare query embeddings for each forecast horizon step
         # Make query indices start at 1 (first future position)
