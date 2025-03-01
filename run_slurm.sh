@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=run_ppgr_transformer_v1
 #SBATCH --gpus=1
-#SBATCH --mem-per-gpu=32G
+#SBATCH --mem-per-gpu=64G
 #SBATCH --cpus-per-gpu=8
 #SBATCH --partition=h100
 #SBATCH --time=12:00:00
