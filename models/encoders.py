@@ -12,6 +12,7 @@ from .transformer_blocks import TransformerEncoderLayer, TransformerEncoder
 
 from pytorch_forecasting.models.nn import MultiEmbedding
 
+
 class MicrobiomeEncoder(nn.Module):
     """
     Encoder for microbiome features.
@@ -689,11 +690,12 @@ class TemporalEncoder(nn.Module):
         
         self.dropout = nn.Dropout(dropout_rate)
     
-    def forward(self, 
-                temporal_categoricals: Optional[torch.Tensor] = None, 
-                temporal_reals: Optional[torch.Tensor] = None,
-                positions: Optional[torch.Tensor] = None,
-                mask: Optional[torch.Tensor] = None
+    def forward(
+        self, 
+        temporal_categoricals: Optional[torch.Tensor] = None, 
+        temporal_reals: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None
                ) -> torch.Tensor:
         """
         Forward pass of the temporal encoder.
