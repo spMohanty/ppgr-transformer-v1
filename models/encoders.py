@@ -366,7 +366,7 @@ class GlucosePatcher(nn.Module):
             
         Returns:
             patches: (B, N_patches, patch_size) patched data
-            patch_indices: (N_patches,) indices where each patch starts
+            patch_indices: (N_patches,) indices where each patch ends (not starts)
             patch_mask: (B, N_patches) boolean mask for valid patches
         """
         glucose_seq = glucose_seq.float()  # Ensure float type
@@ -375,17 +375,20 @@ class GlucosePatcher(nn.Module):
         # Create patches using unfold
         patches = glucose_seq.unfold(1, self.patch_size, self.patch_stride)
         
-        # Handle edge case where T < patch_size
+        # No patches? Handle the edge case
         if patches.size(1) == 0:
+            # Create a single patch
             patches = F.pad(glucose_seq, (0, self.patch_size - T))[:, None, :]
         
-        # Get dimensions
-        _, N_patches, _ = patches.shape
+        # Get indices where each patch STARTS
+        start_indices = torch.arange(0, T - self.patch_size + 1, self.patch_stride, device=glucose_seq.device)
         
-        # Calculate patch indices
-        patch_indices = torch.arange(0, T - self.patch_size + 1, self.patch_stride, device=glucose_seq.device)
+        # Convert to indices where each patch ENDS
+        patch_indices = start_indices + (self.patch_size - 1)
+        
+        # If no patches were created, use a single index at the end
         if patch_indices.size(0) == 0:
-            patch_indices = torch.tensor([0], device=glucose_seq.device)
+            patch_indices = torch.tensor([T-1], device=glucose_seq.device)
         
         # Handle masking if provided
         patch_mask = None
@@ -557,7 +560,7 @@ class PatchedGlucoseEncoder(nn.Module):
         Returns:
             encodings: (B, N_patches, embed_dim) encoded patches
             attn_weights: Optional attention weights if requested
-            patch_indices: (N_patches,) indices where each patch starts
+            patch_indices: (N_patches,) indices where each patch ends (not starts)
         """
         # Step 1: Create patches
         patches, patch_indices, patch_mask = self.patcher(glucose_seq, mask)

@@ -342,27 +342,15 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # Center indices by subtracting (max_encoder_length - 1) for each batch item
         # This makes the last valid position have index 0
-        centered_offset = (max_encoder_length - 1) * torch.ones((B, 1), device=device, dtype=torch.long)
+        offset_value = max_encoder_length - 1
+        centered_offset = offset_value * torch.ones((B, 1), device=device, dtype=torch.long)
         
         # Apply centering to all indices
         past_indices = past_indices - centered_offset
         future_indices = future_indices - centered_offset  # Future will start at index 1
         
         # 2) Generate glucose patch position indices and center them
-        # We need to estimate where patch indices will be based on patching parameters
-        # This creates an approximation of the patch indices that will be generated inside the glucose encoder
-        patch_size = self.config.patch_size
-        patch_stride = self.config.patch_stride
-        T_glucose = past_glucose.size(1)
-        
-        # Create an estimate of patch indices (matches what's generated in glucose encoder)
-        estimated_patch_indices = torch.arange(
-            0, T_glucose - patch_size + 1, patch_stride, device=device
-        ).unsqueeze(0).expand(B, -1)
-        
-        # Apply centering to estimated patch indices
-        estimated_patch_indices = estimated_patch_indices - centered_offset
-        
+        # This time don't create estimated patch indices, we'll use the actual ones
         
         # Encode temporal information
         past_temporal_emb = self.temporal_encoder(
@@ -378,14 +366,36 @@ class MealGlucoseForecastModel(pl.LightningModule):
             mask=None  # Future usually doesn't have a mask
         )
                 
-        
         # 3) Encode glucose sequence with positional information
         glucose_enc, glucose_attn_weights, patch_indices = self.glucose_encoder(
             past_glucose, 
-            positions=estimated_patch_indices,  # Pass centered patch indices
+            positions=past_indices,  # Pass past_indices for consistency
             mask=encoder_padding_mask, 
             return_self_attn=False
         )
+        
+        # Center the patch indices using the same offset as other sequences
+        # patch_indices now already contains the END position of each patch
+        offset_tensor = torch.tensor([offset_value], device=patch_indices.device)
+        centered_patch_indices = patch_indices - offset_tensor
+        
+        # For debugging
+        # print("Centered patch indices:", centered_patch_indices)
+        
+        # Encode temporal information
+        past_temporal_emb = self.temporal_encoder(
+            temporal_categoricals=batch["past_temporal_categoricals"],
+            temporal_reals=batch["past_temporal_reals"],
+            positions=past_indices,  # Use the same positions as for meals
+            mask=encoder_padding_mask
+        )
+        future_temporal_emb = self.temporal_encoder(
+            temporal_categoricals=batch["future_temporal_categoricals"],
+            temporal_reals=batch["future_temporal_reals"],
+            positions=future_indices,  # Use the same positions as for future meals
+            mask=None  # Future usually doesn't have a mask
+        )
+                
         
         # 4) Encode past & future meals with positional information
         past_meal_enc, meal_self_attn_past = self.meal_encoder(
@@ -416,25 +426,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Add temporal embeddings to the meal + glucose encodings
         past_meal_enc = past_meal_enc + past_temporal_emb  # [B, T_past, hidden_dim]
         future_meal_enc = future_meal_enc + future_temporal_emb  # [B, T_future, hidden_dim]
-
-        # Also need to add temporal information to glucose patches
-        # We need to sample the past_temporal_emb at the patch indices
-        # This aligns temporal information with glucose patches
-        if patch_indices.dim() > 1:
-            # If patch_indices is already batched [B, N_patches]
-            glucose_temporal_emb = torch.gather(
-                past_temporal_emb, 1, 
-                patch_indices.unsqueeze(-1).expand(-1, -1, past_temporal_emb.size(-1))
-            )
-        else:
-            # If patch_indices is a single vector, expand it to each batch
-            glucose_temporal_emb = torch.gather(
-                past_temporal_emb, 1, 
-                patch_indices.unsqueeze(0).unsqueeze(-1).expand(B, -1, past_temporal_emb.size(-1))
-            )
-        
-        # Add temporal information to glucose encoding
-        glucose_enc = glucose_enc + glucose_temporal_emb
+        glucose_enc = glucose_enc + past_temporal_emb[:, centered_patch_indices, :]  # [B, N_patches, hidden_dim]
         
         # Prepare user embeddings as a separate token for memory
         user_embeddings_token = user_embeddings.unsqueeze(1)        
