@@ -101,6 +101,9 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.example_attn_weights_future = None
         self.example_meal_self_attn_past = None
         self.example_meal_self_attn_future = None
+                
+        # Create learnable type embeddings for each sequence type
+        self.type_embeddings = nn.Embedding(4, config.hidden_dim)  # 4 types: past_meals, future_meals, glucose, user
         
     def _init_positional_embeddings(self, config: ExperimentConfig) -> None:
         """Initialize the positional embeddings."""
@@ -230,10 +233,10 @@ class MealGlucoseForecastModel(pl.LightningModule):
         metadata = batch["metadata"] # Dict with metadata
         
         # Unpack temporal features if available
-        past_temporal_categoricals = batch["past_temporal_categoricals"]  # [B, T_past, num_temporal_cat_features]
-        past_temporal_reals = batch["past_temporal_reals"]                # [B, T_past, num_temporal_real_features]
-        future_temporal_categoricals = batch["future_temporal_categoricals"]  # [B, T_future, num_temporal_cat_features]
-        future_temporal_reals = batch["future_temporal_reals"]                # [B, T_future, num_temporal_real_features]
+        # past_temporal_categoricals = batch["past_temporal_categoricals"]  # [B, T_past, num_temporal_cat_features]
+        # past_temporal_reals = batch["past_temporal_reals"]                # [B, T_past, num_temporal_real_features]
+        # future_temporal_categoricals = batch["future_temporal_categoricals"]  # [B, T_future, num_temporal_cat_features]
+        # future_temporal_reals = batch["future_temporal_reals"]                # [B, T_future, num_temporal_real_features]
         
         device = past_glucose.device
         B = past_glucose.size(0)
@@ -256,15 +259,15 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # 3) Encode temporal features if available
         # have_temporal_features = (past_temporal_categoricals is not None and past_temporal_reals is not None and
         #                          future_temporal_categoricals is not None and future_temporal_reals is not None)
-        past_temporal_enc = self.temporal_encoder(
-            past_temporal_categoricals,
-            past_temporal_reals,
-            mask=encoder_padding_mask
-        )
-        future_temporal_enc = self.temporal_encoder(
-            future_temporal_categoricals,
-            future_temporal_reals
-        ) # No mask for future
+        # past_temporal_enc = self.temporal_encoder(
+        #     past_temporal_categoricals,
+        #     past_temporal_reals,
+        #     mask=encoder_padding_mask
+        # )
+        # future_temporal_enc = self.temporal_encoder(
+        #     future_temporal_categoricals,
+        #     future_temporal_reals
+        # ) # No mask for future
         
         # Get sequence lengths
         T_past = past_meal_enc.size(1)
@@ -272,16 +275,21 @@ class MealGlucoseForecastModel(pl.LightningModule):
         N_patches = glucose_enc.size(1)
         max_encoder_length = self.config.max_encoder_length
         
+        
+        # Prepare user embeddings as a separate token for memory
+        # Reshape to [B, 1, hidden_dim] to include in sequence dimension
+        user_embeddings_token = user_embeddings.unsqueeze(1)        
+        
         # Add user embeddings to meal embeddings
         user_emb_past = user_embeddings.unsqueeze(1).expand(-1, T_past, -1)  # (B, T_past, hidden_dim)
         user_emb_future = user_embeddings.unsqueeze(1).expand(-1, T_future, -1)  # (B, T_future, hidden_dim)
-        user_emb_patches = user_embeddings.unsqueeze(1).expand(-1, N_patches, -1)  # (B, N_patches, hidden_dim)
+        user_emb_patches = user_embeddings.unsqueeze(1).expand(-1, N_patches, -1)  # (B, N_patches, hidden_dim)        
         
-        # Combine with other embeddings
-        past_meal_enc = past_meal_enc + user_emb_past  # Add user context to past meals
-        future_meal_enc = future_meal_enc + user_emb_future  # Add user context to future meals
-        glucose_enc = glucose_enc + user_emb_patches  # Add user context to glucose patches
-
+        # Concat user context to past meals and project back to hidden_dim
+        past_meal_enc = past_meal_enc + user_emb_past  # [B, T_past, hidden_dim]
+        future_meal_enc = future_meal_enc + user_emb_future  # [B, T_future, hidden_dim] 
+        glucose_enc = glucose_enc + user_emb_patches  # [B, N_patches, hidden_dim]
+        
         # 4) Generate time indices for positional embeddings
         # Regular time indices
         past_indices = torch.arange(T_past, device=device).unsqueeze(0).expand(B, -1)
@@ -300,12 +308,24 @@ class MealGlucoseForecastModel(pl.LightningModule):
         glucose_enc = glucose_enc + self.time_emb(patch_indices)
         past_meal_enc = past_meal_enc + self.time_emb(past_indices)
         future_meal_enc = future_meal_enc + self.time_emb(future_indices)
+                
+        # Create type IDs for each sequence
+        past_meal_type_id = torch.zeros((B, T_past), device=device, dtype=torch.long)
+        future_meal_type_id = torch.ones((B, T_future), device=device, dtype=torch.long)
+        glucose_type_id = 2 * torch.ones((B, N_patches), device=device, dtype=torch.long)
+        user_type_id = 3 * torch.ones((B, 1), device=device, dtype=torch.long)
+        
+        # Add type embeddings to each sequence
+        past_meal_enc = past_meal_enc + self.type_embeddings(past_meal_type_id)
+        future_meal_enc = future_meal_enc + self.type_embeddings(future_meal_type_id)
+        glucose_enc = glucose_enc + self.type_embeddings(glucose_type_id)
+        user_embeddings_token = user_embeddings_token + self.type_embeddings(user_type_id)
         
         # 6) Combine all encodings in a single "memory" sequence
         memory = torch.cat([
             past_meal_enc, future_meal_enc, 
-            past_temporal_enc,
-            glucose_enc
+            glucose_enc,
+            user_embeddings_token
         ], dim=1)
 
         # 7) Prepare query embeddings for each forecast horizon step
@@ -315,7 +335,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # Get query embeddings and add positional encoding
         query_emb = self.future_time_queries(query_indices)  # [B, T_future, hidden_dim]
-        query_emb = query_emb + self.time_emb(query_indices) + future_temporal_enc
+        query_emb = query_emb + self.time_emb(query_indices)
 
         # 8) Decoder: Process queries with the memory
         decoder_output, cross_attn = self.decoder(
