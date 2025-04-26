@@ -58,7 +58,7 @@ class ExperimentConfig:
     transformer_encoder_layers_share_weights: bool = True
     transformer_decoder_layers: int = 2
     transformer_decoder_layers_share_weights: bool = True
-    add_residual_connection_before_predictions: bool = False
+    add_residual_connection_before_predictions: bool = True
     add_residual_connection_before_meal_timestep_embedding: bool = True
     num_quantiles: int = 7
     loss_iauc_weight: float = 0.00
