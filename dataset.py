@@ -1,5 +1,5 @@
 import pandas as pd
-from pytorch_forecasting.data import TimeSeriesDataSet
+# from pytorch_forecasting.data import TimeSeriesDataSet
 from loguru import logger
 
 from sklearn.preprocessing import StandardScaler
@@ -236,7 +236,7 @@ class PPGRTimeSeriesDataset(Dataset):
     
     def validate_parameters(self):
         assert self.min_encoder_length > 0, "Minimum encoder length must be greater than 0"
-        assert self.max_encoder_length > self.min_encoder_length or self.max_encoder_length is None, "Maximum encoder length must be greater than minimum encoder length, or set to False"
+        assert self.max_encoder_length is None or self.max_encoder_length >= self.min_encoder_length , "Maximum encoder length must be greater than or equal to minimum encoder length, or set to None"
         assert self.prediction_length > 0, "Prediction length must be greater than 0"
         assert self.sliding_window_stride is None or self.sliding_window_stride > 0, "Sliding window stride must be greater than 0"
         
@@ -648,7 +648,7 @@ class PPGRTimeSeriesDataset(Dataset):
         slice_anchor_row_idx = slice_metadata.anchor_row_idx
         slice_end = slice_metadata.slice_end
         
-        if self.max_encoder_length is False:
+        if self.max_encoder_length is None:
             encoder_length = self.min_encoder_length
         else:
             # Randomly sample encoder length between min and max

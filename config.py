@@ -1,4 +1,5 @@
 from dataclasses import dataclass, asdict
+from typing import Optional
 
 # -----------------------------------------------------------------------------
 # Experiment Configuration
@@ -15,8 +16,8 @@ class ExperimentConfig:
     dataloader_prefetch_factor: int = 50
 
     # Data splitting & sequence parameters
-    min_encoder_length: int = 8 * 4    # e.g., 8hrs * 4
-    max_encoder_length: int = 12 * 4   # e.g., 12hrs * 4
+    min_encoder_length: int = 12 * 4    # e.g., 8hrs * 4
+    max_encoder_length: Optional[int] = None  # if None, will default to min_encoder_length
     prediction_length: int = 4 * 4     # e.g.,  4hrs * 4
     eval_window: int = 2 * 4            # e.g., 2hrs * 4
     validation_percentage: float = 0.1
@@ -98,6 +99,10 @@ class ExperimentConfig:
     disable_plots: bool = False
 
     def __post_init__(self):
+        
+        if self.max_encoder_length is None:
+            self.max_encoder_length = self.min_encoder_length
+        
         # Set default lists if not provided.
         if self.group_by_columns is None:
             self.group_by_columns = ["timeseries_block_id"]

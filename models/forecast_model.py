@@ -647,6 +647,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # Log metrics
         self.logger.experiment.log({f"{phase}_iAUC_eh{self.eval_window}_correlation": corr.item()})
+        # Also log correlation to Lightning metrics
+        self.log(f"{phase}_iAUC_eh{self.eval_window}_correlation", corr.item(), on_step=False, on_epoch=True, prog_bar=True)
         
         # Clear outputs for the next epoch
         setattr(self, f"{phase}_outputs", [])
@@ -663,8 +665,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         """Test step."""
         return self._shared_step(batch, batch_idx, "test")
 
-    def on_test_end(self):
-        """End of test processing."""
+    def on_test_epoch_end(self):
+        """End of test epoch processing."""
         self._shared_phase_end("test")
         
     def on_fit_start(self):
