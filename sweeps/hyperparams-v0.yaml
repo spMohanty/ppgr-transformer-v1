@@ -1,7 +1,8 @@
-# wandb: Creating sweep from: sweeps/hyperparams.yaml
-# wandb: Creating sweep with ID: gadd4c5h
-# wandb: View sweep at: https://wandb.ai/mfr-ppgr-2025/meal-representations-learning-v1-hyperparams/sweeps/gadd4c5h
-# wandb: Run sweep agent with: wandb agent mfr-ppgr-2025/meal-representations-learning-v1-hyperparams/gadd4c5h
+# wandb: WARNING Using legacy-service, which is deprecated. If this is unintentional, you can fix it by ensuring you do not call `wandb.require('legacy-service')` and do not set the WANDB_X_REQUIRE_LEGACY_SERVICE environment variable.
+# wandb: Creating sweep from: sweeps/hyperparams-v0.yaml
+# wandb: Creating sweep with ID: e5fnblz1
+# wandb: View sweep at: https://wandb.ai/mfr-ppgr-2025/meal-representations-learning-v1-hyperparams/sweeps/e5fnblz1
+# wandb: Run sweep agent with: wandb agent mfr-ppgr-2025/meal-representations-learning-v1-hyperparams/e5fnblz1
 program: main.py
 command:
   - ${interpreter}
@@ -9,8 +10,8 @@ command:
   - ${args_no_boolean_flags}
 method: bayes
 metric:
-  name: val_q_loss
-  goal: minimize
+  name: val_iAUC_eh8_correlation
+  goal: maximize
 parameters:
   # Base dataset parameters (fixed)
   random_seed:
