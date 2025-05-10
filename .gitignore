@@ -196,3 +196,5 @@ animations/
 debug.ipynb
 
 lightning_logs/
+
+sweep_agent.sh
