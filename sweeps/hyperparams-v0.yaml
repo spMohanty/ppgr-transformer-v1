@@ -1,8 +1,7 @@
-# wandb: WARNING Using legacy-service, which is deprecated. If this is unintentional, you can fix it by ensuring you do not call `wandb.require('legacy-service')` and do not set the WANDB_X_REQUIRE_LEGACY_SERVICE environment variable.
 # wandb: Creating sweep from: sweeps/hyperparams-v0.yaml
-# wandb: Creating sweep with ID: e5fnblz1
-# wandb: View sweep at: https://wandb.ai/mfr-ppgr-2025/meal-representations-learning-v1-hyperparams/sweeps/e5fnblz1
-# wandb: Run sweep agent with: wandb agent mfr-ppgr-2025/meal-representations-learning-v1-hyperparams/e5fnblz1
+# wandb: Creating sweep with ID: 9u1gp29m
+# wandb: View sweep at: https://wandb.ai/mfr-ppgr-2025/meal-representations-learning-v1-hyperparams/sweeps/9u1gp29m
+# wandb: Run sweep agent with: wandb agent mfr-ppgr-2025/meal-representations-learning-v1-hyperparams/9u1gp29m
 program: main.py
 command:
   - ${interpreter}
