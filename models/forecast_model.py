@@ -15,6 +15,12 @@ import wandb
 from loguru import logger
 from tqdm import tqdm
 from torch.utils.data import DataLoader
+from torchmetrics.functional.regression import (
+    mean_squared_error,
+    mean_absolute_error,
+    mean_absolute_percentage_error,
+    symmetric_mean_absolute_percentage_error,
+)
 
 from .encoders import (
     UserEncoder, MealEncoder, PatchedGlucoseEncoder, 
@@ -749,7 +755,14 @@ class MealGlucoseForecastModel(pl.LightningModule):
         median_pred = predictions[:, :, median_idx]
         median_pred_eval = median_pred[:, :self.eval_window]
         future_glucose_unscaled_eval = future_glucose_unscaled[:, :self.eval_window]
-        rmse = torch.sqrt(F.mse_loss(median_pred_eval, future_glucose_unscaled_eval))
+        
+        # Flatten predictions and targets to 1D contiguous tensors to avoid view errors in torchmetrics
+        pred_flat = median_pred_eval.contiguous().reshape(-1)
+        target_flat = future_glucose_unscaled_eval.contiguous().reshape(-1)
+        rmse = mean_squared_error(pred_flat, target_flat, squared=False)
+        mae = mean_absolute_error(pred_flat, target_flat)
+        mape = mean_absolute_percentage_error(pred_flat, target_flat)
+        smape = symmetric_mean_absolute_percentage_error(pred_flat, target_flat)
         
         # Compute iAUC metrics
         pred_iAUC, true_iAUC = compute_iAUC(
@@ -765,6 +778,9 @@ class MealGlucoseForecastModel(pl.LightningModule):
             "metrics": {
                 "q_loss": q_loss,
                 "rmse": rmse,
+                "mae": mae,
+                "mape": mape,
+                "smape": smape,
                 f"iAUC_eh{self.eval_window}_loss": iAUC_loss,
                 f"iAUC_eh{self.eval_window}_weighted_loss": weighted_iAUC_loss,
                 "total_loss": total_loss,
