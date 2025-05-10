@@ -1,0 +1,72 @@
+# wandb: Creating sweep from: sweeps/hyperparams.yaml
+# wandb: Creating sweep with ID: gadd4c5h
+# wandb: View sweep at: https://wandb.ai/mfr-ppgr-2025/meal-representations-learning-v1-hyperparams/sweeps/gadd4c5h
+# wandb: Run sweep agent with: wandb agent mfr-ppgr-2025/meal-representations-learning-v1-hyperparams/gadd4c5h
+program: main.py
+command:
+  - ${interpreter}
+  - ${program}
+  - ${args_no_boolean_flags}
+method: bayes
+metric:
+  name: val_q_loss
+  goal: minimize
+parameters:
+  # Base dataset parameters (fixed)
+  random_seed:
+    value: 42
+  dataset_version:
+    value: v0.5
+  debug_mode:
+    value: false
+  use_cache:
+    value: true
+
+  max_encoder_length:
+    value: 48
+  prediction_length:
+    value: 16
+  eval_window:
+    value: 8
+
+  patch_size:
+    values: [4, 8, 12, 16, 24]
+  patch_stride:
+    values: [1, 2] # 15 min or 30 min stride
+
+  # Model hyperparameters to sweep
+  optimizer_lr:
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 1e-2
+  batch_size:
+    values: [512, 1024, 2048, 4096]
+  hidden_dim:
+    values: [64, 128, 256, 512]
+  num_heads:
+    values: [2, 4, 8]
+  transformer_encoder_layers:
+    values: [1, 2, 4]
+  transformer_decoder_layers:
+    values: [1, 2, 4]
+
+  loss_iauc_weight:
+    values: [0.0, 0.01, 0.02, 0.04]
+
+  dropout_rate:
+    distribution: uniform
+    min: 0.0
+    max: 0.3
+  transformer_dropout:
+    distribution: uniform
+    min: 0.0
+    max: 0.3
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1e-6
+    max: 1e-4   
+  gradient_clip_val:
+    values: [0.0, 0.1, 0.2, 0.5]
+  wandb_project:
+    value: meal-representations-learning-v1-hyperparams
+  
