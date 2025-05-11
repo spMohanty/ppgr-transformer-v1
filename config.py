@@ -26,7 +26,7 @@ class ExperimentConfig:
     encoder_length_randomization: str = "none" # "training_only", "all_sets", "none"
     
     # Aggregation
-    patch_size: int = 1 * 4 # 1 hour patch size
+    patch_size: int = 2 * 4 # 2 hour patch size
     patch_stride: int = 2  # 30 min stride
     
     meal_aggregator_type: str = "set"
@@ -53,7 +53,7 @@ class ExperimentConfig:
     # Model hyperparameters
     max_meals: int = 11  # Maximum number of meals to consider
     food_embed_dim: int = 512 # the number of dimensions from the pre-trained embeddings to use
-    hidden_dim: int = 256
+    hidden_dim: int = 64
     num_heads: int = 4
     transformer_encoder_layers: int = 2
     transformer_encoder_layers_share_weights: bool = True
@@ -62,18 +62,18 @@ class ExperimentConfig:
     add_residual_connection_before_predictions: bool = True
     add_residual_connection_before_meal_timestep_embedding: bool = True
     num_quantiles: int = 7
-    loss_iauc_weight: float = 0.00
+    loss_iauc_weight: float = 0.01
     
     # New dropout hyperparameters
-    dropout_rate: float = 0.1          # Used for projections, cross-attention, forecast MLP, etc.
+    dropout_rate: float = 0.2          # Used for projections, cross-attention, forecast MLP, etc.
     transformer_dropout: float = 0.1   # Used within Transformer layers
 
     # Training hyperparameters
     batch_size: int = 1024 * 2
     max_epochs: int = 50
-    optimizer_lr: float = 1e-4
+    optimizer_lr: float = 2e-4
     optimizer_lr_scheduler_pct_start: float = 0.1
-    weight_decay: float = 1e-5
+    weight_decay: float = 4e-6
     gradient_clip_val: float = 0.1  # Added gradient clipping parameter
 
 

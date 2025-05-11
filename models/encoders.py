@@ -352,8 +352,11 @@ class MealEncoder(nn.Module):
             if attn_weights is not None and return_self_attn:
                 # Create a full attention tensor filled with zeros
                 full_self_attn = torch.zeros(
-                    B * T, attn_weights.size(-2), attn_weights.size(-1), 
-                    device=attn_weights.device
+                    B * T,
+                    attn_weights.size(-2),
+                    attn_weights.size(-1),
+                    device=attn_weights.device,
+                    dtype=attn_weights.dtype,
                 )
                 
                 # Place the computed attention weights in the right positions

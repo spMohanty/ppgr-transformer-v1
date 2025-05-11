@@ -363,7 +363,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # Center indices by subtracting (max_encoder_length - 1) for each batch item
         # This makes the last valid position have index 0
-        offset_value = max_encoder_length - 1
+        batch_max_encoder_length = past_glucose.shape[-1] 
+        offset_value = batch_max_encoder_length - 1
         centered_offset = offset_value * torch.ones((B, 1), device=device, dtype=torch.long)
         
         # Apply centering to all indices
