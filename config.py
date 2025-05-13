@@ -26,8 +26,8 @@ class ExperimentConfig:
     encoder_length_randomization: str = "none" # "training_only", "all_sets", "none"
     
     # Aggregation
-    patch_size: int = 2 * 4 # 2 hour patch size
-    patch_stride: int = 2  # 30 min stride
+    patch_size: int = 1 * 4 # 1 hour patch size
+    patch_stride: int = 1  # 15 min stride
     
     meal_aggregator_type: str = "set"
 
@@ -53,7 +53,7 @@ class ExperimentConfig:
     # Model hyperparameters
     max_meals: int = 11  # Maximum number of meals to consider
     food_embed_dim: int = 512 # the number of dimensions from the pre-trained embeddings to use
-    hidden_dim: int = 64
+    hidden_dim: int = 512
     num_heads: int = 4
     transformer_encoder_layers: int = 2
     transformer_encoder_layers_share_weights: bool = True

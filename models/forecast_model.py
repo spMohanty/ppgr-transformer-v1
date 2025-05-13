@@ -345,7 +345,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         B = past_glucose.size(0)
         
         # Get user embeddings - now passing the entire batch to the encoder
-        user_embeddings = self.user_encoder(user_categoricals, user_reals)
+        user_embeddings = self.user_encoder(user_categoricals, user_reals) # [B, hidden_dim]
+        # breakpoint()
                 
         # Handle microbiome data
         microbiome_embeddings = self.microbiome_encoder(batch.get("user_microbiome_embeddings"))
@@ -436,14 +437,14 @@ class MealGlucoseForecastModel(pl.LightningModule):
         N_patches = glucose_enc.size(1)
         
         # Add user embeddings to meal encodings
-        user_emb_past = user_embeddings.unsqueeze(1).expand(-1, T_past, -1)  # (B, T_past, hidden_dim)
-        user_emb_future = user_embeddings.unsqueeze(1).expand(-1, T_future, -1)  # (B, T_future, hidden_dim)
-        user_emb_patches = user_embeddings.unsqueeze(1).expand(-1, N_patches, -1)  # (B, N_patches, hidden_dim)        
+        # user_emb_past = user_embeddings.unsqueeze(1).expand(-1, T_past, -1)  # (B, T_past, hidden_dim)
+        # user_emb_future = user_embeddings.unsqueeze(1).expand(-1, T_future, -1)  # (B, T_future, hidden_dim)
+        # user_emb_patches = user_embeddings.unsqueeze(1).expand(-1, N_patches, -1)  # (B, N_patches, hidden_dim)        
         
-        # Concat user context to embeddings
-        past_meal_enc = past_meal_enc + user_emb_past  # [B, T_past, hidden_dim]
-        future_meal_enc = future_meal_enc + user_emb_future  # [B, T_future, hidden_dim] 
-        glucose_enc = glucose_enc + user_emb_patches  # [B, N_patches, hidden_dim]
+        # # Concat user context to embeddings
+        # past_meal_enc = past_meal_enc + user_emb_past  # [B, T_past, hidden_dim]
+        # future_meal_enc = future_meal_enc + user_emb_future  # [B, T_future, hidden_dim] 
+        # glucose_enc = glucose_enc + user_emb_patches  # [B, N_patches, hidden_dim]
         
         # Add temporal embeddings to the meal + glucose encodings
         past_meal_enc = past_meal_enc + past_temporal_emb  # [B, T_past, hidden_dim]
