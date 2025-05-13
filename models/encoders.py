@@ -57,52 +57,49 @@ class UserEncoder(nn.Module):
     """
     Simple MLP-based user encoder for static features.
     
+    returns [B, num_user_{cat+real}_features, hidden_dim]
+    
     Args:
         categorical_variable_sizes: Dictionary mapping categorical variable names to their vocabulary sizes
         real_variables: List of names for real-valued variables
-        hidden_dim: Dimension of the output embeddings
+        hidden_dim: Dimension of the intermediate representations
         dropout_rate: Dropout rate for regularization
-        use_batch_norm: Whether to apply batch normalization to real variables
     """
     def __init__(
         self,
         categorical_variable_sizes: Dict[str, int],
         real_variables: List[str],
         hidden_dim: int,
-        output_dim: int,
         dropout_rate: float = 0.1,
-        use_batch_norm: bool = True
     ):
         super().__init__()
         
         self.categorical_variable_sizes = categorical_variable_sizes
         self.real_variables = real_variables
         self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
         self.num_cat_features = len(categorical_variable_sizes)
         self.num_real_features = len(real_variables)
+        self.total_features = self.num_cat_features + self.num_real_features
         
         # Individual embeddings for each categorical feature
         self.cat_embeddings = nn.ModuleList([
-            nn.Embedding(size, hidden_dim)
+            nn.Embedding(size, self.hidden_dim)
             for size in categorical_variable_sizes.values()
         ])
         
-        # Simple processing for real variables
-        self.real_projection = nn.Linear(self.num_real_features, hidden_dim)
-        self.batch_norm = nn.BatchNorm1d(hidden_dim) if use_batch_norm else nn.Identity()
+        # Process all real features at once with a single set of layers
+        if self.num_real_features > 0:
+            self.real_projection = nn.Sequential(
+                nn.Linear(1, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate)
+            )
         
-        # Simple feed-forward network for final projection
-        self.projection = nn.Sequential(
-            nn.Linear(hidden_dim * (self.num_cat_features + 1), hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, output_dim),
-            nn.LayerNorm(output_dim)
-        )
-        
-        self.dropout = nn.Dropout(dropout_rate)
-        
+        # Type embeddings to differentiate between each individual feature
+        # Each feature (both categorical and real) gets its own type embedding
+        self.type_embeddings = nn.Embedding(self.total_features, hidden_dim)
+                
     def forward(self, user_categoricals: torch.Tensor, user_reals: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of the user encoder.
@@ -112,33 +109,53 @@ class UserEncoder(nn.Module):
             user_reals: Tensor of shape (batch_size, num_real_features)
             
         Returns:
-            user_embeddings: Tensor of shape (batch_size, hidden_dim)
+            user_embeddings: Tensor of shape (batch_size, num_features, hidden_dim)
         """
         batch_size = user_categoricals.size(0)
+        
+        # Get the dtype from the first parameter of the model
+        dtype = next(self.parameters()).dtype
         device = user_categoricals.device
         
         # Process categorical variables
         cat_embeddings_list = []
         for i, embedding_layer in enumerate(self.cat_embeddings):
             cat_feature = user_categoricals[:, i].long()
-            cat_embeddings_list.append(embedding_layer(cat_feature))
+            # Get embeddings and add type embedding for this specific categorical feature
+            feature_emb = embedding_layer(cat_feature)  # [B, hidden_dim]
+            type_id = torch.full((batch_size,), i, device=device, dtype=torch.long)
+            feature_emb = feature_emb + self.type_embeddings(type_id)  # [B, hidden_dim]
+            cat_embeddings_list.append(feature_emb)
         
-        # Process real variables
-        if self.num_real_features > 0:
-            real_values = user_reals.float()  # [batch_size, num_reals]
-            real_embeddings = self.real_projection(real_values)
-            real_embeddings = self.batch_norm(real_embeddings)
+        # Stack categorical embeddings if any exist
+        if cat_embeddings_list:
+            cat_embeddings = torch.stack(cat_embeddings_list, dim=1)  # [B, num_cat, hidden_dim]
         else:
-            real_embeddings = torch.zeros(batch_size, self.hidden_dim, device=device)
+            cat_embeddings = torch.empty((batch_size, 0, self.hidden_dim), device=device, dtype=dtype)
         
-        # Combine all embeddings
-        all_embeddings = cat_embeddings_list + [real_embeddings]
-        combined = torch.cat(all_embeddings, dim=1)
+        # Process all real features at once
+        real_embeddings_list = []
+        if self.num_real_features > 0:
+            # Process each real feature individually to add its type embedding
+            for i in range(self.num_real_features):
+                # Get single real feature and ensure correct dtype
+                real_feature = user_reals[:, i].to(dtype=dtype).unsqueeze(-1)  # [B, 1]
+                # Project through shared layers
+                feature_emb = self.real_projection(real_feature)  # [B, hidden_dim]
+                # Add type embedding for this specific real feature
+                type_id = torch.full((batch_size,), self.num_cat_features + i, device=device, dtype=torch.long)
+                feature_emb = feature_emb + self.type_embeddings(type_id)  # [B, hidden_dim]
+                real_embeddings_list.append(feature_emb)
+            
+            # Stack all real embeddings
+            real_embeddings = torch.stack(real_embeddings_list, dim=1)  # [B, num_real, hidden_dim]
+        else:
+            real_embeddings = torch.empty((batch_size, 0, self.hidden_dim), device=device, dtype=dtype)
         
-        # Project to final embedding
-        user_embeddings = self.projection(combined)
+        # Combine categorical and real embeddings
+        combined = torch.cat([cat_embeddings, real_embeddings], dim=1)  # [B, num_features, hidden_dim]
         
-        return self.dropout(user_embeddings)
+        return combined
 
 class MealEncoder(nn.Module):
     """

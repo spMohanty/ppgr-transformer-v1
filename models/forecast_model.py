@@ -225,10 +225,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.user_encoder = UserEncoder(
             categorical_variable_sizes=categorical_variable_sizes,
             real_variables=self.user_static_reals,
-            hidden_dim=config.hidden_dim * 2,  # Feedforward dim in self-attention
-            output_dim=config.hidden_dim,
+            hidden_dim=config.hidden_dim,
             dropout_rate=config.dropout_rate,
-            use_batch_norm=False,
         )
         
         # Initialize microbiome encoder
@@ -345,8 +343,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         B = past_glucose.size(0)
         
         # Get user embeddings - now passing the entire batch to the encoder
-        user_embeddings = self.user_encoder(user_categoricals, user_reals) # [B, hidden_dim]
-        # breakpoint()
+        user_embeddings = self.user_encoder(user_categoricals, user_reals) # [B, num_user_{cat+real}_features, hidden_dim]
                 
         # Handle microbiome data
         microbiome_embeddings = self.microbiome_encoder(batch.get("user_microbiome_embeddings"))
@@ -436,15 +433,6 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Get number of glucose patches for further processing
         N_patches = glucose_enc.size(1)
         
-        # Add user embeddings to meal encodings
-        # user_emb_past = user_embeddings.unsqueeze(1).expand(-1, T_past, -1)  # (B, T_past, hidden_dim)
-        # user_emb_future = user_embeddings.unsqueeze(1).expand(-1, T_future, -1)  # (B, T_future, hidden_dim)
-        # user_emb_patches = user_embeddings.unsqueeze(1).expand(-1, N_patches, -1)  # (B, N_patches, hidden_dim)        
-        
-        # # Concat user context to embeddings
-        # past_meal_enc = past_meal_enc + user_emb_past  # [B, T_past, hidden_dim]
-        # future_meal_enc = future_meal_enc + user_emb_future  # [B, T_future, hidden_dim] 
-        # glucose_enc = glucose_enc + user_emb_patches  # [B, N_patches, hidden_dim]
         
         # Add temporal embeddings to the meal + glucose encodings
         past_meal_enc = past_meal_enc + past_temporal_emb  # [B, T_past, hidden_dim]
@@ -459,7 +447,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         microbiome_type_id = 4 * torch.ones((B, 1), device=device, dtype=torch.long)
         
         # Unqueeze user_embeddings to match the shape of past_meal_enc
-        user_embeddings = user_embeddings.unsqueeze(1).expand(B, 1, -1)
+        # user_embeddings = user_embeddings.unsqueeze(1).expand(B, 1, -1)
                 
         # Add type embeddings to each sequence
         past_meal_enc = past_meal_enc + self.type_embeddings(past_meal_type_id)
