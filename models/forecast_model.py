@@ -227,6 +227,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             real_variables=self.user_static_reals,
             hidden_dim=config.hidden_dim,
             dropout_rate=config.dropout_rate,
+            project_to_single_vector=config.project_user_features_to_single_vector,
         )
         
         # Initialize microbiome encoder
@@ -371,20 +372,6 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # 2) Generate glucose patch position indices and center them
         # This time don't create estimated patch indices, we'll use the actual ones
-        
-        # Encode temporal information
-        past_temporal_emb = self.temporal_encoder(
-            temporal_categoricals=batch["past_temporal_categoricals"],
-            temporal_reals=batch["past_temporal_reals"],
-            positions=past_indices,  # Use the same positions as for meals
-            mask=encoder_padding_mask
-        )
-        future_temporal_emb = self.temporal_encoder(
-            temporal_categoricals=batch["future_temporal_categoricals"],
-            temporal_reals=batch["future_temporal_reals"],
-            positions=future_indices,  # Use the same positions as for future meals
-            mask=None  # Future usually doesn't have a mask
-        )
                 
         # 3) Encode glucose sequence with positional information
         glucose_enc, glucose_attn_weights, patch_indices = self.glucose_encoder(
@@ -398,10 +385,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # patch_indices now already contains the END position of each patch
         offset_tensor = torch.tensor([offset_value], device=patch_indices.device)
         centered_patch_indices = patch_indices - offset_tensor
-        
-        # For debugging
-        # print("Centered patch indices:", centered_patch_indices)
-        
+                
         # Encode temporal information
         past_temporal_emb = self.temporal_encoder(
             temporal_categoricals=batch["past_temporal_categoricals"],
@@ -474,7 +458,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # Get query embeddings and add positional encoding
         query_emb = self.future_time_queries(query_indices)  # [B, T_future, hidden_dim]
-        query_emb = query_emb + self.rope_emb(query_emb, query_indices)
+        query_emb = self.rope_emb(query_emb, query_indices)
 
         # 7) Decoder: Process queries with the memory
         decoder_output, cross_attn = self.decoder(

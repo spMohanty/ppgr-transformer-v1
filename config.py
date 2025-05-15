@@ -40,6 +40,9 @@ class ExperimentConfig:
     ignore_food_macro_features: bool = False
     use_microbiome_embeddings: bool = True
     group_by_columns: list = None
+    
+    
+    project_user_features_to_single_vector: bool = False
 
     # Feature lists (users, food, temporal)
     user_static_categoricals: list = None
@@ -62,7 +65,7 @@ class ExperimentConfig:
     add_residual_connection_before_predictions: bool = True
     add_residual_connection_before_meal_timestep_embedding: bool = True
     num_quantiles: int = 7
-    loss_iauc_weight: float = 0.01
+    loss_iauc_weight: float = 0.00
     
     # New dropout hyperparameters
     dropout_rate: float = 0.2          # Used for projections, cross-attention, forecast MLP, etc.

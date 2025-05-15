@@ -57,13 +57,15 @@ class UserEncoder(nn.Module):
     """
     Simple MLP-based user encoder for static features.
     
-    returns [B, num_user_{cat+real}_features, hidden_dim]
+    returns [B, num_user_{cat+real}_features, hidden_dim] if project_to_single_vector=False
+    returns [B, 1, hidden_dim] if project_to_single_vector=True
     
     Args:
         categorical_variable_sizes: Dictionary mapping categorical variable names to their vocabulary sizes
         real_variables: List of names for real-valued variables
         hidden_dim: Dimension of the intermediate representations
         dropout_rate: Dropout rate for regularization
+        project_to_single_vector: Whether to project all user features to a single vector
     """
     def __init__(
         self,
@@ -71,6 +73,7 @@ class UserEncoder(nn.Module):
         real_variables: List[str],
         hidden_dim: int,
         dropout_rate: float = 0.1,
+        project_to_single_vector: bool = False,
     ):
         super().__init__()
         
@@ -80,6 +83,7 @@ class UserEncoder(nn.Module):
         self.num_cat_features = len(categorical_variable_sizes)
         self.num_real_features = len(real_variables)
         self.total_features = self.num_cat_features + self.num_real_features
+        self.project_to_single_vector = project_to_single_vector
         
         # Individual embeddings for each categorical feature
         self.cat_embeddings = nn.ModuleList([
@@ -99,6 +103,16 @@ class UserEncoder(nn.Module):
         # Type embeddings to differentiate between each individual feature
         # Each feature (both categorical and real) gets its own type embedding
         self.type_embeddings = nn.Embedding(self.total_features, hidden_dim)
+        
+        # Optional projection layer to combine all features into a single vector
+        if self.project_to_single_vector:
+            self.final_projection = nn.Sequential(
+                nn.Linear(hidden_dim * self.total_features, hidden_dim * 2),
+                nn.LayerNorm(hidden_dim * 2),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(hidden_dim * 2, hidden_dim)
+            )
                 
     def forward(self, user_categoricals: torch.Tensor, user_reals: torch.Tensor) -> torch.Tensor:
         """
@@ -109,7 +123,8 @@ class UserEncoder(nn.Module):
             user_reals: Tensor of shape (batch_size, num_real_features)
             
         Returns:
-            user_embeddings: Tensor of shape (batch_size, num_features, hidden_dim)
+            user_embeddings: Tensor of shape (batch_size, num_features, hidden_dim) if project_to_single_vector=False
+                           or (batch_size, 1, hidden_dim) if project_to_single_vector=True
         """
         batch_size = user_categoricals.size(0)
         
@@ -155,7 +170,13 @@ class UserEncoder(nn.Module):
         # Combine categorical and real embeddings
         combined = torch.cat([cat_embeddings, real_embeddings], dim=1)  # [B, num_features, hidden_dim]
         
-        return combined
+        if self.project_to_single_vector:
+            # Flatten and project to single vector
+            flattened = combined.reshape(batch_size, -1)  # [B, num_features * hidden_dim]
+            projected = self.final_projection(flattened)  # [B, hidden_dim]
+            return projected.unsqueeze(1)  # [B, 1, hidden_dim]
+        else:
+            return combined  # [B, num_features, hidden_dim]
 
 class MealEncoder(nn.Module):
     """
