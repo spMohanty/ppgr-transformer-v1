@@ -362,15 +362,12 @@ class MealGlucoseForecastModel(pl.LightningModule):
         )
             
         
-        # --- Cross-modal fusion block ---
-        # With the SimpleGlucoseEncoder, we now have direct timestep alignment between modalities
-        # No need for patching or complicated indexing to align different modalities
-        
+        # --- Cross-modal fusion block ---        
         # Get number of timesteps for processing
         T_past = glucose_enc.size(1)  # Now this is the full sequence length
         
         # Process microbiome embeddings
-        microb_per_timestep = microbiome_embeddings.expand(-1, T_past, -1)  # [B, T_past, hidden_dim]
+        microbiome_per_timestep = microbiome_embeddings.expand(-1, T_past, -1)  # [B, T_past, hidden_dim]
         
         # Prepare inputs for CrossModalFusion for past timesteps
         # Create a list of modality tensors
@@ -378,7 +375,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             glucose_enc,           # [B, T_past, hidden_dim]
             past_meal_enc,         # [B, T_past, hidden_dim]
             past_temporal_emb,     # [B, T_past, hidden_dim]
-            microb_per_timestep    # [B, T_past, hidden_dim]
+            microbiome_per_timestep    # [B, T_past, hidden_dim]
         ]
         
         # Add user embeddings to modalities (either as a single vector or individual features)
