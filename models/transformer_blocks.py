@@ -277,22 +277,31 @@ class CrossModalFusionBlock(nn.Module):
         # Optionally: A learnable query token per modality (could help, but start simple)
         # self.modality_query = nn.Parameter(torch.randn(1, num_modalities, hidden_dim))
 
-    def forward(self, modal_inputs):
+    def forward(self, modal_inputs, return_attn_weights=True):
         """
         modal_inputs: [B, T, N_modalities, D]
-        Returns: [B, T, D] (fused vector per time step)
+        Returns: 
+            fused: [B, T, D] (fused vector per time step)
+            attn_weights: [B, T, N_modalities, N_modalities] (attention weights per time step) if return_attn_weights=True
         """
         B, T, N, D = modal_inputs.shape
         # Flatten B, T for batched attention over each timestep independently
         x = modal_inputs.view(B * T, N, D)  # [B*T, N_modalities, D]
         # Self-attention across modalities at each time step
-        fused, _ = self.attn(x, x, x)  # [B*T, N, D]
+        fused, attn_weights = self.attn(x, x, x, need_weights=return_attn_weights)  # [B*T, N, D], [B*T, N, N]
         # Mean-pool across modalities
         fused = fused.mean(dim=1)      # [B*T, D]
         fused = self.norm(fused)
         fused = self.dropout(fused)
         fused = fused.view(B, T, D)
-        return fused
+        
+        # Process attention weights if needed
+        if return_attn_weights and attn_weights is not None:
+            # Reshape attention weights to [B, T, N_modalities, N_modalities]
+            attn_weights = attn_weights.view(B, T, N, N)
+            return fused, attn_weights
+        
+        return fused, None
 
 class TransformerVariableSelectionNetwork(nn.Module):
     def __init__(

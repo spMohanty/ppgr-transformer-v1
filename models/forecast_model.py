@@ -101,58 +101,33 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Store whether we're using projected user features
         self.use_projected_user_features = config.project_user_features_to_single_vector
         
-        # Build input sizes dictionary for past VSN - include individual user features
-        past_input_sizes = {
-            "glucose": config.hidden_dim,
-            "meal": config.hidden_dim,
-            "temporal": config.hidden_dim,
-            "microbiome": config.hidden_dim
-        }
-        
-        # Store the number of base modalities for later use
-        self.past_base_modalities = len(past_input_sizes)
-        
-        # If using projected user features, add a single user feature
-        # Otherwise, add each user feature individually
+        # Replace VSNs with CrossModalFusion blocks
+        # Count the number of modalities for past and future
+        self.past_num_modalities = 4  # glucose, meal, temporal, microbiome
         if self.use_projected_user_features:
-            past_input_sizes["user"] = config.hidden_dim
+            self.past_num_modalities += 1  # projected user features
         else:
-            # Add each user feature as a separate input
-            for feature in user_static_categoricals + user_static_reals:
-                past_input_sizes[f"user_{feature}"] = config.hidden_dim
+            self.past_num_modalities += len(user_static_categoricals) + len(user_static_reals)  # individual user features
             
-        self.past_vsn = TransformerVariableSelectionNetwork(
-            input_sizes=past_input_sizes,
-            hidden_size=config.hidden_dim,
-            n_heads=config.num_heads,
-            dropout=config.dropout_rate,
-            context_size=config.hidden_dim  # Pass user context to inform selection
+        self.past_fusion = CrossModalFusionBlock(
+            hidden_dim=config.hidden_dim,
+            num_modalities=self.past_num_modalities,
+            num_heads=config.num_heads,
+            fusion_dropout=config.dropout_rate
         )
         
         # Future modalities: meal, temporal, user (individual features), microbiome (no glucose)
-        future_input_sizes = {
-            "meal": config.hidden_dim,
-            "temporal": config.hidden_dim,
-            "microbiome": config.hidden_dim
-        }
-        
-        # Store the number of base modalities for later use
-        self.future_base_modalities = len(future_input_sizes)
-        
-        # Add user features to future inputs as well
+        self.future_num_modalities = 3  # meal, temporal, microbiome
         if self.use_projected_user_features:
-            future_input_sizes["user"] = config.hidden_dim
+            self.future_num_modalities += 1  # projected user features
         else:
-            # Add each user feature as a separate input
-            for feature in user_static_categoricals + user_static_reals:
-                future_input_sizes[f"user_{feature}"] = config.hidden_dim
+            self.future_num_modalities += len(user_static_categoricals) + len(user_static_reals)  # individual user features
             
-        self.future_vsn = TransformerVariableSelectionNetwork(
-            input_sizes=future_input_sizes,
-            hidden_size=config.hidden_dim,
-            n_heads=config.num_heads,
-            dropout=config.dropout_rate,
-            context_size=config.hidden_dim  # Pass user context to inform selection
+        self.future_fusion = CrossModalFusionBlock(
+            hidden_dim=config.hidden_dim,
+            num_modalities=self.future_num_modalities,
+            num_heads=config.num_heads,
+            fusion_dropout=config.dropout_rate
         )
         
         # Final projection: hidden_dim -> num_quantiles
@@ -397,57 +372,88 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Process microbiome embeddings
         microb_per_timestep = microbiome_embeddings.expand(-1, T_past, -1)  # [B, T_past, hidden_dim]
         
-        # Create inputs for VSN as dictionary - base modalities first
-        past_inputs = {
-            "glucose": glucose_enc,
-            "meal": past_meal_enc,
-            "temporal": past_temporal_emb,
-            "microbiome": microb_per_timestep
-        }
+        # Prepare inputs for CrossModalFusion for past timesteps
+        # Create a list of modality tensors
+        past_modalities = [
+            glucose_enc,           # [B, T_past, hidden_dim]
+            past_meal_enc,         # [B, T_past, hidden_dim]
+            past_temporal_emb,     # [B, T_past, hidden_dim]
+            microb_per_timestep    # [B, T_past, hidden_dim]
+        ]
         
-        # Get expanded user embeddings and update the inputs dictionary
-        user_embeddings_past = expand_user_embeddings(
-            user_embeddings=user_embeddings, 
-            timesteps=T_past,
-            user_categorical_features=self.user_categorical_features,
-            user_real_features=self.user_real_features,
-            use_projected_user_features=self.use_projected_user_features
-        )
-        past_inputs.update(user_embeddings_past)
+        # Add user embeddings to modalities (either as a single vector or individual features)
+        if self.use_projected_user_features:
+            # Project all user features to a single vector
+            if user_embeddings.dim() == 3:  # [B, num_features, hidden_dim]
+                user_emb_combined = user_embeddings.mean(dim=1, keepdim=True)  # [B, 1, hidden_dim]
+            else:  # Already [B, hidden_dim]
+                user_emb_combined = user_embeddings.unsqueeze(1)  # [B, 1, hidden_dim]
+            # Expand to match sequence length
+            user_emb_expanded = user_emb_combined.expand(-1, T_past, -1)  # [B, T_past, hidden_dim]
+            past_modalities.append(user_emb_expanded)
+        else:
+            # Add each user feature as a separate modality
+            for i, feature in enumerate(self.user_categorical_features + self.user_real_features):
+                # Get the feature embedding
+                feature_emb = user_embeddings[:, i, :].unsqueeze(1)  # [B, 1, hidden_dim]
+                # Expand to match sequence length
+                feature_emb_expanded = feature_emb.expand(-1, T_past, -1)  # [B, T_past, hidden_dim]
+                past_modalities.append(feature_emb_expanded)
         
-        # Get user context for VSN
-        user_context = get_user_context(
-            user_embeddings=user_embeddings,
-            use_projected_user_features=self.use_projected_user_features
-        )
+        # Stack modalities along a new dimension
+        # From list of [B, T_past, hidden_dim] to [B, T_past, num_modalities, hidden_dim]
+        past_modalities_stacked = torch.stack(past_modalities, dim=2)
         
-        # Pass through VSN for past timesteps
-        fused_glucose_past, past_weights = self.past_vsn(past_inputs, context=user_context)  # [B, T_past, D]
-
-        # Process future modalities - similar approach for user features
+        # Apply CrossModalFusion
+        fused_glucose_past, past_attn_weights = self.past_fusion(past_modalities_stacked)  # [B, T_past, hidden_dim], [B, T_past, N, N]
+        
+        # Convert CrossModalFusion attention weights to feature importance weights
+        # We'll use the mean attention score that each modality receives from all others
+        if past_attn_weights is not None:
+            # Average across all query modalities to get how much each modality is attended to
+            past_weights = past_attn_weights.mean(dim=2)  # [B, T_past, num_modalities]
+        else:
+            # Fallback to uniform weights if attention isn't available
+            past_weights = torch.ones(B, T_past, self.past_num_modalities, device=device) / self.past_num_modalities
+        
+        # Similar approach for future modalities
         T_future = future_meal_ids.size(1) if future_meal_ids is not None else 0
         microbiome_per_timestep_future = microbiome_embeddings.expand(-1, T_future, -1)
-
-        # Create inputs for future VSN as dictionary
-        future_inputs = {
-            "meal": future_meal_enc,
-            "temporal": future_temporal_emb,
-            "microbiome": microbiome_per_timestep_future
-        }
         
-        # Get expanded user embeddings for future and update the inputs dictionary
-        user_embeddings_future = expand_user_embeddings(
-            user_embeddings=user_embeddings, 
-            timesteps=T_future,
-            user_categorical_features=self.user_categorical_features,
-            user_real_features=self.user_real_features,
-            use_projected_user_features=self.use_projected_user_features,
-            prefix="user_"
-        )
-        future_inputs.update(user_embeddings_future)
+        # Prepare inputs for CrossModalFusion for future timesteps
+        future_modalities = [
+            future_meal_enc,              # [B, T_future, hidden_dim]
+            future_temporal_emb,          # [B, T_future, hidden_dim]
+            microbiome_per_timestep_future # [B, T_future, hidden_dim]
+        ]
         
-        # Pass through VSN for future timesteps with the same user context
-        fused_meal_future, future_weights = self.future_vsn(future_inputs, context=user_context)  # [B, T_future, D]
+        # Add user embeddings to future modalities
+        if self.use_projected_user_features:
+            # Use the same projected user embedding but expand to T_future
+            user_emb_expanded = user_emb_combined.expand(-1, T_future, -1)  # [B, T_future, hidden_dim]
+            future_modalities.append(user_emb_expanded)
+        else:
+            # Add each user feature as a separate modality
+            for i, feature in enumerate(self.user_categorical_features + self.user_real_features):
+                # Get the feature embedding
+                feature_emb = user_embeddings[:, i, :].unsqueeze(1)  # [B, 1, hidden_dim]
+                # Expand to match sequence length
+                feature_emb_expanded = feature_emb.expand(-1, T_future, -1)  # [B, T_future, hidden_dim]
+                future_modalities.append(feature_emb_expanded)
+        
+        # Stack future modalities
+        future_modalities_stacked = torch.stack(future_modalities, dim=2)  # [B, T_future, num_modalities, hidden_dim]
+        
+        # Apply CrossModalFusion
+        fused_meal_future, future_attn_weights = self.future_fusion(future_modalities_stacked)  # [B, T_future, hidden_dim], [B, T_future, N, N]
+        
+        # Convert future CrossModalFusion attention weights to feature importance weights
+        if future_attn_weights is not None:
+            # Average across all query modalities to get how much each modality is attended to
+            future_weights = future_attn_weights.mean(dim=2)  # [B, T_future, num_modalities]
+        else:
+            # Fallback to uniform weights if attention isn't available
+            future_weights = torch.ones(B, T_future, self.future_num_modalities, device=device) / self.future_num_modalities
         
         # Ensure future meal embeddings have positional information
         fused_meal_future = self.rope_emb(fused_meal_future, future_indices)
@@ -609,7 +615,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             # Past weights
             log_vsn_feature_weights(
                 vsn_weights=past_vsn_weights,
-                base_modalities_count=self.past_base_modalities,
+                base_modalities_count=self.past_num_modalities,
                 user_categorical_features=self.user_categorical_features,
                 user_real_features=self.user_real_features,
                 use_projected_user_features=self.use_projected_user_features,
@@ -621,7 +627,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             # Future weights
             log_vsn_feature_weights(
                 vsn_weights=future_vsn_weights,
-                base_modalities_count=self.future_base_modalities,
+                base_modalities_count=self.future_num_modalities,
                 user_categorical_features=self.user_categorical_features,
                 user_real_features=self.user_real_features,
                 use_projected_user_features=self.use_projected_user_features,
