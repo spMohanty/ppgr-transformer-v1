@@ -70,8 +70,7 @@ def plot_forecast(
         "forecast":    "#2471A3",
         "uncertainty":"#2471A3",
         "meal":        "#7D3C98",
-        "attention":   ['#35193e', '#701f57', '#ad1759', '#e13342', '#f37651', '#f6b48f'], # Same as rocket
-        "custom_attention": [
+        "attention": [
             "#1B1B2F",  # dark base
             "#3C2C54",  # plum
             "#722744",  # red-violet
