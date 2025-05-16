@@ -234,7 +234,7 @@ def plot_forecast(
         for spine in ["top", "right"]:
             ax_at.spines[spine].set_visible(False)
         ax_at.spines["left"].set_edgecolor("grey")
-        ax_at.spines["bottom"].set_edgecolor("grey")
+        ax_at.spines["bottom"].set_visible(False)  # Hide the bottom (x-axis) line
         ax_at.text(
             0.98, 0.02, "Attention Map", transform=ax_at.transAxes,
             ha="right", va="bottom",
@@ -248,6 +248,8 @@ def plot_forecast(
         cbar.outline.set_visible(False)  # Remove the boundary/outline of the colorbar
         cax.set_ylabel("Attention Weight", fontsize=mpl.rcParams["axes.labelsize"]-1)
         cax.tick_params(labelsize=mpl.rcParams["xtick.labelsize"]-1)
+        # Keep the tick labels but remove the tick markers
+        cbar.ax.tick_params(size=0)  # This removes just the tick marks while keeping labels
     else:
         # When we only have the time series plot
         fig.subplots_adjust(left=0.1, right=0.95, top=0.92, bottom=0.15)
