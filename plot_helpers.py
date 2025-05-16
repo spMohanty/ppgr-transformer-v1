@@ -6,6 +6,256 @@ import wandb
 import argparse
 from typing import Optional, Union, Dict, List, Tuple
 
+import matplotlib as mpl
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import LinearSegmentedColormap
+import seaborn as sns
+
+def plot_forecast(
+    true_history: np.ndarray,
+    true_future: Optional[np.ndarray],
+    median_forecast: np.ndarray,
+    quantile_forecasts: np.ndarray,
+    encoder_attention_map: Optional[np.ndarray] = None,
+    decoder_attention_map: Optional[np.ndarray] = None,
+    meal_flags: Optional[np.ndarray] = None,
+    loss_value: Optional[float] = None,
+    show_observed_future: bool = True,
+) -> plt.Figure:
+    """
+    Plot historical + observed + forecast with uncertainty bands and optional attention heatmap.
+    
+    Parameters
+    ----------
+    true_history : 1D array, length = H
+        The observed values before t=0.
+    true_future : 1D array or None, length = F
+        The actual observed values after t=0 (if available).
+    median_forecast : 1D array, length = F
+        The median forecast values.
+    quantile_forecasts : 2D array, shape = (F, Q)
+        The quantile forecasts (each column is one quantile level).
+    encoder_attention_map : 2D array or None, shape = (F, H)
+        If provided, shown as a heatmap below the time series.
+    decoder_attention_map : 2D array or None, shape = (F, F)
+        If provided, shown as a heatmap below the time series.
+    meal_flags : 1D bool array or None, length = H+F
+        If provided, draws vertical tick at each True.
+    loss_value : float or None
+        If provided, appended to the title.
+    show_observed_future : bool
+        Whether to plot `true_future` (if given).
+    """
+    # — Convert torch tensors to numpy arrays if needed —
+    def convert_to_numpy(x):
+        if x is None:
+            return None
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy()
+        return x
+    
+    true_history = convert_to_numpy(true_history)
+    true_future = convert_to_numpy(true_future)
+    median_forecast = convert_to_numpy(median_forecast)
+    quantile_forecasts = convert_to_numpy(quantile_forecasts)
+    encoder_attention_map = convert_to_numpy(encoder_attention_map)
+    decoder_attention_map = convert_to_numpy(decoder_attention_map)
+    meal_flags = convert_to_numpy(meal_flags)
+    
+    # — style & palette —
+    sns.set_style("white")
+    PALETTE = {
+        "historical":  "#2E4057",
+        "observed":    "#CB4335",
+        "forecast":    "#2471A3",
+        "uncertainty":"#2471A3",
+        "meal":        "#7D3C98",
+        "attention":   ['#35193e', '#701f57', '#ad1759', '#e13342', '#f37651', '#f6b48f'], # Same as rocket
+        "custom_attention": [
+            "#1B1B2F",  # dark base
+            "#3C2C54",  # plum
+            "#722744",  # red-violet
+            "#A7442A",  # copper rose
+            "#DA7422",  # amber
+            "#F6B78C",  # peach glow
+            "#FBE3D1", # champagne
+        ],        
+    }
+    
+    attention_cmap = LinearSegmentedColormap.from_list(
+        "attention_cmap", PALETTE["custom_attention"], N=512
+    )
+    mpl.rcParams.update({
+        'font.family':'serif',
+        'font.serif':['DejaVu Serif','Liberation Serif','serif'],
+        'font.size':10,
+        'axes.titlesize':12,
+        'axes.labelsize':11,
+        'xtick.labelsize':10,
+        'ytick.labelsize':10,
+        'legend.fontsize':10,
+        'axes.linewidth':1.2,
+        'xtick.direction':'in',
+        'ytick.direction':'in',
+        'xtick.major.width':1.0,
+        'ytick.major.width':1.0,
+    })
+
+    # — unwrap shapes —
+    H = true_history.size
+    F = median_forecast.size
+    total_len = H + F
+
+    # — build index vectors —
+    hist_idx = np.arange(H)
+    fut_idx  = H + np.arange(F)
+    combined_idx = np.arange(total_len)
+
+    # — relative time labels —
+    rel_steps = np.concatenate([np.arange(-H+1, 1), np.arange(1, F+1)])
+    zero_pos  = int(np.where(rel_steps == 0)[0][0])
+    
+    # Generate ticks from -H to F in steps of 4, ensuring 0 is included
+    neg_ticks = np.arange(0, -H, -4)[::-1]  # From 0 to -H in steps of -4, then reverse
+    if neg_ticks[0] != 0:  # Ensure 0 is included
+        neg_ticks = np.concatenate([[0], neg_ticks])
+    pos_ticks = np.arange(4, F+1, 4)  # From 4 to F in steps of 4
+    tick_rel = np.concatenate([neg_ticks, pos_ticks])
+    
+    tick_pos  = zero_pos + tick_rel
+    valid     = (tick_pos >= 0) & (tick_pos < total_len)
+    tick_pos  = tick_pos[valid]
+    tick_lbl  = tick_rel[valid]
+    
+
+    # — start figure —
+    fig = plt.figure(figsize=(12, 8), constrained_layout=False)
+    nrows = 2 if encoder_attention_map is not None else 1
+    ncols = 2 if encoder_attention_map is not None else 1  # Add an extra column for the colorbar
+    height_ratios = [3, 1] if encoder_attention_map is not None else [1]
+    width_ratios = [60, 1] if encoder_attention_map is not None else [1]  # Main plot gets 20x width of colorbar
+
+    if encoder_attention_map is not None:
+        # Create grid with extra column for colorbar
+        gs = gridspec.GridSpec(nrows, ncols, height_ratios=height_ratios, width_ratios=width_ratios,
+                               hspace=0.3, wspace=0.02, figure=fig)
+        ax_ts = fig.add_subplot(gs[0, 0])  # Time series in top-left
+        ax_at = fig.add_subplot(gs[1, 0], sharex=ax_ts)  # Attention map in bottom-left
+        cax = fig.add_subplot(gs[1, 1])  # Colorbar in bottom-right
+    else:
+        # Original layout when there's no attention map
+        gs = gridspec.GridSpec(nrows, 1, height_ratios=height_ratios,
+                               hspace=0.3, figure=fig)
+        ax_ts = fig.add_subplot(gs[0])
+        ax_at = None
+        cax = None
+
+    # — plot history —
+    ax_ts.plot(hist_idx, true_history,
+               color=PALETTE["historical"], lw=2, marker="o", ms=6,
+               markerfacecolor="white", markeredgecolor=PALETTE["historical"],
+               label="Historical")
+
+    # — plot observed future —
+    if show_observed_future and (true_future is not None) and true_future.size:
+        ext_i = np.concatenate([[H-1], fut_idx])
+        ext_v = np.concatenate([[true_history[-1]], true_future])
+        ax_ts.plot(ext_i, ext_v,
+                   color=PALETTE["observed"], lw=2, marker="o", ms=6,
+                   markerfacecolor="white", markeredgecolor=PALETTE["observed"],
+                   label="Observed")
+
+    # — plot median forecast —
+    ext_i = np.concatenate([[H-1], fut_idx])
+    ext_med = np.concatenate([[true_history[-1]], median_forecast])
+    ax_ts.plot(ext_i, ext_med,
+               color=PALETTE["forecast"], lw=2, ls="--", label="Forecast")
+
+    # — plot uncertainty bands —
+    # Flag to ensure we only add the quantile explanation to the legend once
+    quantile_legend_added = False
+    
+    for q in range(quantile_forecasts.shape[1] - 1):
+        low  = np.minimum(quantile_forecasts[:, q],   quantile_forecasts[:, q+1])
+        high = np.maximum(quantile_forecasts[:, q], quantile_forecasts[:, q+1])
+        alpha = 0.05 + abs(q - (quantile_forecasts.shape[1]//2))*0.02
+        
+        # Only add the legend entry for the middle quantile (most visible)
+        label = None
+        if q == quantile_forecasts.shape[1]//2 and not quantile_legend_added:
+            label = "Forecast Quantiles"
+            quantile_legend_added = True
+        
+        ax_ts.fill_between(
+            ext_i,
+            np.concatenate([[true_history[-1]], low]),
+            np.concatenate([[true_history[-1]], high]),
+            color=PALETTE["uncertainty"], alpha=alpha,
+            label=label
+        )
+
+    # — meal event lines —
+    if meal_flags is not None:
+        for pos, flag in enumerate(meal_flags):
+            if flag:
+                ax_ts.axvline(pos, ls=":", lw=1.2, color=PALETTE["meal"],
+                              label="Meal"
+                                if "Meal" not in ax_ts.get_legend_handles_labels()[1]
+                                else None)
+
+    # — axes formatting —
+    ax_ts.set_xticks(tick_pos)
+    ax_ts.set_xticklabels(tick_lbl)
+    ax_ts.axvline(zero_pos, color="black", lw=1.2, label="t=0")
+    ax_ts.set_ylabel("Glucose (mmol/L)")
+    ax_ts.legend(loc="upper left", frameon=True, framealpha=0.6, facecolor='white', edgecolor='none', 
+                handlelength=1.5, handletextpad=0.5)
+    for spine in ["top", "right"]:
+        ax_ts.spines[spine].set_visible(False)
+
+    # — title with optional loss —
+    title = "Glucose Forecast"
+    if loss_value is not None:
+        title += f" (Loss: {loss_value:.3f})"
+    ax_ts.set_title(title)
+
+    # — attention heatmap —
+    if encoder_attention_map is not None and decoder_attention_map is not None and ax_at is not None:
+        attention_map = np.concatenate([encoder_attention_map, decoder_attention_map], axis=1)
+        # Plot the attention map
+        im = ax_at.imshow(attention_map, aspect="auto", origin="lower", cmap=attention_cmap)
+        ax_at.set_ylabel("Forecast Step")
+        ax_at.set_xlabel("Relative Timestep\n(15 min intervals)")
+        ax_at.set_xticks(tick_pos)
+        ax_at.set_xticklabels(tick_lbl)
+        y_ticks = np.arange(0, attention_map.shape[0], 4)
+        ax_at.set_yticks(y_ticks)
+        ax_at.set_yticklabels(y_ticks + 1)
+        for spine in ["top", "right"]:
+            ax_at.spines[spine].set_visible(False)
+        ax_at.spines["left"].set_edgecolor("grey")
+        ax_at.spines["bottom"].set_edgecolor("grey")
+        ax_at.text(
+            0.98, 0.02, "Attention Map", transform=ax_at.transAxes,
+            ha="right", va="bottom",
+            fontsize=mpl.rcParams["legend.fontsize"],
+            family=mpl.rcParams["font.family"],
+            color="white", alpha=0.7
+        )
+        
+        # Use the dedicated colorbar axis created in the GridSpec
+        cbar = plt.colorbar(im, cax=cax)
+        cbar.outline.set_visible(False)  # Remove the boundary/outline of the colorbar
+        cax.set_ylabel("Attention Weight", fontsize=mpl.rcParams["axes.labelsize"]-1)
+        cax.tick_params(labelsize=mpl.rcParams["xtick.labelsize"]-1)
+    else:
+        # When we only have the time series plot
+        fig.subplots_adjust(left=0.1, right=0.95, top=0.92, bottom=0.15)
+
+    return [fig]
+
+
+
 def plot_forecast_examples(
     forecasts, 
     attn_weights_past, 
@@ -57,124 +307,31 @@ def plot_forecast_examples(
         fixed_indices = random.sample(list(range(past.size(0))), num_examples)
     sampled_indices = fixed_indices
 
-    # Create subplots: 
-    # - For each example, we have 1 row and up to 3 columns:
-    #     [0] time-series plot
-    #     [1] past attention heatmap (if available)
-    #     [2] future attention heatmap (if available)
-    #
-    # But if attn_weights_past or attn_weights_future is None, we skip that column
-    # and reduce the subplot columns as needed.
-    n_cols = 1
-    if attn_weights_past is not None:
-        n_cols += 1
-    if attn_weights_future is not None:
-        n_cols += 1
-    
-    fig, axs = plt.subplots(num_examples, n_cols, figsize=(6 * n_cols, 4 * num_examples))
-    
-    # If there's only 1 example, axs is 1D if n_cols>1, or just a single Axes if n_cols=1
-    if num_examples == 1:
-        axs = np.array([axs])  # make it 2D for consistency
-    if n_cols == 1:
-        # One column only => rework into 2D array
-        axs = axs[:, None]
 
-    for i, idx in enumerate(sampled_indices):
-        col_idx = 0
-        # Column 0: Time-series + forecast
-        ax_ts = axs[i][col_idx]
-        col_idx += 1
-
-        past_i = past[idx].cpu().numpy()
-        pred_i = pred[idx].cpu().numpy()   # shape (T_forecast, Q)
-        truth_i = truth[idx].cpu().numpy() # shape (T_forecast, )
+    figs = []
+    for sampled_idx in sampled_indices:
         
-        T_context = past_i.shape[0]
-        T_forecast = pred_i.shape[0]
-        x_hist = list(range(-T_context + 1, 1))
-        x_forecast = list(range(1, T_forecast + 1))
-
-        # Historical glucose
-        ax_ts.plot(x_hist, past_i, marker="o", markersize=2, label="Historical Glucose")
-
-        # Ground-truth future
-        ax_ts.plot(x_forecast, truth_i, marker="o", markersize=2, label="Ground Truth")
-
-        # Plot quantile forecasts (shaded)
-        median_index = pred_i.shape[1] // 2
-        base_color = "blue"
-        # Fill intervals between consecutive quantiles
-        # e.g. pred_i[:,0]..pred_i[:,1], pred_i[:,1]..pred_i[:,2], etc.
-        for qi in range(pred_i.shape[1] - 1):
-            alpha_val = 0.1 + (abs(qi - median_index)) * 0.05
-            q_lower = np.minimum(pred_i[:, qi], pred_i[:, qi+1])
-            q_upper = np.maximum(pred_i[:, qi], pred_i[:, qi+1])
-            ax_ts.fill_between(
-                x_forecast, q_lower, q_upper,
-                color=base_color, alpha=alpha_val
-            )
-        # The "median" line
-        ax_ts.plot(
-            x_forecast, pred_i[:, median_index],
-            marker="o", markersize=2, color="darkblue", label="Median Forecast"
+        median_index = pred[sampled_idx].shape[1] // 2
+        median_forecast = pred[sampled_idx][:, median_index]
+        
+        meal_flags = torch.concat(
+            (meal_ids_past[sampled_idx].sum(axis=1) > 0, 
+                meal_ids_future[sampled_idx].sum(axis=1) > 0), 
+            axis=0
         )
-
-        # Overplot vertical lines where "non‐padding" meals are present
-        meal_label_added = False
-        # Past meal lines
-        meals_past = meal_ids_past[idx].cpu().numpy()
-        T_past_meals = meals_past.shape[0]
-        for t, meal in enumerate(meals_past):
-            # If any non‐zero ID => there's a meal
-            if (meal != 0).any():
-                relative_time = t - T_past_meals + 1
-                if not meal_label_added:
-                    ax_ts.axvline(x=relative_time, color="purple", linestyle="--", alpha=0.7, label="Meal Consumption")
-                    meal_label_added = True
-                else:
-                    ax_ts.axvline(x=relative_time, color="purple", linestyle="--", alpha=0.7)
-        # Future meal lines
-        meals_future = meal_ids_future[idx].cpu().numpy()
-        for t, meal in enumerate(meals_future):
-            if (meal != 0).any():
-                relative_time = t + 1
-                ax_ts.axvline(x=relative_time, color="purple", linestyle="--", alpha=0.7)
-
-        ax_ts.set_xlabel("Relative Timestep")
-        ax_ts.set_ylabel("Glucose Level (mmol/L)")
-        ax_ts.set_title(f"Forecast Example {i} (Idx: {idx})")
-        ax_ts.legend(fontsize="small")
         
-        # Column 1 (if attn_weights_past is not None): Past attention
-        if attn_weights_past is not None:
-            ax_attn_past = axs[i][col_idx]
-            col_idx += 1
-            attn_past_i = attn_weights_past[idx].cpu().numpy()
-            im_past = ax_attn_past.imshow(attn_past_i, aspect="auto", cmap="viridis")
-            ax_attn_past.set_title("Past Meals Attention")
-            ax_attn_past.set_xlabel("Past Meal Timestep")
-            ax_attn_past.set_ylabel("Glucose Timestep")
-            cbar_past = fig.colorbar(im_past, ax=ax_attn_past, fraction=0.046, pad=0.04)
-            cbar_past.set_label("Attention Weight", fontsize=8)
-
-        # Column 2 (if attn_weights_future is not None): Future attention
-        if attn_weights_future is not None:
-            ax_attn_future = axs[i][col_idx]
-            col_idx += 1
-            attn_future_i = attn_weights_future[idx].cpu().numpy()
-            im_future = ax_attn_future.imshow(attn_future_i, aspect="auto", cmap="viridis")
-            ax_attn_future.set_title("Future Meals Attention")
-            ax_attn_future.set_xlabel("Future Meal Timestep")
-            ax_attn_future.set_ylabel("Glucose Timestep")
-            cbar_future = fig.colorbar(im_future, ax=ax_attn_future, fraction=0.046, pad=0.04)
-            cbar_future.set_label("Attention Weight", fontsize=8)
-
-    fig.tight_layout()
-
-    # Log to W&B
-    logger.experiment.log({"forecast_samples": wandb.Image(fig), "global_step": global_step})
-    return fixed_indices, fig
+        figs += plot_forecast(
+                true_history=past[sampled_idx], 
+                true_future=truth[sampled_idx], 
+                median_forecast=median_forecast,
+                quantile_forecasts=pred[sampled_idx],
+                encoder_attention_map=attn_weights_past[sampled_idx],
+                decoder_attention_map=attn_weights_future[sampled_idx],
+                meal_flags=meal_flags,
+                loss_value=None
+            )
+        
+    return fixed_indices, figs
 
 
 def plot_iAUC_scatter(all_pred_iAUC, all_true_iAUC, disable_plots=False):
@@ -520,6 +677,7 @@ def plot_meal_self_attention(
         # Add colorbar with better sizing
         cbar = fig.colorbar(im, ax=ax, fraction=0.02, pad=0.04)
         cbar.set_label('Attention Strength', fontsize=8)
+        cbar.outline.set_visible(False)  # Remove the boundary/outline
         
         # Adjust layout with extra padding at the top for title and labels
         plt.subplots_adjust(top=0.80, bottom=0.20, left=0.1, right=0.95)
@@ -542,6 +700,121 @@ def plot_meal_self_attention(
         plt.close(fig)
     
     return fixed_indices
+
+def generate_mock_attention(batch_size: int, 
+                           context_len: int, 
+                           past_len: int, 
+                           forecast_len: int,
+                           meal_embedding_dim: int = 5) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Generate mock attention weights for visualization.
+    
+    Args:
+        batch_size: Number of samples
+        context_len: Length of context window (not used in this implementation)
+        past_len: Number of past timesteps
+        forecast_len: Number of forecast timesteps
+        meal_embedding_dim: Dimension of meal embeddings (not used for attention maps)
+        
+    Returns:
+        Tuple of:
+            encoder_attention: Encoder attention weights [batch, forecast_len, past_len]
+            decoder_attention: Decoder attention weights [batch, forecast_len, forecast_len]
+    """
+    # Create encoder attention [batch_size, forecast_len, past_len]
+    # Simply use random values for clear visibility
+    encoder_attn = torch.rand(batch_size, forecast_len, past_len)
+    
+    # Normalize rows to sum to 1
+    row_sums = encoder_attn.sum(dim=2, keepdim=True)
+    encoder_attn = encoder_attn / row_sums
+    
+    # Create decoder attention [batch_size, forecast_len, forecast_len]
+    # Use random values but maintain causal mask (empty bottom half)
+    decoder_attn = torch.rand(batch_size, forecast_len, forecast_len)
+    
+    # Apply causal mask - zero out the upper triangular part (j > i)
+    for b in range(batch_size):
+        for i in range(forecast_len):
+            for j in range(forecast_len):
+                if j > i:  # Zero out future positions
+                    decoder_attn[b, i, j] = 0.0
+    
+    # Normalize each row to sum to 1
+    for b in range(batch_size):
+        for i in range(forecast_len):
+            row_sum = decoder_attn[b, i].sum()
+            if row_sum > 0:
+                decoder_attn[b, i] = decoder_attn[b, i] / row_sum
+    
+    return encoder_attn, decoder_attn
+
+def test_plot_forecast_examples():
+    print("\n===== Testing plot_forecast_examples =====")
+    
+    # Create mock data
+    batch_size = 8
+    past_len = 32  # 8 hours with 4 readings per hour
+    forecast_len = 16  # 4 hours with 4 readings per hour
+    quantiles = torch.tensor([0.05, 0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9, 0.95])
+    num_quantiles = len(quantiles)
+    past_meal_len = 8  # Number of past meal timepoints
+    future_meal_len = 4  # Number of future meal timepoints
+    meal_embedding_dim = 5  # Dimension of meal embeddings
+    
+    # Generate mock glucose and meal data
+    forecasts = generate_mock_glucose_data(
+        batch_size=batch_size, 
+        past_len=past_len,
+        forecast_len=forecast_len,
+        num_quantiles=num_quantiles,
+        past_meal_len=past_meal_len,
+        future_meal_len=future_meal_len
+    )
+    
+    # Generate mock attention weights with proper dimensions for plot_forecast
+    # The attention maps should have shapes:
+    # - encoder_attn: [batch_size, forecast_len, past_len]
+    # - decoder_attn: [batch_size, forecast_len, forecast_len]
+    encoder_attn, decoder_attn = generate_mock_attention(
+        batch_size=batch_size,
+        context_len=past_len,  # Not used in the updated function
+        past_len=past_len,
+        forecast_len=forecast_len
+    )
+    
+    # Create a mock logger
+    logger = MockLogger()
+    global_step = 1000
+    
+    print(f"Generated mock data:")
+    print(f"- past glucose shape: {forecasts['past'].shape}")
+    print(f"- predicted glucose shape: {forecasts['pred'].shape}")
+    print(f"- true future glucose shape: {forecasts['truth'].shape}")
+    print(f"- past meal IDs shape: {forecasts['past_meal_ids'].shape}")
+    print(f"- future meal IDs shape: {forecasts['future_meal_ids'].shape}")
+    print(f"- encoder attention weights shape: {encoder_attn.shape}")
+    print(f"- decoder attention weights shape: {decoder_attn.shape}")
+    
+    # Call the plotting function with updated axis labels
+    fixed_indices, figs = plot_forecast_examples(
+        forecasts=forecasts,
+        attn_weights_past=encoder_attn,
+        attn_weights_future=decoder_attn,
+        quantiles=quantiles,
+        logger=logger,
+        global_step=global_step,
+        fixed_indices=None  # Let the function randomly select examples
+    )
+            
+    # Save figure instead of showing it
+    for idx, fig in enumerate(figs):
+        output_path = f"forecast_examples_test_{idx}.png"
+        fig.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Plot saved to {output_path}")
+    
+    return fixed_indices, figs
 
 if __name__ == "__main__":
     import random
@@ -679,79 +952,6 @@ if __name__ == "__main__":
             "future_meal_ids": future_meals
         }
     
-    def generate_mock_attention(batch_size: int, 
-                               context_len: int, 
-                               past_meal_len: int, 
-                               future_meal_len: int,
-                               meal_embedding_dim: int = 5) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Generate mock self-attention weights for meal data.
-        
-        Args:
-            batch_size: Number of samples
-            context_len: Length of context window
-            past_meal_len: Number of past meal timepoints
-            future_meal_len: Number of future meal timepoints
-            meal_embedding_dim: Dimension of meal embeddings
-            
-        Returns:
-            Tuple of:
-                past_attn: Past attention weights [batch, context_len, past_meal_len]
-                future_attn: Future attention weights [batch, context_len, future_meal_len]
-        """
-        # Generate meal-to-meal self-attention (for each meal timestep with meals)
-        # Create attention matrices with reasonable patterns
-        
-        # Past meals attention
-        # Shape: [batch_size, past_meal_len, past_meal_len]
-        past_meals_attn = torch.zeros(batch_size, past_meal_len, past_meal_len)
-        
-        # Future meals attention
-        # Shape: [batch_size, future_meal_len, future_meal_len]
-        future_meals_attn = torch.zeros(batch_size, future_meal_len, future_meal_len)
-        
-        # For meal self-attention, create plausible patterns:
-        # 1. Strong diagonal (self-attention)
-        # 2. Attention to nearby meals
-        # 3. Some meals might get more attention overall
-        
-        for b in range(batch_size):
-            # Past meals self-attention
-            for i in range(past_meal_len):
-                for j in range(past_meal_len):
-                    # Strong diagonal
-                    if i == j:
-                        past_meals_attn[b, i, j] = 0.7 + 0.3 * torch.rand(1).item()
-                    else:
-                        # Attention decays with distance
-                        dist = abs(i - j)
-                        past_meals_attn[b, i, j] = max(0, 0.5 - 0.1 * dist) * torch.rand(1).item()
-            
-            # Normalize rows to sum to 1
-            row_sums = past_meals_attn[b].sum(dim=1, keepdim=True)
-            nonzero_rows = row_sums > 0
-            if nonzero_rows.any():
-                past_meals_attn[b, nonzero_rows.squeeze(), :] /= row_sums[nonzero_rows]
-            
-            # Future meals self-attention
-            for i in range(future_meal_len):
-                for j in range(future_meal_len):
-                    # Strong diagonal
-                    if i == j:
-                        future_meals_attn[b, i, j] = 0.7 + 0.3 * torch.rand(1).item()
-                    else:
-                        # Attention decays with distance
-                        dist = abs(i - j)
-                        future_meals_attn[b, i, j] = max(0, 0.5 - 0.1 * dist) * torch.rand(1).item()
-            
-            # Normalize rows to sum to 1
-            row_sums = future_meals_attn[b].sum(dim=1, keepdim=True)
-            nonzero_rows = row_sums > 0
-            if nonzero_rows.any():
-                future_meals_attn[b, nonzero_rows.squeeze(), :] /= row_sums[nonzero_rows]
-        
-        return past_meals_attn, future_meals_attn
-    
     def generate_mock_iauc_data(num_samples: int = 200) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate mock iAUC (incremental Area Under Curve) data.
@@ -804,12 +1004,15 @@ if __name__ == "__main__":
             future_meal_len=future_meal_len
         )
         
-        # Generate mock attention weights
-        past_attn, future_attn = generate_mock_attention(
+        # Generate mock attention weights with proper dimensions for plot_forecast
+        # The attention maps should have shapes:
+        # - encoder_attn: [batch_size, forecast_len, past_len]
+        # - decoder_attn: [batch_size, forecast_len, forecast_len]
+        encoder_attn, decoder_attn = generate_mock_attention(
             batch_size=batch_size,
-            context_len=past_len,  # For contextual attention
-            past_meal_len=past_meal_len,
-            future_meal_len=future_meal_len
+            context_len=past_len,  # Not used in the updated function
+            past_len=past_len,
+            forecast_len=forecast_len
         )
         
         # Create a mock logger
@@ -822,33 +1025,28 @@ if __name__ == "__main__":
         print(f"- true future glucose shape: {forecasts['truth'].shape}")
         print(f"- past meal IDs shape: {forecasts['past_meal_ids'].shape}")
         print(f"- future meal IDs shape: {forecasts['future_meal_ids'].shape}")
-        print(f"- past attention weights shape: {past_attn.shape}")
-        print(f"- future attention weights shape: {future_attn.shape}")
+        print(f"- encoder attention weights shape: {encoder_attn.shape}")
+        print(f"- decoder attention weights shape: {decoder_attn.shape}")
         
         # Call the plotting function with updated axis labels
-        fixed_indices, fig = plot_forecast_examples(
+        fixed_indices, figs = plot_forecast_examples(
             forecasts=forecasts,
-            attn_weights_past=past_attn,
-            attn_weights_future=future_attn,
+            attn_weights_past=encoder_attn,
+            attn_weights_future=decoder_attn,
             quantiles=quantiles,
             logger=logger,
             global_step=global_step,
             fixed_indices=None  # Let the function randomly select examples
         )
-        
-        # Update all axis labels to include units
-        for ax_row in fig.axes:
-            if hasattr(ax_row, 'set_ylabel'):  # Check if it's a main plot axes
-                if ax_row.get_ylabel() == 'Glucose Level':
-                    ax_row.set_ylabel('Glucose Level (mmol/L)')
-        
+                
         # Save figure instead of showing it
-        output_path = "forecast_examples_test.png"
-        fig.savefig(output_path, dpi=150, bbox_inches='tight')
-        plt.close(fig)
-        print(f"Plot saved to {output_path}")
+        for idx, fig in enumerate(figs):
+            output_path = f"forecast_examples_test_{idx}.png"
+            fig.savefig(output_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            print(f"Plot saved to {output_path}")
         
-        return fixed_indices, fig
+        return fixed_indices, figs
     
     # ===== Test plot_iAUC_scatter =====
     

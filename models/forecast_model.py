@@ -752,7 +752,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
                 )
             
             # Plot forecast examples
-            fixed_indices, fig = plot_forecast_examples(
+            fixed_indices, figs = plot_forecast_examples(
                 self.example_forecasts,
                 self.example_attn_weights_past,
                 self.example_attn_weights_future,
@@ -761,8 +761,11 @@ class MealGlucoseForecastModel(pl.LightningModule):
                 self.global_step,
                 fixed_indices=fixed_indices
             )
+            for idx, fig in enumerate(figs):
+                self.logger.experiment.log({f"forecast_samples_{fixed_indices[idx]}": wandb.Image(fig), "global_step": self.global_step})
+                plt.close(fig)
+                
             self.fixed_forecast_indices = fixed_indices
-            plt.close(fig)
             self.example_forecasts = None
         
         # Plot iAUC scatter and calculate correlation
