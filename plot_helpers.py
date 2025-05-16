@@ -82,7 +82,7 @@ def plot_forecast(
     }
     
     attention_cmap = LinearSegmentedColormap.from_list(
-        "attention_cmap", PALETTE["custom_attention"], N=512
+        "attention_cmap", PALETTE["attention"], N=512
     )
     mpl.rcParams.update({
         'font.family':'serif',
