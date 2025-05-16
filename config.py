@@ -26,8 +26,8 @@ class ExperimentConfig:
     encoder_length_randomization: str = "none" # "training_only", "all_sets", "none"
     
     # Aggregation
-    patch_size: int = 1 * 4 # 1 hour patch size
-    patch_stride: int = 1  # 15 min stride
+    patch_size: int = 1 * 4 # 1 hour patch size (NOTE: No longer used with SimpleGlucoseEncoder, kept for backwards compatibility)
+    patch_stride: int = 1  # 15 min stride (NOTE: No longer used with SimpleGlucoseEncoder, kept for backwards compatibility)
     
     meal_aggregator_type: str = "set"
 
@@ -42,7 +42,7 @@ class ExperimentConfig:
     group_by_columns: list = None
     
     
-    project_user_features_to_single_vector: bool = False
+    project_user_features_to_single_vector: bool = True
 
     # Feature lists (users, food, temporal)
     user_static_categoricals: list = None

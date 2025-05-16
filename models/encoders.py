@@ -301,6 +301,7 @@ class MealEncoder(nn.Module):
         # Get filtered mask for non-empty timesteps
         filtered_mask = None
         if mask is not None:
+            # Extract mask values for non-empty timesteps only
             flat_mask = mask.view(B * T)
             filtered_mask = flat_mask[non_empty_indices]  # (N_non_empty)
         
@@ -349,11 +350,13 @@ class MealEncoder(nn.Module):
             pad_mask = torch.cat([zero_col, pad_mask], dim=1)  # => (N_non_empty, M+1)
             
             # Incorporate timestep mask if provided (for non-empty timesteps)
-            if filtered_mask is not None:
+            if filtered_mask is not None and self.aggregator_type == "set":
                 # Expand to match the meal items + aggregator token
                 filtered_timestep_mask = filtered_mask.unsqueeze(1).expand(-1, pad_mask.size(1))  # (N_non_empty, M+1)
                 
                 # Combine with padding mask
+                # In PyTorch transformers, src_key_padding_mask=True means positions to IGNORE
+                # filtered_mask has True for valid positions, so we invert it for transformer
                 timestep_mask_combined = ~filtered_timestep_mask  # True means positions to ignore
                 timestep_mask_combined[:, 0] = False  # Keep aggregator token valid
                 pad_mask = pad_mask | timestep_mask_combined
@@ -408,6 +411,8 @@ class MealEncoder(nn.Module):
 
         # Apply filtered mask if provided
         if filtered_mask is not None:
+            # In this codebase, mask=True means valid values
+            # multiplying by mask zeros out invalid positions
             filtered_meal_emb = filtered_meal_emb * filtered_mask.unsqueeze(-1).float()
         
         # Place embeddings back in the full tensor
@@ -483,9 +488,12 @@ class GlucosePatcher(nn.Module):
                 mask_patches = F.pad(mask, (0, self.patch_size - T))[:, None, :]
             
             # A patch is valid only if at least one point in it is valid
+            # In this codebase, mask=True means valid positions
+            # patch_mask will be True for patches with at least one valid point
             patch_mask = mask_patches.any(dim=2)  # [B, N_patches]
             
             # Apply mask to patches (zero out invalid points)
+            # mask_patches has True for valid points, multiplying zeros out invalid points
             patches = patches * mask_patches.float()
         
         return patches, patch_indices, patch_mask
@@ -574,10 +582,9 @@ class PatchEncoder(nn.Module):
         # Create key padding mask if patch mask is provided
         key_padding_mask = None
         if patch_mask is not None:
-            # In transformer, key_padding_mask=True means positions to IGNORE
+            # In PyTorch transformers, src_key_padding_mask=True means positions to IGNORE
+            # patch_mask has True for valid positions, so we need to invert it
             key_padding_mask = ~patch_mask
-            # Convert to float to match mask type - this was missing
-            key_padding_mask = key_padding_mask.float()
         
         # Pass through transformer
         encodings, attn_weights = self.transformer(
@@ -806,6 +813,87 @@ class TemporalEncoder(nn.Module):
         
         # Apply mask if provided
         if mask is not None:
+            # In this codebase, mask=True means valid values
+            # multiplying by mask zeros out invalid positions
             temporal_embeddings = temporal_embeddings * mask.unsqueeze(-1).float()
         
         return temporal_embeddings
+
+class SimpleGlucoseEncoder(nn.Module):
+    """
+    A simple encoder that transforms each glucose value to hidden_dim using a linear layer.
+    No patching is performed in this encoder.
+    """
+    def __init__(
+        self,
+        embed_dim: int,
+        positional_embedding: Optional[nn.Module] = None,
+        dropout_rate: float = 0.1,
+        add_type_embedding: bool = True  # Option to add type embedding
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.positional_embedding = positional_embedding
+        self.add_type_embedding = add_type_embedding
+        
+        # Transformation from 1D glucose value to hidden_dim
+        self.glucose_projection = nn.Linear(1, embed_dim)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.layer_norm = nn.LayerNorm(embed_dim)
+        
+        # Add type embedding if requested
+        if add_type_embedding:
+            self.type_embedding = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        
+    def forward(
+        self,
+        glucose_values: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        return_self_attn: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Forward pass for the glucose encoder.
+        
+        Args:
+            glucose_values: Tensor of shape [batch_size, seq_len]
+            positions: Optional tensor of shape [batch_size, seq_len] for positional encoding
+            mask: Optional mask tensor of shape [batch_size, seq_len]
+            return_self_attn: Whether to return self-attention weights (not used in this encoder)
+            
+        Returns:
+            Tuple of:
+            - glucose_embeddings: Tensor of shape [batch_size, seq_len, embed_dim]
+            - None: No self-attention weights in this encoder
+        """
+        batch_size, seq_len = glucose_values.shape
+        
+        # Convert to [batch_size, seq_len, 1] for the linear projection
+        glucose_values = glucose_values.unsqueeze(-1)
+        
+        # Project glucose values to embedding dimension
+        glucose_embeddings = self.glucose_projection(glucose_values)
+        
+        # Add type embedding if requested
+        if self.add_type_embedding:
+            glucose_embeddings = glucose_embeddings + self.type_embedding
+        
+        # Apply dropout
+        glucose_embeddings = self.dropout(glucose_embeddings)
+        
+        # Apply layer normalization
+        glucose_embeddings = self.layer_norm(glucose_embeddings)
+        
+        # Apply positional encoding if provided
+        if self.positional_embedding is not None and positions is not None:
+            glucose_embeddings = self.positional_embedding(glucose_embeddings, positions)
+            
+        # Apply mask if provided
+        if mask is not None:
+            # In this codebase, mask=True means valid values
+            # multiplying by mask zeros out invalid positions
+            glucose_embeddings = glucose_embeddings * mask.unsqueeze(-1).float()
+        
+        return glucose_embeddings
+    
+    

@@ -23,14 +23,15 @@ from torchmetrics.functional.regression import (
 )
 
 from .encoders import (
-    UserEncoder, MealEncoder, PatchedGlucoseEncoder, 
-    TemporalEncoder, GlucosePatcher, PatchEncoder, MicrobiomeEncoder
+    UserEncoder, MealEncoder, PatchedGlucoseEncoder, SimpleGlucoseEncoder,
+    TemporalEncoder, MicrobiomeEncoder
 )
-from .transformer_blocks import TransformerDecoderLayer, TransformerDecoder
+from .transformer_blocks import TransformerDecoderLayer, TransformerDecoder, CrossModalFusionBlock, TransformerVariableSelectionNetwork
 from config import ExperimentConfig
 from plot_helpers import plot_meal_self_attention, plot_forecast_examples, plot_iAUC_scatter
 from dataset import PPGRToMealGlucoseWrapper
 from .losses import quantile_loss, compute_iAUC, unscale_tensor
+
 
 
 class RotaryPositionalEmbeddings(nn.Module):
@@ -127,6 +128,10 @@ class RotaryPositionalEmbeddings(nn.Module):
 class MealGlucoseForecastModel(pl.LightningModule):
     """
     PyTorch Lightning model for forecasting glucose levels based on meal data.
+    
+    This implementation uses a simple linear layer to encode glucose values directly to hidden_dim,
+    rather than using a patching approach. This allows for more straightforward alignment between
+    glucose values and other modalities (meals, temporal, user data).
     """
     def __init__(
         self, 
@@ -174,12 +179,73 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self._init_glucose_encoder(config)
         self._init_decoder(config)
         
+        # Initialize variable selection networks for past and future modalities
+        # Past modalities: glucose, meal, temporal, user features (individual), microbiome
+        # Build a dictionary of input sizes for the VSN that includes individual user features
+        user_static_categoricals = dataset_metadata["user_static_categoricals"]
+        user_static_reals = dataset_metadata["user_static_reals"]
         
-        # Future time query embeddings for each forecast horizon step
-        self.future_time_queries = nn.Embedding(config.prediction_length + 1, config.hidden_dim)
-        # NOTE: we are adding 1 to the prediction length, as we want to stay consistent and use 1-indexed values for future time points
-        # So basically, the embedding for 0 is not really used here. todo: see if refactoring this makes sense.
-
+        # Store user feature names for later use in forward pass
+        self.user_categorical_features = user_static_categoricals
+        self.user_real_features = user_static_reals
+        
+        # Store whether we're using projected user features
+        self.use_projected_user_features = config.project_user_features_to_single_vector
+        
+        # Build input sizes dictionary for past VSN - include individual user features
+        past_input_sizes = {
+            "glucose": config.hidden_dim,
+            "meal": config.hidden_dim,
+            "temporal": config.hidden_dim,
+            "microbiome": config.hidden_dim
+        }
+        
+        # Store the number of base modalities for later use
+        self.past_base_modalities = len(past_input_sizes)
+        
+        # If using projected user features, add a single user feature
+        # Otherwise, add each user feature individually
+        if self.use_projected_user_features:
+            past_input_sizes["user"] = config.hidden_dim
+        else:
+            # Add each user feature as a separate input
+            for feature in user_static_categoricals + user_static_reals:
+                past_input_sizes[f"user_{feature}"] = config.hidden_dim
+            
+        self.past_vsn = TransformerVariableSelectionNetwork(
+            input_sizes=past_input_sizes,
+            hidden_size=config.hidden_dim,
+            n_heads=config.num_heads,
+            dropout=config.dropout_rate,
+            context_size=config.hidden_dim  # Pass user context to inform selection
+        )
+        
+        # Future modalities: meal, temporal, user (individual features), microbiome (no glucose)
+        future_input_sizes = {
+            "meal": config.hidden_dim,
+            "temporal": config.hidden_dim,
+            "microbiome": config.hidden_dim
+        }
+        
+        # Store the number of base modalities for later use
+        self.future_base_modalities = len(future_input_sizes)
+        
+        # Add user features to future inputs as well
+        if self.use_projected_user_features:
+            future_input_sizes["user"] = config.hidden_dim
+        else:
+            # Add each user feature as a separate input
+            for feature in user_static_categoricals + user_static_reals:
+                future_input_sizes[f"user_{feature}"] = config.hidden_dim
+            
+        self.future_vsn = TransformerVariableSelectionNetwork(
+            input_sizes=future_input_sizes,
+            hidden_size=config.hidden_dim,
+            n_heads=config.num_heads,
+            dropout=config.dropout_rate,
+            context_size=config.hidden_dim  # Pass user context to inform selection
+        )
+        
         # Final projection: hidden_dim -> num_quantiles
         self.forecast_linear = nn.Linear(config.hidden_dim, config.num_quantiles)
 
@@ -284,15 +350,11 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
     def _init_glucose_encoder(self, config: ExperimentConfig) -> None:
         """Initialize the glucose encoder component."""
-        self.glucose_encoder = PatchedGlucoseEncoder(
+        self.glucose_encoder = SimpleGlucoseEncoder(
             embed_dim=config.hidden_dim,
-            patch_size=config.patch_size,
-            patch_stride=config.patch_stride,
             positional_embedding=self.rope_emb,
-            num_heads=config.num_heads,
-            num_layers=config.transformer_encoder_layers,
-            layers_share_weights=config.transformer_encoder_layers_share_weights,
-            dropout_rate=config.dropout_rate
+            dropout_rate=config.dropout_rate,
+            add_type_embedding=True
         )
         
     def _init_decoder(self, config: ExperimentConfig) -> None:
@@ -304,13 +366,70 @@ class MealGlucoseForecastModel(pl.LightningModule):
             dropout=config.transformer_dropout,
             activation="relu"
         )
+        
+        # By default, share weights among decoder layers
+        # This matches the SharedTransformerDecoder in the TFT model
+        # where the same decoder layer is applied multiple times
+        layers_share_weights = config.transformer_decoder_layers_share_weights
+        if layers_share_weights is None:
+            layers_share_weights = True
+            
         self.decoder = TransformerDecoder(
             dec_layer,
             num_layers=config.transformer_decoder_layers,
-            layers_share_weights=config.transformer_decoder_layers_share_weights,
+            layers_share_weights=layers_share_weights,
             norm=nn.LayerNorm(config.hidden_dim)
         )
     
+    def get_attention_mask(
+        self, 
+        forecast_horizon: torch.LongTensor, 
+        T_past: int,
+        T_future: int
+    ):
+        """
+        Returns causal mask to apply for cross-attention in the transformer decoder.
+        
+        This mask ensures that predictions for position i can only attend to:
+        1. All historical data (always accessible to all decoder positions)
+        2. Future meal data only up to position i (to prevent future information leakage)
+        
+        This enforces causality in the time dimension, similar to the TFT implementation.
+        
+        Args:
+            forecast_horizon: Length of the prediction horizon
+            T_past: Length of the historical/encoder sequence
+            T_future: Length of the future sequence with known features (e.g., meals)
+            
+        Returns:
+            Attention mask of shape [forecast_horizon, T_past+T_future] where values of
+            float('-inf') indicate positions that should be masked out during attention.
+        """
+        device = next(self.parameters()).device
+        decoder_length = forecast_horizon
+        
+        # Indices to which each query position can attend
+        attend_step = torch.arange(T_past + T_future, device=device)
+        
+        # Indices for which predictions are made
+        predict_step = torch.arange(0, decoder_length, device=device)[:, None]
+        
+        # Create mask where True means position can be attended to
+        mask = torch.ones((decoder_length, T_past + T_future), device=device)
+        
+        # Allow all positions to attend to past
+        mask[:, :T_past] = 1.0
+        
+        # For future positions, create causal mask
+        future_mask = attend_step[None, T_past:] <= predict_step + T_past
+        mask[:, T_past:] = future_mask.float()
+        
+        # Convert to format expected by attention mechanism
+        # (0 -> -inf, 1 -> 0)
+        mask = mask.masked_fill(mask == 0, float('-inf'))
+        
+        return mask
+
     def forward(
         self,
         batch: Dict[str, torch.Tensor],
@@ -322,7 +441,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         Returns either a single tensor [B, T_future, Q] with predictions
         or a tuple if return_attn=True with the following elements:
-          (pred_future, past_meal_enc, attn_past, future_meal_enc, attn_future, meal_self_attn_past, meal_self_attn_future)
+          (pred_future, past_meal_enc, attn_past, future_meal_enc, attn_future, 
+           meal_self_attn_past, meal_self_attn_future, past_vsn_weights, future_vsn_weights)
         """        
         # Extract parts of batch
         # Unpack batch
@@ -370,33 +490,25 @@ class MealGlucoseForecastModel(pl.LightningModule):
         past_indices = past_indices - centered_offset
         future_indices = future_indices - centered_offset  # Future will start at index 1
         
-        # 2) Generate glucose patch position indices and center them
-        # This time don't create estimated patch indices, we'll use the actual ones
-                
-        # 3) Encode glucose sequence with positional information
-        glucose_enc, glucose_attn_weights, patch_indices = self.glucose_encoder(
-            past_glucose, 
-            positions=past_indices,  # Pass past_indices for consistency
-            mask=encoder_padding_mask, 
-            return_self_attn=False
-        )
         
-        # Center the patch indices using the same offset as other sequences
-        # patch_indices now already contains the END position of each patch
-        offset_tensor = torch.tensor([offset_value], device=patch_indices.device)
-        centered_patch_indices = patch_indices - offset_tensor
+        # 3) Encode glucose sequence with positional information
+        glucose_enc = self.glucose_encoder(
+            past_glucose, 
+            positions=past_indices,
+            mask=encoder_padding_mask
+        )
                 
         # Encode temporal information
         past_temporal_emb = self.temporal_encoder(
             temporal_categoricals=batch["past_temporal_categoricals"],
             temporal_reals=batch["past_temporal_reals"],
-            positions=past_indices,  # Use the same positions as for meals
+            positions=past_indices,
             mask=encoder_padding_mask
         )
         future_temporal_emb = self.temporal_encoder(
             temporal_categoricals=batch["future_temporal_categoricals"],
             temporal_reals=batch["future_temporal_reals"],
-            positions=future_indices,  # Use the same positions as for future meals
+            positions=future_indices,
             mask=None  # Future usually doesn't have a mask
         )
                 
@@ -404,66 +516,145 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # 4) Encode past & future meals with positional information
         past_meal_enc, meal_self_attn_past = self.meal_encoder(
             past_meal_ids, past_meal_macros, 
-            positions=past_indices,  # Pass past position indices
+            positions=past_indices,
             mask=encoder_padding_mask, 
             return_self_attn=return_meal_self_attn
         )
         future_meal_enc, meal_self_attn_future = self.meal_encoder(
             future_meal_ids, future_meal_macros, 
-            positions=future_indices,  # Pass future position indices
+            positions=future_indices,
             return_self_attn=return_meal_self_attn
         )
+            
         
-        # Get number of glucose patches for further processing
-        N_patches = glucose_enc.size(1)
+        # --- Cross-modal fusion block ---
+        # With the SimpleGlucoseEncoder, we now have direct timestep alignment between modalities
+        # No need for patching or complicated indexing to align different modalities
         
+        # Get number of timesteps for processing
+        T_past = glucose_enc.size(1)  # Now this is the full sequence length
         
-        # Add temporal embeddings to the meal + glucose encodings
-        past_meal_enc = past_meal_enc + past_temporal_emb  # [B, T_past, hidden_dim]
-        future_meal_enc = future_meal_enc + future_temporal_emb  # [B, T_future, hidden_dim]
-        glucose_enc = glucose_enc + past_temporal_emb[:, centered_patch_indices, :]  # [B, N_patches, hidden_dim]
+        # Process microbiome embeddings
+        microb_per_timestep = microbiome_embeddings.expand(-1, T_past, -1)  # [B, T_past, hidden_dim]
         
-        # Create type IDs for each sequence
-        past_meal_type_id = torch.zeros((B, T_past), device=device, dtype=torch.long)
-        future_meal_type_id = torch.ones((B, T_future), device=device, dtype=torch.long)
-        glucose_type_id = 2 * torch.ones((B, N_patches), device=device, dtype=torch.long)
-        user_type_id = 3 * torch.ones((B, user_embeddings.shape[1]), device=device, dtype=torch.long)
-        microbiome_type_id = 4 * torch.ones((B, 1), device=device, dtype=torch.long)
+        # Create inputs for VSN as dictionary - base modalities first
+        past_inputs = {
+            "glucose": glucose_enc,
+            "meal": past_meal_enc,
+            "temporal": past_temporal_emb,
+            "microbiome": microb_per_timestep
+        }
         
-        # Unqueeze user_embeddings to match the shape of past_meal_enc
-        # user_embeddings = user_embeddings.unsqueeze(1).expand(B, 1, -1)
+        # Add user features based on whether they are projected to a single vector or not
+        if self.use_projected_user_features:
+            # When projected, user_embeddings has shape [B, 1, hidden_dim]
+            # Expand to match timesteps
+            user_per_timestep = user_embeddings.expand(-1, T_past, -1)  # [B, T_past, hidden_dim]
+            past_inputs["user"] = user_per_timestep
+            
+            # Use the projected embedding directly as context
+            user_context = user_embeddings.squeeze(1)  # [B, hidden_dim]
+        else:
+            # When not projected, user_embeddings has shape [B, num_features, hidden_dim]
+            # Add each user feature as a separate input
+            num_cat_features = len(self.user_categorical_features)
+            for i, feature_name in enumerate(self.user_categorical_features):
+                # Extract this specific feature's embedding for all batches
+                feature_emb = user_embeddings[:, i, :]  # [B, hidden_dim]
+                # Expand across time dimension
+                feature_emb_expanded = feature_emb.unsqueeze(1).expand(-1, T_past, -1)  # [B, T_past, hidden_dim]
+                # Add to inputs dictionary
+                past_inputs[f"user_{feature_name}"] = feature_emb_expanded
                 
-        # Add type embeddings to each sequence
-        past_meal_enc = past_meal_enc + self.type_embeddings(past_meal_type_id)
-        future_meal_enc = future_meal_enc + self.type_embeddings(future_meal_type_id)
-        glucose_enc = glucose_enc + self.type_embeddings(glucose_type_id)
-        user_embeddings = user_embeddings + self.type_embeddings(user_type_id)
-        microbiome_embeddings = microbiome_embeddings + self.type_embeddings(microbiome_type_id)
+            # Add real features
+            for i, feature_name in enumerate(self.user_real_features):
+                # Real features start after categorical features
+                feature_idx = i + num_cat_features
+                # Extract this specific feature's embedding
+                feature_emb = user_embeddings[:, feature_idx, :]  # [B, hidden_dim]
+                # Expand across time dimension
+                feature_emb_expanded = feature_emb.unsqueeze(1).expand(-1, T_past, -1)  # [B, T_past, hidden_dim]
+                # Add to inputs dictionary
+                past_inputs[f"user_{feature_name}"] = feature_emb_expanded
+                
+            # Use average of user embeddings as context for VSN
+            user_context = user_embeddings.mean(dim=1)  # [B, hidden_dim]
         
+        # Pass through VSN for past timesteps
+        fused_glucose_past, past_weights = self.past_vsn(past_inputs, context=user_context)  # [B, T_past, D]
+
+        # Process future modalities - similar approach for user features
+        T_future = future_meal_ids.size(1) if future_meal_ids is not None else 0
+        microbiome_per_timestep_future = microbiome_embeddings.expand(-1, T_future, -1)
+
+        # Create inputs for future VSN as dictionary
+        future_inputs = {
+            "meal": future_meal_enc,
+            "temporal": future_temporal_emb,
+            "microbiome": microbiome_per_timestep_future
+        }
+        
+        # Add user features to future inputs
+        if self.use_projected_user_features:
+            # When projected, user_embeddings has shape [B, 1, hidden_dim]
+            # Expand to match timesteps
+            user_per_timestep_future = user_embeddings.expand(-1, T_future, -1)  # [B, T_future, hidden_dim]
+            future_inputs["user"] = user_per_timestep_future
+        else:
+            # Add each user feature as a separate input for future
+            num_cat_features = len(self.user_categorical_features)
+            for i, feature_name in enumerate(self.user_categorical_features):
+                feature_emb = user_embeddings[:, i, :]  # [B, hidden_dim]
+                feature_emb_expanded = feature_emb.unsqueeze(1).expand(-1, T_future, -1)  # [B, T_future, hidden_dim]
+                future_inputs[f"user_{feature_name}"] = feature_emb_expanded
+                
+            # Add real features
+            for i, feature_name in enumerate(self.user_real_features):
+                feature_idx = i + num_cat_features
+                feature_emb = user_embeddings[:, feature_idx, :]  # [B, hidden_dim]
+                feature_emb_expanded = feature_emb.unsqueeze(1).expand(-1, T_future, -1)  # [B, T_future, hidden_dim]
+                future_inputs[f"user_{feature_name}"] = feature_emb_expanded
+        
+        # Pass through VSN for future timesteps with the same user context
+        fused_meal_future, future_weights = self.future_vsn(future_inputs, context=user_context)  # [B, T_future, D]
+        
+        # Ensure future meal embeddings have positional information
+        fused_meal_future = self.rope_emb(fused_meal_future, future_indices)
+                
         
         # 5) Combine all encodings in a single "memory" sequence
         memory = [
-            past_meal_enc,
-            future_meal_enc,
-            glucose_enc,
-            user_embeddings,
-            microbiome_embeddings
+            fused_glucose_past,   # [B, T_past, D]
+            fused_meal_future     # [B, T_future, D]
         ]
         memory = torch.cat(memory, dim=1)
 
-        # 6) Prepare query embeddings for each forecast horizon step
-        # Make query indices start at 1 (first future position)
-        query_indices = torch.arange(self.forecast_horizon, device=device).unsqueeze(0).expand(B, -1) + 1
-        # NOTE: query_indices also start at 1 (and is same as future_indices)
+        # Get lengths for masking
+        T_past = fused_glucose_past.size(1)
+        T_future = fused_meal_future.size(1)
         
-        # Get query embeddings and add positional encoding
-        query_emb = self.future_time_queries(query_indices)  # [B, T_future, hidden_dim]
-        query_emb = self.rope_emb(query_emb, query_indices)
-
-        # 7) Decoder: Process queries with the memory
+        # Create self-attention causal mask for decoder queries
+        # This mask ensures autoregressive behavior in the decoder
+        causal_mask = torch.triu(
+            torch.full((T_future, T_future), float('-inf'), device=device), 
+            diagonal=1
+        )
+        
+        # Create cross-attention mask for the decoder to attend to memory
+        # This mask ensures each decoder position can only see past data 
+        # and future positions up to its own position
+        memory_mask = self.get_attention_mask(
+            forecast_horizon=self.forecast_horizon,
+            T_past=T_past,
+            T_future=T_future
+        )
+        
+        # directly use the future embeddings as the target sequence,
         decoder_output, cross_attn = self.decoder(
-            tgt=query_emb,
+            tgt=fused_meal_future,  # Use future embeddings as query sequence
             memory=memory,
+            tgt_mask=causal_mask,   # Self-attention mask (autoregressive)
+            memory_mask=memory_mask,  # Cross-attention mask (causal constraints)
             return_attn=return_attn
         )
 
@@ -471,15 +662,13 @@ class MealGlucoseForecastModel(pl.LightningModule):
         attn_past = None
         attn_future = None
         if cross_attn is not None:
-            past_len = past_meal_enc.shape[1]
-            future_len = future_meal_enc.shape[1]
-            # Split attention weights for past and future meals
-            attn_past = cross_attn[:, :, :past_len]  # => [B, T_future, past_len]
-            attn_future = cross_attn[:, :, past_len : past_len + future_len]
+            # Split attention weights for different parts of memory
+            attn_past = cross_attn[:, :, :T_past]  # => [B, T_future, T_past]
+            attn_future = cross_attn[:, :, T_past:T_past + T_future]  # => [B, T_future, T_future]
 
-        # Force full precision for the residual connection
+        # Force full precision for the final output and theresidual connection
         with torch.amp.autocast("cuda", enabled=False):
-            # 9) Final projection to get quantile predictions
+            # 9) Final projection to get quantile predictions (position wise)
             pred_future = self.forecast_linear(decoder_output)
 
             # Add residual connection if configured
@@ -496,7 +685,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
                 pred_future,
                 past_meal_enc, attn_past,
                 future_meal_enc, attn_future,
-                meal_self_attn_past, meal_self_attn_future
+                meal_self_attn_past, meal_self_attn_future,
+                past_weights, future_weights
             )
         else:
             return pred_future
@@ -559,7 +749,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # Store example data for plotting on first batch
         if batch_idx == 0:
-            (pred_future, _, attn_past, _, attn_future, meal_self_attn_past, meal_self_attn_future) = preds
+            (pred_future, _, attn_past, _, attn_future, meal_self_attn_past, 
+             meal_self_attn_future, past_vsn_weights, future_vsn_weights) = preds
             self.example_forecasts = {
                 "past": unscale_tensor(past_glucose, target_scales).detach().cpu(),
                 "pred": pred_future.detach().cpu(),
@@ -571,6 +762,44 @@ class MealGlucoseForecastModel(pl.LightningModule):
             self.example_attn_weights_future = attn_future
             self.example_meal_self_attn_past = meal_self_attn_past
             self.example_meal_self_attn_future = meal_self_attn_future
+            self.example_past_vsn_weights = past_vsn_weights.detach().cpu()
+            self.example_future_vsn_weights = future_vsn_weights.detach().cpu()
+            
+            # Log variable selection weights
+            self.log(f"{phase}_past_vsn_glucose_weight", past_vsn_weights[:, :, 0].mean().item())
+            self.log(f"{phase}_past_vsn_meal_weight", past_vsn_weights[:, :, 1].mean().item())
+            self.log(f"{phase}_past_vsn_temporal_weight", past_vsn_weights[:, :, 2].mean().item())
+            self.log(f"{phase}_past_vsn_microbiome_weight", past_vsn_weights[:, :, 3].mean().item())
+            
+            # Calculate aggregated user feature weights instead of logging each feature individually
+            # Use the stored base modality counts instead of computing them dynamically
+            num_user_features = len(self.user_categorical_features) + len(self.user_real_features)
+            
+            # Compute the mean weight across all user features for past VSN
+            if self.use_projected_user_features:
+                # In single vector mode, there's only one user feature column to log
+                # It comes right after the base modalities
+                user_feature_idx = self.past_base_modalities
+                self.log(f"{phase}_past_vsn_user_aggregate_weight", past_vsn_weights[:, :, user_feature_idx].mean().item())
+            else:
+                # In multi-vector mode, user features are individual columns
+                user_feature_start_idx = self.past_base_modalities
+                user_feature_end_idx = user_feature_start_idx + num_user_features
+                past_user_weights = past_vsn_weights[:, :, user_feature_start_idx:user_feature_end_idx]
+                self.log(f"{phase}_past_vsn_user_aggregate_weight", past_user_weights.mean().item())
+            
+            # Compute the mean weight across all user features for future VSN
+            if self.use_projected_user_features:
+                # In single vector mode, there's only one user feature column to log
+                # It comes right after the base modalities
+                future_user_idx = self.future_base_modalities
+                self.log(f"{phase}_future_vsn_user_aggregate_weight", future_vsn_weights[:, :, future_user_idx].mean().item())
+            else:
+                # In multi-vector mode, user features are individual columns
+                future_user_start_idx = self.future_base_modalities
+                future_user_end_idx = future_user_start_idx + num_user_features
+                future_user_weights = future_vsn_weights[:, :, future_user_start_idx:future_user_end_idx]
+                self.log(f"{phase}_future_vsn_user_aggregate_weight", future_user_weights.mean().item())
         
         return metrics["metrics"]["q_loss"]
 
