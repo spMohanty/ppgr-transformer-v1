@@ -1,8 +1,11 @@
+"""
+Helper functions for plotting forecasts, attention weights, and more.
+"""
 import random
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
 import wandb
+import numpy as np
 import argparse
 from typing import Optional, Union, Dict, List, Tuple
 
@@ -310,6 +313,27 @@ def plot_forecast_examples(
         fixed_indices = random.sample(list(range(past.size(0))), num_examples)
     sampled_indices = fixed_indices
 
+    # Process attention weights to ensure they're in the correct format
+    # Handle None case or empty tensors
+    def process_attention(attn_weights):
+        if attn_weights is None or attn_weights.numel() == 0:
+            return None
+        # Detach and convert to CPU numpy array
+        return attn_weights.detach().cpu().numpy()
+    
+    # Process attention weights
+    attn_past_np = process_attention(attn_weights_past) if attn_weights_past is not None else None
+    attn_future_np = process_attention(attn_weights_future) if attn_weights_future is not None else None
+    
+    # Check if attention weights are valid (not all zeros or NaNs)
+    if attn_past_np is not None:
+        if np.isnan(attn_past_np).any() or np.all(attn_past_np == 0):
+            print("Warning: Past attention weights contain all zeros or NaNs - setting to None")
+            attn_past_np = None
+    if attn_future_np is not None:
+        if np.isnan(attn_future_np).any() or np.all(attn_future_np == 0):
+            print("Warning: Future attention weights contain all zeros or NaNs - setting to None")
+            attn_future_np = None
 
     figs = []
     for sampled_idx in sampled_indices:
@@ -323,13 +347,17 @@ def plot_forecast_examples(
             axis=0
         )
         
+        # Get attention weights for this sample
+        encoder_attn = attn_past_np[sampled_idx] if attn_past_np is not None else None
+        decoder_attn = attn_future_np[sampled_idx] if attn_future_np is not None else None
+        
         figs += plot_forecast(
                 true_history=past[sampled_idx], 
                 true_future=truth[sampled_idx], 
                 median_forecast=median_forecast,
                 quantile_forecasts=pred[sampled_idx],
-                encoder_attention_map=attn_weights_past[sampled_idx],
-                decoder_attention_map=attn_weights_future[sampled_idx],
+                encoder_attention_map=encoder_attn,
+                decoder_attention_map=decoder_attn,
                 meal_flags=meal_flags,
                 loss_value=None
             )

@@ -85,51 +85,44 @@ def get_user_context(
         return user_embeddings.mean(dim=1)  # [B, hidden_dim]
 
 def get_attention_mask(
-    forecast_horizon: torch.LongTensor, 
-    T_past: int,
-    T_future: int,
+    encoder_lengths: torch.LongTensor, 
+    decoder_lengths: torch.LongTensor,
+    forecast_horizon: int,
     device: torch.device
 ) -> torch.Tensor:
     """
-    Returns causal mask to apply for cross-attention in the transformer decoder.
-    
-    This mask ensures that predictions for position i can only attend to:
-    1. All historical data (always accessible to all decoder positions)
-    2. Future meal data only up to position i (to prevent future information leakage)
-    
-    This enforces causality in the time dimension, similar to the TFT implementation.
+    Create a mask for transformer attention.
     
     Args:
-        forecast_horizon: Length of the prediction horizon
-        T_past: Length of the historical/encoder sequence
-        T_future: Length of the future sequence with known features (e.g., meals)
-        device: Device to create the mask on
+        encoder_lengths: Lengths of encoder sequences [batch_size]
+        decoder_lengths: Lengths of decoder sequences [batch_size] 
+        forecast_horizon: Prediction horizon
+        device: Device to create tensors on
         
     Returns:
-        Attention mask of shape [forecast_horizon, T_past+T_future] where values of
-        float('-inf') indicate positions that should be masked out during attention.
+        Boolean mask where True means position should be attended to
     """
-    decoder_length = forecast_horizon
+    batch_size = encoder_lengths.size(0)
+    max_encoder_length = encoder_lengths.max().item()
     
-    # Indices to which each query position can attend
-    attend_step = torch.arange(T_past + T_future, device=device)
+    # Create simple full mask first (all positions can attend)
+    mask = torch.ones(
+        batch_size, 
+        forecast_horizon,
+        max_encoder_length + forecast_horizon, 
+        dtype=torch.bool, 
+        device=device
+    )
     
-    # Indices for which predictions are made
-    predict_step = torch.arange(0, decoder_length, device=device)[:, None]
+    # Apply encoder padding mask (can't attend to padded positions)
+    for i in range(batch_size):
+        # Mask out padding in encoder (can't attend to padded positions)
+        mask[i, :, encoder_lengths[i]:max_encoder_length] = False
     
-    # Create mask where True means position can be attended to
-    mask = torch.ones((decoder_length, T_past + T_future), device=device)
-    
-    # Allow all positions to attend to past
-    mask[:, :T_past] = 1.0
-    
-    # For future positions, create causal mask
-    future_mask = attend_step[None, T_past:] <= predict_step + T_past
-    mask[:, T_past:] = future_mask.float()
-    
-    # Convert to format expected by attention mechanism
-    # (0 -> -inf, 1 -> 0)
-    mask = mask.masked_fill(mask == 0, float('-inf'))
+    # Apply causal mask in decoder part (can't attend to future positions)
+    for i in range(forecast_horizon):
+        # For each decoder position, mask out future positions
+        mask[:, i, max_encoder_length+i+1:] = False
     
     return mask
 
