@@ -34,7 +34,9 @@ class ExperimentConfig:
     # Data options
     is_food_anchored: bool = True
     sliding_window_stride: int = None
-    use_meal_level_food_covariates: bool = True
+    use_meal_level_food_covariates: bool = True # This should not change for the current version of the dataset.py
+    
+    use_simple_meal_encoder: bool = True # This aggregates the per-marco consumption disregarding the food-level covariates.
     use_bootstraped_food_embeddings: bool = True
     freeze_food_id_embeddings: bool = True
     ignore_food_macro_features: bool = False
@@ -134,17 +136,9 @@ class ExperimentConfig:
                 "user__evening_hunger_level",
             ]
         if self.use_meal_level_food_covariates:
-            self.food_categoricals = ["food__food_group_cname", "food_id"]
+            self.food_categoricals = ["food_id"]
         else:
-            self.food_categoricals = [
-                "food__vegetables_fruits",
-                "food__grains_potatoes_pulses",
-                "food__unclassified",
-                "food__non_alcoholic_beverages",
-                "food__dairy_products_meat_fish_eggs_tofu",
-                "food__sweets_salty_snacks_alcohol",
-                "food__oils_fats_nuts",
-            ]
+            self.food_categoricals = []
         if self.food_reals is None:
             self.food_reals = [
                 "food__eaten_quantity_in_gram", "food__energy_kcal_eaten",
