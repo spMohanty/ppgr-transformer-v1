@@ -263,79 +263,160 @@ class TransformerDecoder(nn.Module):
     
 class CrossModalFusionBlock(nn.Module):
     """
-    Fuses multiple modality embeddings per time step using multi-head self-attention.
-    Each input is of shape [B, T, N_modalities, D].
-    Outputs fused representation [B, T, D].
+    Fuses multiple modality embeddings using multi-head self-attention.
+    Unlike the original, this version uses a dictionary-based API like TransformerVariableSelectionNetwork.
     
     Two fusion modes are supported:
     1. "mean_pooling": Apply self-attention across modalities then mean-pool (original approach)
     2. "query_token": Use a learnable query token to attend to all modalities (similar to VSN)
     """
-    def __init__(self, hidden_dim, num_modalities, num_heads=4, fusion_dropout=0.1, fusion_mode="mean_pooling"):
+    def __init__(
+        self,
+        input_sizes: Dict[str, int],
+        hidden_size: int,
+        n_heads: int = 4,
+        input_embedding_flags: Dict[str, bool] = None,
+        dropout: float = 0.1,
+        context_size: int = None,
+        single_variable_grns: Dict[str, nn.Module] = None,
+        prescalers: Dict[str, nn.Module] = None,
+        fusion_mode: str = "query_token"
+    ):
+        """
+        Initialize a cross-modal fusion block with VSN-compatible API.
+        
+        Args:
+            input_sizes: Dictionary mapping variable names to their input dimensions 
+                         (currently ignored as we assume all inputs are already of hidden_size).
+            hidden_size: The hidden dimension of the model.
+            n_heads: Number of attention heads.
+            input_embedding_flags: (Ignored, for VSN compatibility).
+            dropout: Dropout probability.
+            context_size: (Ignored, for VSN compatibility).
+            single_variable_grns: (Ignored, for VSN compatibility).
+            prescalers: Optional dict mapping variable names to a prescaler module.
+            fusion_mode: Fusion approach: "mean_pooling" or "query_token".
+        """
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_modalities = num_modalities
+        self.input_sizes = input_sizes
+        self.hidden_size = hidden_size
+        self.n_heads = n_heads
+        self.dropout = dropout
         self.fusion_mode = fusion_mode
-        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=fusion_dropout, batch_first=True)
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(fusion_dropout)
+        self.n_vars = len(input_sizes)
+        self.single_variable = (self.n_vars == 1)
+        
+        # If provided, use the given prescalers
+        if prescalers is not None:
+            self.prescalers = nn.ModuleDict(prescalers)
+        else:
+            self.prescalers = nn.ModuleDict()
+        
+        # Multi-head attention for fusion
+        self.attn = nn.MultiheadAttention(hidden_size, n_heads, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(hidden_size)
+        self.dropout_layer = nn.Dropout(dropout)
         
         # Add a learnable query token if using query_token mode
         if fusion_mode == "query_token":
-            # Create a learnable query token [1, 1, hidden_dim] - will be expanded to [B, T, hidden_dim]
-            self.query_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
+            # Create a learnable query token [1, 1, hidden_size] - will be expanded to [B, T, hidden_size]
+            self.query_token = nn.Parameter(torch.randn(1, 1, hidden_size))
             
             # Add feed-forward network for processing query token output
             self.feed_forward = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
+                nn.Linear(hidden_size, hidden_size),
                 nn.ReLU(),
-                nn.Dropout(fusion_dropout),
-                nn.Linear(hidden_dim, hidden_dim),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_size, hidden_size),
             )
 
-    def forward(self, modal_inputs, return_attn_weights=True):
+    def forward(
+        self, x: Dict[str, torch.Tensor], context: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        modal_inputs: [B, T, N_modalities, D]
-        Returns: 
-            fused: [B, T, D] (fused vector per time step)
-            attn_weights: 
-                If mean_pooling: [B, T, N_modalities, N_modalities]
-                If query_token: [B, T, 1, N_modalities]
+        Args:
+            x: Dictionary of variable names to tensors.
+               Each tensor should be of shape [batch, time, hidden_size].
+            context: (Ignored, for VSN compatibility).
+
+        Returns:
+            output: The fused variable embedding of shape [batch, time, hidden_size].
+            selection_weights: The variable selection weights, of shape [batch, time, n_vars].
         """
-        B, T, N, D = modal_inputs.shape
+        # Handle single variable case
+        if self.single_variable:
+            var_name = list(self.input_sizes.keys())[0]
+            var_tensor = x[var_name]
+            
+            # Apply prescaler if present
+            if var_name in self.prescalers:
+                var_tensor = self.prescalers[var_name](var_tensor)
+                
+            # Create trivial selection weights
+            B, T, _ = var_tensor.shape
+            weights = torch.ones(B, T, 1, device=var_tensor.device)
+            
+            return var_tensor, weights
         
+        # Get batch and time dimensions from the first variable
+        sample_tensor = next(iter(x.values()))
+        B, T, D = sample_tensor.shape
+        
+        # Process each variable and collect embeddings
+        embedded_vars = []
+        var_names = []
+        
+        for name in self.input_sizes.keys():
+            var_tensor = x[name]
+            # Apply prescaler if exists
+            if name in self.prescalers:
+                var_tensor = self.prescalers[name](var_tensor)
+            embedded_vars.append(var_tensor)
+            var_names.append(name)
+        
+        # Stack variables along a new dimension
+        tokens = torch.stack(embedded_vars, dim=2)  # [B, T, n_vars, D]
+        
+        # --- Fusion processing ---
         if self.fusion_mode == "mean_pooling":
             # Original approach: mean pooling after self-attention
-            # Flatten B, T for batched attention over each timestep independently
-            x = modal_inputs.view(B * T, N, D)  # [B*T, N_modalities, D]
-            # Self-attention across modalities at each time step
-            fused, attn_weights = self.attn(x, x, x, need_weights=return_attn_weights)  # [B*T, N, D], [B*T, N, N]
-            # Mean-pool across modalities
-            fused = fused.mean(dim=1)      # [B*T, D]
+            # Reshape for batch processing: [B*T, n_vars, D]
+            tokens_reshaped = tokens.reshape(B * T, self.n_vars, D)
+            
+            # Self-attention across variables
+            attn_output, attn_weights = self.attn(
+                tokens_reshaped, tokens_reshaped, tokens_reshaped,
+                need_weights=True
+            )  # [B*T, n_vars, D], [B*T, n_vars, n_vars]
+            
+            # Mean-pool across variables
+            fused = attn_output.mean(dim=1)  # [B*T, D]
             fused = self.norm(fused)
-            fused = self.dropout(fused)
-            fused = fused.view(B, T, D)
+            fused = self.dropout_layer(fused)
             
-            # Process attention weights if needed
-            if return_attn_weights and attn_weights is not None:
-                # Reshape attention weights to [B, T, N_modalities, N_modalities]
-                attn_weights = attn_weights.view(B, T, N, N)
-                
+            # Reshape back to [B, T, D]
+            fused = fused.reshape(B, T, D)
+            
+            # Reshape attention weights to [B, T, n_vars, n_vars]
+            # Then average across the first variable dimension to get [B, T, n_vars]
+            selection_weights = attn_weights.reshape(B, T, self.n_vars, self.n_vars)
+            selection_weights = selection_weights.mean(dim=2)  # [B, T, n_vars]
+            
         elif self.fusion_mode == "query_token":
-            # Query token approach: use a learnable token to attend to all modalities
-            # Reshape modal inputs to [B*T, N, D]
-            x = modal_inputs.view(B * T, N, D)
+            # Query token approach: similar to VSN
+            # Reshape tokens for processing: [B*T, n_vars, D]
+            tokens_reshaped = tokens.reshape(B * T, self.n_vars, D)
             
-            # Expand query token to match batch and time dimensions
+            # Expand query token
             query = self.query_token.expand(B * T, 1, D)  # [B*T, 1, D]
             
-            # Apply cross-attention: query attends to all modalities
+            # Apply cross-attention: query attends to variables
             attn_output, attn_weights = self.attn(
-                query=query,       # [B*T, 1, D]
-                key=x,             # [B*T, N, D]
-                value=x,           # [B*T, N, D]
-                need_weights=return_attn_weights
-            )  # [B*T, 1, D], [B*T, 1, N]
+                query=query,          # [B*T, 1, D]
+                key=tokens_reshaped,  # [B*T, n_vars, D]
+                value=tokens_reshaped,  # [B*T, n_vars, D]
+                need_weights=True
+            )  # [B*T, 1, D], [B*T, 1, n_vars]
             
             # Apply feed-forward with residual connection
             ff_output = self.feed_forward(attn_output)
@@ -343,18 +424,16 @@ class CrossModalFusionBlock(nn.Module):
             
             # Remove singleton dimension and reshape
             fused = fused.squeeze(1)  # [B*T, D]
-            fused = self.dropout(fused)
-            fused = fused.view(B, T, D)  # [B, T, D]
+            fused = self.dropout_layer(fused)
+            fused = fused.reshape(B, T, D)  # [B, T, D]
             
-            # Process attention weights if needed
-            if return_attn_weights and attn_weights is not None:
-                # Reshape attention weights to [B, T, 1, N_modalities]
-                attn_weights = attn_weights.view(B, T, 1, N)
+            # Reshape attention weights to [B, T, n_vars]
+            selection_weights = attn_weights.reshape(B, T, self.n_vars)
         
         else:
             raise ValueError(f"Unsupported fusion mode: {self.fusion_mode}")
         
-        return fused, attn_weights
+        return fused, selection_weights
 
 class TransformerVariableSelectionNetwork(nn.Module):
     def __init__(

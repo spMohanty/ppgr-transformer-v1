@@ -210,8 +210,8 @@ def compute_forecast_metrics(
         f"true_iAUC_{eval_window}": true_iAUC,        
     }
 
-def log_vsn_feature_weights(
-    vsn_weights: torch.Tensor,
+def log_fusion_feature_weights(
+    feature_weights: torch.Tensor,
     base_modalities_count: int,
     user_categorical_features: List[str],
     user_real_features: List[str],
@@ -221,10 +221,13 @@ def log_vsn_feature_weights(
     base_modality_names: List[str] = None
 ) -> Dict[str, float]:
     """
-    Calculate and log VSN feature weights.
+    Calculate and log fusion feature weights for both VSN and CrossModalFusion blocks.
+    
+    This function works with weights from either VariableSelectionNetwork or 
+    CrossModalFusion blocks, as they both use a standardized format.
     
     Args:
-        vsn_weights: The weights from the VSN [B, T, num_features]
+        feature_weights: The weights from the fusion block [B, T, num_features]
         base_modalities_count: Number of base modalities (e.g., glucose, meal, temporal, microbiome)
         user_categorical_features: List of categorical feature names
         user_real_features: List of real-valued feature names
@@ -246,8 +249,8 @@ def log_vsn_feature_weights(
     
     # Log base modality weights
     for i, name in enumerate(base_modality_names):
-        if i < vsn_weights.shape[2]:  # Make sure we don't exceed the number of features
-            weight = vsn_weights[:, :, i].mean().item()
+        if i < feature_weights.shape[2]:  # Make sure we don't exceed the number of features
+            weight = feature_weights[:, :, i].mean().item()
             weight_dict[f"{prefix}_{name}_weight"] = weight
             if logger_fn:
                 logger_fn(f"{prefix}_{name}_weight", weight)
@@ -260,8 +263,8 @@ def log_vsn_feature_weights(
         # In single vector mode, there's only one user feature column to log
         # It comes right after the base modalities
         user_feature_idx = base_modalities_count
-        if user_feature_idx < vsn_weights.shape[2]:  # Check bounds
-            weight = vsn_weights[:, :, user_feature_idx].mean().item()
+        if user_feature_idx < feature_weights.shape[2]:  # Check bounds
+            weight = feature_weights[:, :, user_feature_idx].mean().item()
             weight_dict[f"{prefix}_user_aggregate_weight"] = weight
             if logger_fn:
                 logger_fn(f"{prefix}_user_aggregate_weight", weight)
@@ -271,11 +274,69 @@ def log_vsn_feature_weights(
         user_feature_end_idx = user_feature_start_idx + num_user_features
         
         # If we have enough weights columns
-        if user_feature_end_idx <= vsn_weights.shape[2]:
-            user_weights = vsn_weights[:, :, user_feature_start_idx:user_feature_end_idx]
+        if user_feature_end_idx <= feature_weights.shape[2]:
+            user_weights = feature_weights[:, :, user_feature_start_idx:user_feature_end_idx]
             agg_weight = user_weights.mean().item()
             weight_dict[f"{prefix}_user_aggregate_weight"] = agg_weight
             if logger_fn:
                 logger_fn(f"{prefix}_user_aggregate_weight", agg_weight)
     
-    return weight_dict 
+    return weight_dict
+
+# Keep backward compatibility with old function name
+log_vsn_feature_weights = log_fusion_feature_weights 
+
+def expand_user_embeddings_for_fusion(
+    user_embeddings: torch.Tensor,
+    T_past: int,
+    T_future: int,
+    user_categorical_features: List[str],
+    user_real_features: List[str],
+    project_to_single_vector: bool,
+    user_prefix: str = 'user_'
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """
+    Expand user embeddings across time dimensions for fusion blocks.
+    
+    This function takes pre-computed user embeddings and expands them across
+    the time dimension for both past and future sequences. It handles both
+    single-vector projection and individual feature cases.
+    
+    Args:
+        user_embeddings: User embeddings tensor of shape [B, num_features, hidden_dim] or [B, hidden_dim]
+        T_past: Length of past sequence
+        T_future: Length of future sequence
+        user_categorical_features: List of categorical feature names
+        user_real_features: List of real-valued feature names
+        project_to_single_vector: Whether to project all user features to a single vector
+        user_prefix: Prefix to use for user feature keys
+        
+    Returns:
+        Tuple of (past_user_dict, future_user_dict) containing expanded user embeddings
+        ready to update into modality dictionaries
+    """
+    past_user_dict = {}
+    future_user_dict = {}
+    
+    # Process user embeddings based on projection setting
+    if project_to_single_vector:
+        # Project all user features to a single vector
+        if user_embeddings.dim() == 3:  # [B, num_features, hidden_dim]
+            user_emb_combined = user_embeddings.mean(dim=1, keepdim=True)  # [B, 1, hidden_dim]
+        else:  # Already [B, hidden_dim]
+            user_emb_combined = user_embeddings.unsqueeze(1)  # [B, 1, hidden_dim]
+            
+        # Expand to match sequence lengths
+        past_user_dict['user'] = user_emb_combined.expand(-1, T_past, -1)  # [B, T_past, hidden_dim]
+        future_user_dict['user'] = user_emb_combined.expand(-1, T_future, -1)  # [B, T_future, hidden_dim]
+    else:
+        # Add each user feature as a separate modality
+        for i, feature in enumerate(user_categorical_features + user_real_features):
+            # Get the feature embedding
+            feature_emb = user_embeddings[:, i, :].unsqueeze(1)  # [B, 1, hidden_dim]
+            
+            # Expand to match sequence lengths
+            past_user_dict[f'{user_prefix}{feature}'] = feature_emb.expand(-1, T_past, -1)  # [B, T_past, hidden_dim]
+            future_user_dict[f'{user_prefix}{feature}'] = feature_emb.expand(-1, T_future, -1)  # [B, T_future, hidden_dim]
+    
+    return past_user_dict, future_user_dict 
