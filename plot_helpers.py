@@ -38,10 +38,12 @@ def plot_forecast(
         The median forecast values.
     quantile_forecasts : 2D array, shape = (F, Q)
         The quantile forecasts (each column is one quantile level).
-    encoder_attention_map : 2D array or None, shape = (F, H)
+    encoder_attention_map : 2D or 3D array or None
         If provided, shown as a heatmap below the time series.
-    decoder_attention_map : 2D array or None, shape = (F, F)
+        Can be shape (F, H) for single-head attention or (n_heads, F, H) for multi-head.
+    decoder_attention_map : 2D or 3D array or None
         If provided, shown as a heatmap below the time series.
+        Can be shape (F, F) for single-head attention or (n_heads, F, F) for multi-head.
     meal_flags : 1D bool array or None, length = H+F
         If provided, draws vertical tick at each True.
     loss_value : float or None
@@ -65,6 +67,18 @@ def plot_forecast(
     decoder_attention_map = convert_to_numpy(decoder_attention_map)
     meal_flags = convert_to_numpy(meal_flags)
     
+    # Process multi-head attention if provided
+    # For multi-head attention, we average across heads 
+    if encoder_attention_map is not None:
+        if encoder_attention_map.ndim == 3:  # [n_heads, seq_len_q, seq_len_k]
+            # Average across heads
+            encoder_attention_map = encoder_attention_map.mean(axis=0)
+            
+    if decoder_attention_map is not None:
+        if decoder_attention_map.ndim == 3:  # [n_heads, seq_len_q, seq_len_k]
+            # Average across heads
+            decoder_attention_map = decoder_attention_map.mean(axis=0)
+    
     # — style & palette —
     sns.set_style("white")
     PALETTE = {
@@ -87,7 +101,6 @@ def plot_forecast(
     attention_cmap = LinearSegmentedColormap.from_list(
         "attention_cmap", PALETTE["attention"], N=512
     )
-    # attention_cmap = sns.color_palette("rocket", as_cmap=True)
     
     mpl.rcParams.update({
         'font.family':'serif',
@@ -160,11 +173,18 @@ def plot_forecast(
                markerfacecolor="white", markeredgecolor=PALETTE["historical"],
                label="Historical")
 
+    # Make t=0 transition point clear
+    ax_ts.axvline(x=H-1, color='black', lw=1.2, label="t=0")
+
     # — plot observed future —
     if show_observed_future and (true_future is not None) and true_future.size:
-        ext_i = np.concatenate([[H-1], fut_idx])
-        ext_v = np.concatenate([[true_history[-1]], true_future])
-        ax_ts.plot(ext_i, ext_v,
+        # For continuity, connect last historical point to first future point
+        connection_x = np.array([H-1, H])
+        connection_y = np.array([true_history[-1], true_future[0]])
+        ax_ts.plot(connection_x, connection_y, color=PALETTE["observed"], lw=1, alpha=0.7)
+        
+        # Now plot the future observations
+        ax_ts.plot(fut_idx, true_future,
                    color=PALETTE["observed"], lw=2, marker="o", ms=6,
                    markerfacecolor="white", markeredgecolor=PALETTE["observed"],
                    label="Observed")
@@ -190,10 +210,12 @@ def plot_forecast(
             label = "Forecast Quantiles"
             quantile_legend_added = True
         
+        # First, create a smooth transition from the last historical value
+        last_hist_val = true_history[-1]
         ax_ts.fill_between(
             ext_i,
-            np.concatenate([[true_history[-1]], low]),
-            np.concatenate([[true_history[-1]], high]),
+            np.concatenate([[last_hist_val], low]),
+            np.concatenate([[last_hist_val], high]),
             color=PALETTE["uncertainty"], alpha=alpha,
             label=label
         )
@@ -210,7 +232,6 @@ def plot_forecast(
     # — axes formatting —
     ax_ts.set_xticks(tick_pos)
     ax_ts.set_xticklabels(tick_lbl)
-    ax_ts.axvline(zero_pos, color="black", lw=1.2, label="t=0")
     ax_ts.set_ylabel("Glucose (mmol/L)")
     ax_ts.legend(loc="upper left", frameon=True, framealpha=0.6, facecolor='white', edgecolor='none', 
                 handlelength=1.5, handletextpad=0.5)
@@ -218,14 +239,25 @@ def plot_forecast(
         ax_ts.spines[spine].set_visible(False)
 
     # — title with optional loss —
-    title = "Glucose Forecast"
+    title = "Glucose Forecast" 
     if loss_value is not None:
-        title += f" (Loss: {loss_value:.3f})"
-    ax_ts.set_title(title)
+        title += f" (Loss: {loss_value:.4f})"
+        
+    # Add the title with our new formatting
+    ax_ts.set_title(title, fontsize=14)
+    
+    # Add better labels
+    ax_ts.set_xlabel("Time (15-min intervals)", fontsize=12)
+    ax_ts.set_ylabel("Glucose (mmol/L)", fontsize=12)
 
     # — attention heatmap —
-    if encoder_attention_map is not None and decoder_attention_map is not None and ax_at is not None:
-        attention_map = np.concatenate([encoder_attention_map, decoder_attention_map], axis=1)
+    if encoder_attention_map is not None and ax_at is not None:
+        # Combine encoder and decoder attention maps if both are provided
+        if decoder_attention_map is not None:
+            attention_map = np.concatenate([encoder_attention_map, decoder_attention_map], axis=1)
+        else:
+            attention_map = encoder_attention_map
+            
         # Plot the attention map
         im = ax_at.imshow(attention_map, aspect="auto", origin="lower", cmap=attention_cmap)
         ax_at.set_ylabel("Forecast Step")

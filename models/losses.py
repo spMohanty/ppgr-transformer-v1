@@ -82,14 +82,36 @@ def unscale_tensor(tensor: torch.Tensor, target_scales: torch.Tensor) -> torch.T
     Returns:
         Unscaled tensor
     """
+    # Check if inputs contain NaNs
+    if torch.isnan(tensor).any():
+        # Replace NaNs with zeros
+        tensor = torch.nan_to_num(tensor, nan=0.0)
+        
+    if torch.isnan(target_scales).any():
+        # Replace NaNs with reasonable defaults (no scaling)
+        target_scales = torch.nan_to_num(target_scales, nan=1.0)
+    
     # Extract scale parameters
     mean_val = target_scales[:, 0]
     std_val = target_scales[:, 1]
     
+    # Handle division by zero or very small values in standard deviation
+    # Ensure std_val doesn't contain zeros, negatives, or extremely small values
+    eps = 1e-6
+    std_val = torch.clamp(std_val, min=eps)
+    
     # Handle different tensor shapes
     if tensor.dim() == 2:  # (B, T)
-        return tensor * std_val.unsqueeze(1) + mean_val.unsqueeze(1)
+        unscaled = tensor * std_val.unsqueeze(1) + mean_val.unsqueeze(1)
     elif tensor.dim() == 3:  # (B, T, Q)
-        return tensor * std_val.unsqueeze(1).unsqueeze(2) + mean_val.unsqueeze(1).unsqueeze(2)
+        unscaled = tensor * std_val.unsqueeze(1).unsqueeze(2) + mean_val.unsqueeze(1).unsqueeze(2)
     else:
         raise ValueError(f"Unsupported tensor dimension: {tensor.dim()}")
+    
+    # Clip extreme values to prevent NaNs in subsequent calculations
+    # Glucose values typically range from ~40 to ~400 mg/dL
+    # Or approximately 2.5 to 22 mmol/L in SI units
+    min_glucose = 2.0   # Below physiological range but allow for some prediction error
+    max_glucose = 30.0  # Above physiological range but allow for some prediction error
+    
+    return torch.clamp(unscaled, min=min_glucose, max=max_glucose)

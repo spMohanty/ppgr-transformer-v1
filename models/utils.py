@@ -155,6 +155,16 @@ def compute_forecast_metrics(
         predictions = preds[0]
     else:
         predictions = preds
+    
+    # Check for NaN values in predictions
+    if torch.isnan(predictions).any():
+        print(f"WARNING: NaN values detected in predictions: {torch.isnan(predictions).sum().item()} / {predictions.numel()}")
+    
+    if torch.isnan(future_glucose).any():
+        print(f"WARNING: NaN values detected in future_glucose: {torch.isnan(future_glucose).sum().item()} / {future_glucose.numel()}")
+    
+    if torch.isnan(target_scales).any():
+        print(f"WARNING: NaN values detected in target_scales: {torch.isnan(target_scales).sum().item()} / {target_scales.numel()}")
         
     # Unscale future glucose values
     future_glucose_unscaled = (

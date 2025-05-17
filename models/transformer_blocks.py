@@ -101,10 +101,10 @@ class TransformerEncoder(nn.Module):
         return output, attn_weights
 
 
-class TransformerDecoderLayer(nn.Module):
+class CustomTransformerDecoderLayer(nn.Module):
     """
-    A single Transformer decoder layer with self-attention + cross-attention + feed-forward.
-    Returns cross-attn weights if return_attn=True.
+    Custom TransformerDecoderLayer implementation that allows returning attention weights.
+    Based on PyTorch's TransformerDecoderLayer but modified to return attention weights.
     """
     def __init__(
         self, 
@@ -112,497 +112,533 @@ class TransformerDecoderLayer(nn.Module):
         nhead: int, 
         dim_feedforward: int = 2048, 
         dropout: float = 0.1, 
-        activation: str = "relu"
+        activation: str = "relu",
+        batch_first: bool = True
     ):
         super().__init__()
-        # Self-attn
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-        # Cross-attn
-        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-
-        # Feed-forward
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
+        
+        # Feed-forward network
         self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
 
-        self.dropout_attn = nn.Dropout(dropout)
-        self.dropout_cross = nn.Dropout(dropout)
-        self.dropout_ffn = nn.Dropout(dropout)
-
+        # Normalization layers
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
+        
+        # Dropout layers
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
 
-        # Activation function
-        self.activation_fn = F.relu if activation == "relu" else F.gelu
-
+        # Activation
+        self.activation = F.relu if activation == "relu" else F.gelu
+        
     def forward(
-        self,
-        tgt, 
-        memory,
-        tgt_mask=None,
-        memory_mask=None,
-        tgt_key_padding_mask=None,
-        memory_key_padding_mask=None,
-        return_attn=False
+        self, 
+        tgt: torch.Tensor, 
+        memory: torch.Tensor, 
+        tgt_mask: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+        return_attn: bool = False
     ):
         """
-        Forward pass of a transformer decoder layer.
+        Forward pass with option to return attention weights.
         
         Args:
-            tgt: Target sequence (queries)
-            memory: Source sequence (keys/values)
-            tgt_mask: Mask applied to self-attention
-            memory_mask: Mask applied to cross-attention
-            tgt_key_padding_mask: Padding mask for target sequence
-            memory_key_padding_mask: Padding mask for memory sequence
+            tgt: Target sequence
+            memory: Source sequence from encoder
+            tgt_mask: Target sequence mask
+            memory_mask: Memory mask
+            tgt_key_padding_mask: Target key padding mask
+            memory_key_padding_mask: Memory key padding mask
             return_attn: Whether to return attention weights
             
         Returns:
-            x: Output tensor
-            cross_attn_weights: Cross-attention weights if return_attn=True
+            output: Decoder layer output
+            attn: Attention weights if return_attn=True
         """
-        # 1) Self-Attn
-        x = tgt
-        sa_out, _ = self.self_attn(
-            x, x, x,
+        # Self-attention block
+        tgt2 = self.norm1(tgt)
+        tgt2, _ = self.self_attn(
+            tgt2, tgt2, tgt2,
             attn_mask=tgt_mask,
-            key_padding_mask=tgt_key_padding_mask,
-            need_weights=False
+            key_padding_mask=tgt_key_padding_mask
         )
-        x = x + self.dropout_attn(sa_out)
-        x = self.norm1(x)
+        tgt = tgt + self.dropout1(tgt2)
 
-        # 2) Cross-Attn
-        cross_attn_weights = None
-        ca_out, ca_weights = self.cross_attn(
-            query=x, 
-            key=memory, 
-            value=memory,
+        # Cross-attention block
+        tgt2 = self.norm2(tgt)
+        tgt2, attn_weights = self.multihead_attn(
+            tgt2, memory, memory,
             attn_mask=memory_mask,
-            key_padding_mask=memory_key_padding_mask,
-            need_weights=True
+            key_padding_mask=memory_key_padding_mask
         )
-        x = x + self.dropout_cross(ca_out)
-        x = self.norm2(x)
+        tgt = tgt + self.dropout2(tgt2)
+
+        # Feed-forward block
+        tgt2 = self.norm3(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
+        tgt = tgt + self.dropout3(tgt2)
 
         if return_attn:
-            cross_attn_weights = ca_weights  # shape [B, T_tgt, T_mem]
+            return tgt, attn_weights
+        else:
+            return tgt
 
-        # 3) Feed-forward
-        ff = self.linear2(self.dropout_ffn(self.activation_fn(self.linear1(x))))
-        x = x + ff
-        x = self.norm3(x)
 
-        return x, cross_attn_weights
+class TransformerDecoderLayer(CustomTransformerDecoderLayer):
+    """
+    A single Transformer decoder layer with self-attention + cross-attention + feed-forward.
+    Returns cross-attn weights if return_attn=True.
+    
+    Inherits from CustomTransformerDecoderLayer for compatibility with existing code.
+    """
+    pass
 
 
 class TransformerDecoder(nn.Module):
     """
-    Stacks multiple TransformerDecoderLayer blocks.
-    If return_attn=True, returns the final layer's cross-attn weights.
-    If layers_share_weights=True, the same layer is used for all positions,
-    otherwise independent copies are created for each position.
+    A stack of transformer decoder layers with support for returning attention weights.
+    Optionally shares weights across layers for parameter efficiency.
     """
-    def __init__(self, decoder_layer, num_layers, norm=None, layers_share_weights=False):
+    def __init__(
+        self, 
+        decoder_layer: nn.Module, 
+        num_layers: int, 
+        layers_share_weights: bool = True,
+        norm: Optional[nn.Module] = None,
+    ):
         super().__init__()
-        if layers_share_weights:
-            # Use the same layer instance for all positions
-            self.layers = nn.ModuleList([decoder_layer for _ in range(num_layers)])
-        else:
-            # Create independent copies of the layer for each position
-            self.layers = nn.ModuleList([deepcopy(decoder_layer) for _ in range(num_layers)])
-        self.norm = norm
+        
         self.num_layers = num_layers
-
+        self.layers_share_weights = layers_share_weights
+        
+        if layers_share_weights:
+            # Use shared decoder with weight sharing
+            self.decoder = SharedTransformerDecoder(decoder_layer, num_layers)
+        else:
+            # Use decoder with separate weights for each layer
+            self.layers = nn.ModuleList([
+                TransformerDecoderLayer(
+                    d_model=decoder_layer.self_attn.embed_dim,
+                    nhead=decoder_layer.self_attn.num_heads,
+                    dim_feedforward=decoder_layer.linear1.out_features,
+                    dropout=decoder_layer.dropout1.p,
+                    activation="relu" if isinstance(decoder_layer.activation, type(F.relu)) else "gelu"
+                )
+                for _ in range(num_layers)
+            ])
+        
+        self.norm = norm
+        
     def forward(
-        self,
-        tgt,
-        memory,
-        tgt_mask=None,
-        memory_mask=None,
-        tgt_key_padding_mask=None,
-        memory_key_padding_mask=None,
-        return_attn=False
+        self, 
+        tgt: torch.Tensor, 
+        memory: torch.Tensor, 
+        tgt_mask: Optional[torch.Tensor] = None, 
+        memory_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None, 
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+        return_attn: bool = False,
     ):
         """
-        Forward pass through the transformer decoder stack.
+        Forward pass through the decoder stack.
         
         Args:
-            tgt: Target sequence (queries)
-            memory: Source sequence (keys/values from encoder)
-            tgt_mask: Mask for target sequence (self-attention)
-            memory_mask: Mask for memory sequence (cross-attention)
+            tgt: Target sequence (decoder input)
+            memory: Source sequence from encoder
+            tgt_mask: Mask for target sequence (usually causal)
+            memory_mask: Mask for memory sequence
             tgt_key_padding_mask: Padding mask for target sequence
             memory_key_padding_mask: Padding mask for memory sequence
             return_attn: Whether to return attention weights
             
         Returns:
             output: Decoder output
-            cross_attn_weights: Attention weights if return_attn=True
+            attn: Attention weights from the last layer if return_attn=True
         """
         output = tgt
         cross_attn_weights = None
-
-        for layer_idx, layer in enumerate(self.layers):
-            is_last = (layer_idx == len(self.layers) - 1)
-            output, cross_attn_weights = layer(
-                output,
-                memory,
-                tgt_mask=tgt_mask,
-                memory_mask=memory_mask,
-                tgt_key_padding_mask=tgt_key_padding_mask,
-                memory_key_padding_mask=memory_key_padding_mask,
-                return_attn=(return_attn and is_last)
-            )            
-
+        
+        if self.layers_share_weights:
+            # Use shared decoder
+            if return_attn:
+                output, cross_attn_weights = self.decoder(
+                    output, memory,
+                    tgt_mask=tgt_mask,
+                    memory_mask=memory_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask,
+                    memory_key_padding_mask=memory_key_padding_mask,
+                    return_attn=True
+                )
+            else:
+                output = self.decoder(
+                    output, memory,
+                    tgt_mask=tgt_mask,
+                    memory_mask=memory_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask,
+                    memory_key_padding_mask=memory_key_padding_mask
+                )
+        else:
+            # Process through separate layers
+            for i, layer in enumerate(self.layers):
+                if return_attn and i == len(self.layers) - 1:
+                    # Only return attention from the last layer
+                    output, cross_attn_weights = layer(
+                        output, memory,
+                        tgt_mask=tgt_mask,
+                        memory_mask=memory_mask,
+                        tgt_key_padding_mask=tgt_key_padding_mask,
+                        memory_key_padding_mask=memory_key_padding_mask,
+                        return_attn=True
+                    )
+                else:
+                    output, _ = layer(
+                        output, memory,
+                        tgt_mask=tgt_mask,
+                        memory_mask=memory_mask,
+                        tgt_key_padding_mask=tgt_key_padding_mask,
+                        memory_key_padding_mask=memory_key_padding_mask,
+                        return_attn=False
+                    )
+        
         if self.norm is not None:
             output = self.norm(output)
+            
+        if return_attn:
+            return output, cross_attn_weights
+        else:
+            return output
 
-        return output, cross_attn_weights
-    
-    
+
 class CrossModalFusionBlock(nn.Module):
     """
-    Fuses multiple modality embeddings using multi-head self-attention.
-    Unlike the original, this version uses a dictionary-based API like TransformerVariableSelectionNetwork.
+    Cross-modal fusion using multihead self-attention.
     
-    Two fusion modes are supported:
-    1. "mean_pooling": Apply self-attention across modalities then mean-pool (original approach)
-    2. "query_token": Use a learnable query token to attend to all modalities (similar to VSN)
+    This block fuses information from multiple modalities using a multihead
+    self-attention mechanism followed by a feed-forward network.
     """
-    def __init__(
-        self,
-        input_sizes: Dict[str, int],
-        hidden_size: int,
-        n_heads: int = 4,
-        input_embedding_flags: Dict[str, bool] = None,
-        dropout: float = 0.1,
-        context_size: int = None,
-        single_variable_grns: Dict[str, nn.Module] = None,
-        prescalers: Dict[str, nn.Module] = None,
-        fusion_mode: str = "query_token"
-    ):
-        """
-        Initialize a cross-modal fusion block with VSN-compatible API.
-        
-        Args:
-            input_sizes: Dictionary mapping variable names to their input dimensions 
-                         (currently ignored as we assume all inputs are already of hidden_size).
-            hidden_size: The hidden dimension of the model.
-            n_heads: Number of attention heads.
-            input_embedding_flags: (Ignored, for VSN compatibility).
-            dropout: Dropout probability.
-            context_size: (Ignored, for VSN compatibility).
-            single_variable_grns: (Ignored, for VSN compatibility).
-            prescalers: Optional dict mapping variable names to a prescaler module.
-            fusion_mode: Fusion approach: "mean_pooling" or "query_token".
-        """
-        super().__init__()
-        self.input_sizes = input_sizes
-        self.hidden_size = hidden_size
-        self.n_heads = n_heads
-        self.dropout = dropout
-        self.fusion_mode = fusion_mode
-        self.n_vars = len(input_sizes)
-        self.single_variable = (self.n_vars == 1)
-        
-        # If provided, use the given prescalers
-        if prescalers is not None:
-            self.prescalers = nn.ModuleDict(prescalers)
-        else:
-            self.prescalers = nn.ModuleDict()
-        
-        # Multi-head attention for fusion
-        self.attn = nn.MultiheadAttention(hidden_size, n_heads, dropout=dropout, batch_first=True)
-        self.norm = nn.LayerNorm(hidden_size)
-        self.dropout_layer = nn.Dropout(dropout)
-        
-        # Add a learnable query token if using query_token mode
-        if fusion_mode == "query_token":
-            # Create a learnable query token [1, 1, hidden_size] - will be expanded to [B, T, hidden_size]
-            self.query_token = nn.Parameter(torch.randn(1, 1, hidden_size))
-            
-            # Add feed-forward network for processing query token output
-            self.feed_forward = nn.Sequential(
-                nn.Linear(hidden_size, hidden_size),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_size, hidden_size),
-            )
-
-    def forward(
-        self, x: Dict[str, torch.Tensor], context: torch.Tensor = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: Dictionary of variable names to tensors.
-               Each tensor should be of shape [batch, time, hidden_size].
-            context: (Ignored, for VSN compatibility).
-
-        Returns:
-            output: The fused variable embedding of shape [batch, time, hidden_size].
-            selection_weights: The variable selection weights, of shape [batch, time, n_vars].
-        """
-        # Handle single variable case
-        if self.single_variable:
-            var_name = list(self.input_sizes.keys())[0]
-            var_tensor = x[var_name]
-            
-            # Apply prescaler if present
-            if var_name in self.prescalers:
-                var_tensor = self.prescalers[var_name](var_tensor)
-                
-            # Create trivial selection weights
-            B, T, _ = var_tensor.shape
-            weights = torch.ones(B, T, 1, device=var_tensor.device)
-            
-            return var_tensor, weights
-        
-        # Get batch and time dimensions from the first variable
-        sample_tensor = next(iter(x.values()))
-        B, T, D = sample_tensor.shape
-        
-        # Process each variable and collect embeddings
-        embedded_vars = []
-        var_names = []
-        
-        for name in self.input_sizes.keys():
-            var_tensor = x[name]
-            # Apply prescaler if exists
-            if name in self.prescalers:
-                var_tensor = self.prescalers[name](var_tensor)
-            embedded_vars.append(var_tensor)
-            var_names.append(name)
-        
-        # Stack variables along a new dimension
-        tokens = torch.stack(embedded_vars, dim=2)  # [B, T, n_vars, D]
-        
-        # --- Fusion processing ---
-        if self.fusion_mode == "mean_pooling":
-            # Original approach: mean pooling after self-attention
-            # Reshape for batch processing: [B*T, n_vars, D]
-            tokens_reshaped = tokens.reshape(B * T, self.n_vars, D)
-            
-            # Self-attention across variables
-            attn_output, attn_weights = self.attn(
-                tokens_reshaped, tokens_reshaped, tokens_reshaped,
-                need_weights=True
-            )  # [B*T, n_vars, D], [B*T, n_vars, n_vars]
-            
-            # Mean-pool across variables
-            fused = attn_output.mean(dim=1)  # [B*T, D]
-            fused = self.norm(fused)
-            fused = self.dropout_layer(fused)
-            
-            # Reshape back to [B, T, D]
-            fused = fused.reshape(B, T, D)
-            
-            # Reshape attention weights to [B, T, n_vars, n_vars]
-            # Then average across the first variable dimension to get [B, T, n_vars]
-            selection_weights = attn_weights.reshape(B, T, self.n_vars, self.n_vars)
-            selection_weights = selection_weights.mean(dim=2)  # [B, T, n_vars]
-            
-        elif self.fusion_mode == "query_token":
-            # Query token approach: similar to VSN
-            # Reshape tokens for processing: [B*T, n_vars, D]
-            tokens_reshaped = tokens.reshape(B * T, self.n_vars, D)
-            
-            # Expand query token
-            query = self.query_token.expand(B * T, 1, D)  # [B*T, 1, D]
-            
-            # Apply cross-attention: query attends to variables
-            attn_output, attn_weights = self.attn(
-                query=query,          # [B*T, 1, D]
-                key=tokens_reshaped,  # [B*T, n_vars, D]
-                value=tokens_reshaped,  # [B*T, n_vars, D]
-                need_weights=True
-            )  # [B*T, 1, D], [B*T, 1, n_vars]
-            
-            # Apply feed-forward with residual connection
-            ff_output = self.feed_forward(attn_output)
-            fused = self.norm(attn_output + ff_output)  # [B*T, 1, D]
-            
-            # Remove singleton dimension and reshape
-            fused = fused.squeeze(1)  # [B*T, D]
-            fused = self.dropout_layer(fused)
-            fused = fused.reshape(B, T, D)  # [B, T, D]
-            
-            # Reshape attention weights to [B, T, n_vars]
-            selection_weights = attn_weights.reshape(B, T, self.n_vars)
-        
-        else:
-            raise ValueError(f"Unsupported fusion mode: {self.fusion_mode}")
-        
-        return fused, selection_weights
-
-class TransformerVariableSelectionNetwork(nn.Module):
     def __init__(
         self,
         input_sizes: Dict[str, int],
         hidden_size: int,
         n_heads: int,
-        input_embedding_flags: Dict[str, bool] = None,
         dropout: float = 0.1,
-        context_size: int = None,
-        single_variable_grns: Dict[str, nn.Module] = None,
-        prescalers: Dict[str, nn.Module] = None,
+        fusion_mode: str = "query_token"
     ):
-        """
-        Transformer-based variable selection network.
-        
-        Args:
-            input_sizes: Dictionary mapping variable names to their input dimensions.
-            hidden_size: The hidden dimension (this is used as the transformer model dimension).
-            input_embedding_flags: (Ignored in this implementation, but left here for compatibility with the original code.)
-            dropout: Dropout probability.
-            context_size: If provided, context will be projected and added to a learnable CLS token.
-            single_variable_grns: (Ignored in this implementation. - as here All variables are treated as "tokens" in a single attention mechanism)
-            prescalers: Optional dict mapping variable names to a prescaler (e.g. an nn.Linear)
-                        that should be applied before the main variable embedding.
-        """
         super().__init__()
+        
         self.input_sizes = input_sizes
         self.hidden_size = hidden_size
         self.n_heads = n_heads
         self.dropout = dropout
-        self.context_size = context_size
-        self.input_embedding_flags = input_embedding_flags if input_embedding_flags is not None else {}
-        self.n_vars = len(input_sizes)
-        self.single_variable = (self.n_vars == 1)
-
-        # If provided, use the given prescalers; otherwise, initialize an empty ModuleDict.
-        if prescalers is not None:
-            self.prescalers = nn.ModuleDict(prescalers)
-        else:
-            self.prescalers = nn.ModuleDict()
-
-        # Build a simple per-variable embedding layer mapping from the variable's input dim to hidden_size.
-        self.variable_embeddings = nn.ModuleDict()
-        for name, size in input_sizes.items():
-            self.variable_embeddings[name] = nn.Linear(size, hidden_size)
-
-        # If context is provided, project it to hidden_size.
-        if context_size is not None:
-            self.context_proj = nn.Linear(context_size, hidden_size)
-        else:
-            self.context_proj = None
+        self.fusion_mode = fusion_mode
+        self.mode_token = None
         
-        # Learned CLS token used as the query for variable selection.
-        # Shape: [1, 1, hidden_size] — later expanded to match the batch (and time) dimensions.
-        self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_size))
-
-        # Multi-head attention layer.
-        self.mha = nn.MultiheadAttention(
-            embed_dim=hidden_size, num_heads=self.n_heads, dropout=dropout, batch_first=True
+        # Projections for each modality
+        self.projections = nn.ModuleDict()
+        for modality, input_size in input_sizes.items():
+            # Project to hidden size if input size differs
+            if input_size != hidden_size:
+                self.projections[modality] = nn.Linear(input_size, hidden_size)
+        
+        # Multi-head self-attention for cross-modal fusion
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size, 
+            num_heads=n_heads, 
+            dropout=dropout,
+            batch_first=True
         )
-
-        # An optional feed-forward network and layer norm following the attention layer.
-        self.feed_forward = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
+        
+        # Normalization and feed-forward
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size)
+        
+        # Feed-forward network
+        self.ff = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, hidden_size),
+            nn.Linear(hidden_size * 4, hidden_size),
+            nn.Dropout(dropout)
         )
-        self.layer_norm = nn.LayerNorm(hidden_size)
-
-    def forward(
-        self, x: Dict[str, torch.Tensor], context: torch.Tensor = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+        # For query token mode
+        if fusion_mode == "query_token":
+            # Create a learnable query token for fusion
+            self.query_token = nn.Parameter(torch.randn(1, 1, hidden_size))
+        
+        # Initialize weights
+        self._reset_parameters()
+    
+    def _reset_parameters(self):
+        """Initialize the parameters."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # Special initialization for the query token
+        if hasattr(self, 'query_token'):
+            nn.init.xavier_normal_(self.query_token)
+    
+    def forward(self, inputs: Dict[str, torch.Tensor], static_context: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        Forward pass of the CrossModalFusionBlock.
+        
         Args:
-            x: Dictionary of variable names to tensors.
-               Each tensor can be of shape [batch, input_dim] or [batch, time, input_dim].
-            context: Optional context tensor of shape [batch, context_size] or [batch, time, context_size].
-
+            inputs: Dictionary mapping modality names to tensors [B, T, H]
+            static_context: Optional static context tensor [B, T, H]
+            
         Returns:
-            output: The combined variable embedding, of shape [batch, hidden_size] (if no time dimension)
-                    or [batch, time, hidden_size] (if inputs are time-varying).
-            sparse_weights: The variable selection weights (attention weights),
-                            of shape [batch, n_vars] or [batch, time, n_vars].
+            fused: Fused representation [B, T, H]
+            weights: Attention weights [B, T, M]
         """
-        # Determine whether inputs are time-varying based on one sample.
-        sample_tensor = next(iter(x.values()))
-        has_time = (sample_tensor.dim() == 3)
+        batch_size = next(iter(inputs.values())).size(0)
+        seq_len = next(iter(inputs.values())).size(1)
+        
+        # Project each modality to hidden size if needed
+        modality_list = []
+        modality_names = []
+        
+        for modality, tensor in inputs.items():
+            if modality in self.projections:
+                # Project if input size differs from hidden size
+                projected = self.projections[modality](tensor)
+            else:
+                projected = tensor
+            
+            modality_list.append(projected)
+            modality_names.append(modality)
+        
+        # Track weights for each modality
+        weights = torch.zeros(batch_size, seq_len, len(modality_list), device=modality_list[0].device)
+        
+        # Combine all modalities into a single sequence for attention
+        if self.fusion_mode == "mean_pooling":
+            # Stack all modalities [B, T, M, H] where M is the number of modalities
+            stacked = torch.stack(modality_list, dim=2)
+            
+            # Apply self-attention across modalities
+            for t in range(seq_len):
+                # Get the t-th timestep for all modalities [B, M, H]
+                time_slice = stacked[:, t]
+                
+                # Condition with static context if provided
+                if static_context is not None:
+                    # Add static context for this timestep
+                    time_slice = time_slice + static_context[:, t].unsqueeze(1)
+                
+                # Apply self-attention
+                attn_out, attn_weights = self.self_attn(
+                    time_slice, time_slice, time_slice
+                )
+                
+                # Update weights for this timestep
+                weights[:, t] = attn_weights
+                
+                # Mean pooling across modalities (dimension 1)
+                time_out = attn_out.mean(dim=1)
+                
+                # Update the original tensor
+                if t == 0:
+                    fused = time_out.unsqueeze(1)
+                else:
+                    fused = torch.cat([fused, time_out.unsqueeze(1)], dim=1)
+        
+        elif self.fusion_mode == "query_token":
+            # Similar to VSN approach using a query token
+            # Stack all modalities [B, T, M, H]
+            stacked = torch.stack(modality_list, dim=2)
+            
+            # Initialize output tensor
+            fused = torch.zeros(batch_size, seq_len, self.hidden_size, device=stacked.device)
+            
+            # Process each timestep
+            for t in range(seq_len):
+                # Get modalities at this timestep [B, M, H]
+                time_slice = stacked[:, t]
+                
+                # Expand query token to batch size
+                query = self.query_token.expand(batch_size, -1, -1)
+                
+                # Apply static context if provided
+                if static_context is not None:
+                    # Add static context to the query
+                    query = query + static_context[:, t].unsqueeze(1)
+                
+                # Apply attention with query token as query
+                # and modalities as keys/values
+                attn_out, attn_weights = self.self_attn(
+                    query=query,
+                    key=time_slice,
+                    value=time_slice
+                )
+                
+                # Store the attention weights
+                weights[:, t] = attn_weights.squeeze(1)
+                
+                # Store the output for this timestep
+                fused[:, t] = attn_out.squeeze(1)
+        
+        else:
+            raise ValueError(f"Unsupported fusion mode: {self.fusion_mode}")
+        
+        # Apply layer norm
+        fused = self.norm1(fused)
+        
+        # Apply feed-forward network with residual connection
+        ff_output = self.ff(fused)
+        fused = self.norm2(fused + ff_output)
+        
+        return fused, weights
 
-        # --- Case 1: Single variable input ---
-        if self.single_variable:
-            var_name = list(self.input_sizes.keys())[0]
-            var_tensor = x[var_name]
-            if var_tensor.dim() == 2:
-                var_tensor = var_tensor.unsqueeze(1)  # Shape: [B, 1, input_dim]
-            if var_name in self.prescalers:
-                var_tensor = self.prescalers[var_name](var_tensor)
-            # Embed the variable.
-            output = self.variable_embeddings[var_name](var_tensor)  # [B, T, hidden_size]
-            B, T, _ = output.shape
-            # Create trivial sparse weights (all ones).
-            sparse_weights = torch.ones(B, T, 1, device=output.device)
-            # If time dimension is 1, squeeze it.
-            if T == 1:
-                output = output.squeeze(1)
-                sparse_weights = sparse_weights.squeeze(1)
-            return output, sparse_weights
-
-        # --- Case 2: Multiple variable inputs ---
-        # Process each variable: apply prescaler (if provided) then the embedding.
-        embedded_vars = []
-        for name, size in self.input_sizes.items():
-            var_tensor = x[name]
-            if var_tensor.dim() == 2:
-                var_tensor = var_tensor.unsqueeze(1)  # [B, 1, input_dim]
-            if name in self.prescalers:
-                var_tensor = self.prescalers[name](var_tensor)
-            embedded = self.variable_embeddings[name](var_tensor)  # [B, T, hidden_size]
-            embedded_vars.append(embedded)
-
-        # Stack along a new variable dimension so that tokens shape becomes [B, T, n_vars, hidden_size].
-        tokens = torch.stack(embedded_vars, dim=2)
-        B, T, n_vars, H = tokens.shape
-        # Merge batch and time dimensions for transformer processing: [B*T, n_vars, H].
-        tokens_reshaped = tokens.view(B * T, n_vars, H)
-
-        # Create a CLS token for each instance.
-        cls_tokens = self.cls_token.expand(B * T, -1, -1)  # [B*T, 1, H]
-        # If a context tensor is provided, project and add it to the CLS token.
-        if context is not None:
-            if context.dim() == 3:
-                # [B, T, context_size] -> [B*T, 1, context_size]
-                context = context.reshape(B * T, 1, -1)
-            elif context.dim() == 2:
-                # [B, context_size] -> [B, 1, context_size] then repeat for each time step.
-                context = context.unsqueeze(1).expand(B, T, -1).reshape(B * T, 1, -1)
-            if self.context_proj is not None:
-                context = self.context_proj(context)
-            cls_tokens = cls_tokens + context
-
-        # Concatenate the CLS token with the variable tokens.
-        # attn_input: [B*T, 1+n_vars, H]
-        attn_input = torch.cat([cls_tokens, tokens_reshaped], dim=1)
-
-        # Use the CLS token as the query, and the full sequence as key/value.
-        query = attn_input[:, :1, :]  # [B*T, 1, H]
-        key = attn_input             # [B*T, 1+n_vars, H]
-        value = attn_input
-
-        # Apply multi-head attention.
-        attn_output, attn_weights = self.mha(query, key, value)
-        # attn_weights shape: [B*T, 1, 1+n_vars]. Discard the first column (self-attention of CLS).
-        variable_selection_weights = attn_weights[:, :, 1:]  # [B*T, 1, n_vars]
-
-        # pass the output through a feed-forward network and add a residual connection.
-        ff = self.feed_forward(attn_output)
-        output = self.layer_norm(attn_output + ff)  # [B*T, 1, H]
-
-        # Reshape back to [B, T, H].
-        output = output.view(B, T, H)
-        variable_selection_weights = variable_selection_weights.view(B, T, n_vars)
-
-        # If time dimension is 1, squeeze it.
-        if T == 1:
-            output = output.squeeze(1)
-            variable_selection_weights = variable_selection_weights.squeeze(1)
-
-        return output, variable_selection_weights
+class TransformerVariableSelectionNetwork(nn.Module):
+    """
+    Transformer-based Variable Selection Network.
+    
+    Implements a variable selection mechanism using a transformer architecture.
+    This allows for modeling dynamic relationships between variables.
+    """
+    def __init__(
+        self,
+        input_sizes: Dict[str, int],
+        hidden_size: int,
+        n_heads: int,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        
+        self.input_sizes = input_sizes
+        self.hidden_size = hidden_size
+        self.n_heads = n_heads
+        self.num_variables = len(input_sizes)
+        
+        # Ensure all inputs have the same hidden size after projection
+        self.projections = nn.ModuleDict()
+        for var_name, input_size in input_sizes.items():
+            if input_size != hidden_size:
+                self.projections[var_name] = nn.Linear(input_size, hidden_size)
+        
+        # Create an embedding for the CLS token
+        self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_size))
+        
+        # Multi-head self-attention
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # Feed-forward network for processing attention output
+        self.ff = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 4, hidden_size),
+            nn.Dropout(dropout),
+            nn.LayerNorm(hidden_size)
+        )
+        
+        # Final projection layer to get attention weights
+        self.attn_weights_layer = nn.Linear(hidden_size, self.num_variables)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize the weights."""
+        for name, param in self.named_parameters():
+            if 'weight' in name and param.dim() > 1:
+                nn.init.xavier_normal_(param)
+            elif 'bias' in name:
+                nn.init.zeros_(param)
+            elif 'cls_token' in name:
+                nn.init.xavier_normal_(param)
+    
+    def forward(self, inputs: Dict[str, torch.Tensor], static_context: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass of the TransformerVariableSelectionNetwork.
+        
+        Args:
+            inputs: Dictionary mapping variable names to tensors [B, T, H]
+            static_context: Optional static context tensor [B, T, H]
+            
+        Returns:
+            vs_output: Weighted sum of variables [B, T, H]
+            weights: Selection weights for each variable [B, T, num_variables]
+        """
+        batch_size = next(iter(inputs.values())).size(0)
+        seq_len = next(iter(inputs.values())).size(1)
+        device = next(iter(inputs.values())).device
+        
+        # Project variables to hidden_size if needed
+        var_list = []
+        var_names = []
+        
+        for var_name, var_tensor in inputs.items():
+            if var_name in self.projections:
+                projected = self.projections[var_name](var_tensor)
+            else:
+                projected = var_tensor
+            
+            var_list.append(projected)
+            var_names.append(var_name)
+        
+        # Initialize the output tensor
+        vs_output = torch.zeros(batch_size, seq_len, self.hidden_size, device=device)
+        
+        # Initialize attention weights tensor
+        weights = torch.zeros(batch_size, seq_len, self.num_variables, device=device)
+        
+        # Process each timestep separately to maintain variable dependencies
+        for t in range(seq_len):
+            # Get the variables for this timestep
+            time_vars = [var[:, t].unsqueeze(1) for var in var_list]  # [B, 1, H]
+            
+            # Concatenate the CLS token with the variables
+            # CLS token serves as the query for attention
+            cls = self.cls_token.expand(batch_size, -1, -1)  # [B, 1, H]
+            
+            # Condition with static context if provided
+            if static_context is not None:
+                # Add static context to the CLS token
+                cls = cls + static_context[:, t].unsqueeze(1)
+            
+            # Concatenate all variables for this timestep [B, num_vars, H]
+            time_vars_cat = torch.cat(time_vars, dim=1)
+            
+            # Apply self-attention using CLS token as query and variables as keys/values
+            attn_output, _ = self.self_attn(
+                query=cls,
+                key=time_vars_cat,
+                value=time_vars_cat
+            )
+            
+            # Process through feed-forward network
+            processed = self.ff(attn_output).squeeze(1)  # [B, H]
+            
+            # Generate attention weights for variables
+            time_weights = self.attn_weights_layer(processed)  # [B, num_vars]
+            time_weights = F.softmax(time_weights, dim=-1)  # [B, num_vars]
+            
+            # Store the weights for this timestep
+            weights[:, t] = time_weights
+            
+            # Weighted sum of variables for this timestep
+            for i, var in enumerate(var_list):
+                vs_output[:, t] += var[:, t] * time_weights[:, i].unsqueeze(-1)
+        
+        return vs_output, weights
 
 
 class RotaryPositionalEmbeddings(nn.Module):
@@ -695,3 +731,86 @@ class RotaryPositionalEmbeddings(nn.Module):
         
         # Return with the same dtype as the input
         return x_out.type_as(x)
+
+class SharedTransformerEncoder(nn.Module):
+    def __init__(self, layer: nn.TransformerEncoderLayer, num_layers: int):
+        """
+        A transformer encoder that applies the same layer (weight sharing) repeatedly.
+        
+        Args:
+            layer (nn.TransformerEncoderLayer): The transformer encoder layer to be shared.
+            num_layers (int): How many times to apply the layer.
+        """
+        super().__init__()
+        self.shared_layer = layer
+        self.num_layers = num_layers
+
+    def forward(self, src, mask=None, src_key_padding_mask=None):
+        output = src
+        for _ in range(self.num_layers):
+            output = self.shared_layer(
+                output,
+                src_mask=mask,
+                src_key_padding_mask=src_key_padding_mask,
+            )
+        return output
+
+
+class SharedTransformerDecoder(nn.Module):
+    def __init__(self, layer: nn.TransformerDecoderLayer, num_layers: int):
+        """
+        A transformer decoder that applies the same layer (weight sharing) repeatedly.
+        
+        Args:
+            layer (nn.TransformerDecoderLayer): The transformer decoder layer to be shared.
+            num_layers (int): How many times to apply the layer.
+        """
+        super().__init__()
+        self.shared_layer = layer
+        self.num_layers = num_layers
+
+    def forward(self, tgt, memory, tgt_mask=None, 
+                memory_mask=None, tgt_key_padding_mask=None, 
+                memory_key_padding_mask=None, return_attn=False):
+        """
+        Forward pass through the shared decoder layer.
+        
+        Args:
+            tgt: Target sequence
+            memory: Source sequence from encoder
+            tgt_mask: Target sequence mask
+            memory_mask: Memory mask
+            tgt_key_padding_mask: Target key padding mask
+            memory_key_padding_mask: Memory key padding mask
+            return_attn: Whether to return attention weights
+            
+        Returns:
+            output: Decoder output
+            attn: Attention weights if return_attn=True
+        """
+        output = tgt
+        for i in range(self.num_layers):
+            # Only return attention on the last layer if requested
+            if return_attn and i == self.num_layers - 1:
+                output, attn = self.shared_layer(
+                    output,
+                    memory,
+                    tgt_mask=tgt_mask,
+                    memory_mask=memory_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask,
+                    memory_key_padding_mask=memory_key_padding_mask,
+                    return_attn=True
+                )
+                return output, attn
+            else:
+                output = self.shared_layer(
+                    output,
+                    memory,
+                    tgt_mask=tgt_mask,
+                    memory_mask=memory_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask,
+                    memory_key_padding_mask=memory_key_padding_mask,
+                )
+        
+        # If we didn't return earlier, return output without attention
+        return output
