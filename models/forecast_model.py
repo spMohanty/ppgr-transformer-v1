@@ -49,6 +49,164 @@ class FusionMode(Enum):
 BASE_MODALITIES_PAST = ["glucose", "meal", "temporal", "microbiome"]
 BASE_MODALITIES_FUTURE = ["meal", "temporal", "microbiome"]
 
+class ScaledDotProductAttention(nn.Module):
+    """
+    Scaled Dot-Product Attention module.
+    """
+    def __init__(self, dropout: float = None, scale: bool = True):
+        super(ScaledDotProductAttention, self).__init__()
+        if dropout is not None:
+            self.dropout = nn.Dropout(p=dropout)
+        else:
+            self.dropout = dropout
+        self.softmax = nn.Softmax(dim=2)
+        self.scale = scale
+
+    def forward(self, q, k, v, mask=None):
+        attn = torch.bmm(q, k.permute(0, 2, 1))  # query-key overlap
+
+        if self.scale:
+            dimension = torch.as_tensor(
+                k.size(-1), dtype=attn.dtype, device=attn.device
+            ).sqrt()
+            attn = attn / dimension
+
+        if mask is not None:
+            attn = attn.masked_fill(mask, -float("inf"))
+        attn = self.softmax(attn)
+
+        if self.dropout is not None:
+            attn = self.dropout(attn)
+        output = torch.bmm(attn, v)
+        return output, attn
+
+class InterpretableMultiHeadAttention(nn.Module):
+    """
+    Interpretable Multi-Head Attention from TFT implementation.
+    """
+    def __init__(self, n_head: int, d_model: int, dropout: float = 0.0):
+        super(InterpretableMultiHeadAttention, self).__init__()
+
+        self.n_head = n_head
+        self.d_model = d_model
+        self.d_k = self.d_q = self.d_v = d_model // n_head
+        self.dropout = nn.Dropout(p=dropout)
+
+        self.v_layer = nn.Linear(self.d_model, self.d_v)
+        self.q_layers = nn.ModuleList(
+            [nn.Linear(self.d_model, self.d_q) for _ in range(self.n_head)]
+        )
+        self.k_layers = nn.ModuleList(
+            [nn.Linear(self.d_model, self.d_k) for _ in range(self.n_head)]
+        )
+        self.attention = ScaledDotProductAttention()
+        self.w_h = nn.Linear(self.d_v, self.d_model, bias=False)
+
+        self.init_weights()
+
+    def init_weights(self):
+        for name, p in self.named_parameters():
+            if "bias" not in name:
+                torch.nn.init.xavier_uniform_(p)
+            else:
+                torch.nn.init.zeros_(p)
+
+    def forward(self, q, k, v, mask=None) -> Tuple[torch.Tensor, torch.Tensor]:
+        heads = []
+        attns = []
+        vs = self.v_layer(v)
+        for i in range(self.n_head):
+            qs = self.q_layers[i](q)
+            ks = self.k_layers[i](k)
+            head, attn = self.attention(qs, ks, vs, mask)
+            head_dropout = self.dropout(head)
+            heads.append(head_dropout)
+            attns.append(attn)
+
+        head = torch.stack(heads, dim=2) if self.n_head > 1 else heads[0]
+        attn = torch.stack(attns, dim=2)
+
+        outputs = torch.mean(head, dim=2) if self.n_head > 1 else head
+        outputs = self.w_h(outputs)
+        outputs = self.dropout(outputs)
+
+        return outputs, attn
+
+class GatedLinearUnit(nn.Module):
+    """
+    Gated Linear Unit implementation.
+    """
+    def __init__(self, input_size: int, dropout: float = 0.0):
+        super().__init__()
+        self.fc = nn.Linear(input_size, input_size * 2)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        x = self.dropout(x)
+        x = self.fc(x)
+        return F.glu(x, dim=-1)
+        
+class AddNorm(nn.Module):
+    """
+    Add and Normalize module.
+    """
+    def __init__(self, input_size: int, trainable_add: bool = False):
+        super().__init__()
+        self.input_size = input_size
+        self.trainable_add = trainable_add
+        
+        if self.trainable_add:
+            self.mask = nn.Parameter(torch.zeros(self.input_size, dtype=torch.float))
+            self.gate = nn.Sigmoid()
+        self.norm = nn.LayerNorm(self.input_size)
+    
+    def forward(self, x, skip):
+        if self.trainable_add:
+            skip = skip * self.gate(self.mask) * 2.0
+        return self.norm(x + skip)
+
+class GateAddNorm(nn.Module):
+    """
+    Gated Add & Norm module.
+    """
+    def __init__(self, hidden_size: int, dropout: float = 0.0, trainable_add: bool = False):
+        super().__init__()
+        self.dropout = dropout
+        self.glu = GatedLinearUnit(hidden_size, dropout=dropout)
+        self.add_norm = AddNorm(hidden_size, trainable_add=trainable_add)
+        
+    def forward(self, x, skip):
+        output = self.glu(x)
+        output = self.add_norm(output, skip)
+        return output
+
+class StaticContextEnrichment(nn.Module):
+    """
+    Static context enrichment layer that combines the input with a context vector.
+    Similar to the implementation in TFT.
+    """
+    def __init__(self, hidden_size: int, dropout: float = 0.1):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.norm = nn.LayerNorm(hidden_size)
+        self.ff = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size),
+            nn.Dropout(dropout)
+        )
+        
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        # x: [batch_size, seq_len, hidden_size]
+        # context: [batch_size, seq_len, hidden_size]
+        x_norm = self.norm(x)
+        # Concatenate along the feature dimension
+        combined = torch.cat([x_norm, context], dim=-1)
+        enriched = self.ff(combined)
+        # Add residual connection
+        return x + enriched
+
 class MealGlucoseForecastModel(pl.LightningModule):
     """
     PyTorch Lightning model for forecasting glucose levels based on meal data.
@@ -113,6 +271,9 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # Initialize fusion blocks
         self._init_fusion_blocks(config, dataset_metadata)
+        
+        # Initialize multihead attention components (from TFT architecture)
+        self._init_multihead_attention(config)
         
         # Initialize forecast layers
         self._init_forecast_layers(config)
@@ -362,6 +523,45 @@ class MealGlucoseForecastModel(pl.LightningModule):
         else:
             raise ValueError(f"Unsupported fusion block type: {self.fusion_block_type}")
 
+    def _init_multihead_attention(self, config: ExperimentConfig) -> None:
+        """Initialize the multihead attention components."""
+        # Interpretable multihead attention (from TFT)
+        self.multihead_attn = InterpretableMultiHeadAttention(
+            n_head=config.num_heads,
+            d_model=config.hidden_dim,
+            dropout=config.dropout_rate
+        )
+        
+        # Skip connection for attention output
+        self.post_attn_gate_norm = GateAddNorm(
+            hidden_size=config.hidden_dim,
+            dropout=config.dropout_rate,
+            trainable_add=False
+        )
+        
+        # Position-wise feed-forward network (replaced with a simpler implementation)
+        self.pos_wise_ff = nn.Sequential(
+            nn.LayerNorm(config.hidden_dim),
+            nn.Linear(config.hidden_dim, config.hidden_dim * self.ffn_expansion_factor),
+            nn.GELU(),
+            nn.Dropout(config.dropout_rate),
+            nn.Linear(config.hidden_dim * self.ffn_expansion_factor, config.hidden_dim),
+            nn.Dropout(config.dropout_rate)
+        )
+        
+        # Pre-output gate norm
+        self.pre_output_gate_norm = GateAddNorm(
+            hidden_size=config.hidden_dim,
+            dropout=0.0,  # No dropout at this late stage
+            trainable_add=False
+        )
+        
+        # Static enrichment - processes static embedding with context
+        self.static_context_enrichment = StaticContextEnrichment(
+            hidden_size=config.hidden_dim,
+            dropout=config.dropout_rate
+        )
+
     def forward(
         self,
         batch: Dict[str, torch.Tensor],
@@ -381,7 +581,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         2. Create dictionaries of inputs for fusion blocks  
         3. Apply fusion to past and future modalities
         4. Combine fused representations and process with transformer decoder
-        5. Generate quantile predictions
+        5. Apply interpretable multi-head attention (from TFT architecture)
+        6. Generate quantile predictions
         
         Returns either a single tensor [B, T_future, Q] with predictions
         or a tuple if return_attn=True with the following elements:
@@ -510,63 +711,116 @@ class MealGlucoseForecastModel(pl.LightningModule):
         fused_glucose_past, past_weights = self.past_fusion(past_modalities_dict)  # [B, T_past, hidden_dim], [B, T_past, num_modalities]
         fused_meal_future, future_weights = self.future_fusion(future_modalities_dict)  # [B, T_future, hidden_dim], [B, T_future, num_modalities]
         
-        # 5) Combine all encodings in a single "memory" sequence
-        memory = torch.cat([
-            fused_glucose_past, 
-            fused_meal_future
-            ], dim=1)  # [B, T_past+T_future, hidden_dim]
-
+        # 5) Combine all encodings in a single "memory" sequence for the multihead attention
+        # but for the decoder, keep them separate
+        
         # Get lengths for masking
         T_past = fused_glucose_past.size(1)
         T_future = fused_meal_future.size(1)
         
-        # Create self-attention causal mask for decoder queries
-        # This mask ensures autoregressive behavior in the decoder
+        # Create self-attention causal mask for decoder queries (ensuring autoregressive behavior)
         causal_mask = torch.triu(
             torch.full((T_future, T_future), float('-inf'), device=device), 
             diagonal=1
         )
         
-        # Create cross-attention mask for the decoder to attend to memory
-        # This mask ensures each decoder position can only see past data 
-        # and future positions up to its own position
-        memory_mask = get_attention_mask(
-            forecast_horizon=self.forecast_horizon,
-            T_past=T_past,
-            T_future=T_future,
-            device=device
-        )
-        
-        # Use the learnable future query embeddings as the target sequence for the decoder
-        # Simply expand across batch dimension since T_future is fixed
-        future_query_embeddings = self.future_query_embeddings.expand(B, -1, -1)
-        
+        # Instead of using the learnable query embeddings, use fused_meal_future directly as input
+        # to the decoder, similar to the TFT approach
         decoder_output, cross_attn = self.decoder(
-            tgt=future_query_embeddings,  # Use learnable query embeddings
-            memory=memory,
-            tgt_mask=causal_mask,   # Self-attention mask (autoregressive)
-            memory_mask=memory_mask,  # Cross-attention mask (causal constraints)
+            tgt=fused_meal_future,          # Use fused future embedding directly
+            memory=fused_glucose_past,      # Only use past data as memory/context
+            tgt_mask=causal_mask,           # Self-attention mask (autoregressive)
+            memory_mask=None,               # No need for memory mask as we're only using past data
             return_attn=return_attn
         )
-
+        
         # Apply position-wise feed-forward network with residual connection
         if self.post_decoder_residual:
             decoder_output = decoder_output + self.post_decoder_ffn(decoder_output)
         else:
             decoder_output = self.post_decoder_ffn(decoder_output)
+        
+        # === Multihead Attention Layer (TFT-style) ===
+        # Following the TFT approach more closely:
+        
+        # 1. Create combined input by concatenating encoder and decoder outputs
+        transformer_output = torch.cat([
+            fused_glucose_past,     # Encoder/past output
+            decoder_output          # Decoder/future output
+        ], dim=1)  # [B, T_past+T_future, hidden_dim]
+        
+        # 2. Apply static enrichment (like in TFT)
+        static_context_enrichment = user_embeddings
+        if self.config.project_user_features_to_single_vector:
+            # If user embeddings are already a single vector [B, 1, hidden_dim]
+            static_context_enrichment = static_context_enrichment.squeeze(1)
+        else:
+            # If user embeddings are multiple features, average them [B, hidden_dim]
+            static_context_enrichment = static_context_enrichment.mean(dim=1)
+        
+        # Process static context with self-enrichment (just pass identical tensors)
+        # No actual context to use here, so we self-enrich
+        processed_static_context = static_context_enrichment.clone()  # Just use a copy for now
+        
+        # Expand static context for the entire sequence
+        expanded_static_context = processed_static_context.unsqueeze(1).expand(-1, transformer_output.size(1), -1)
+        
+        # Enrich the transformer output with static context
+        attn_input = self.static_context_enrichment(transformer_output, expanded_static_context)
+        
+        # 3. Create attention mask for multihead attention
+        attn_mask = get_attention_mask(
+            forecast_horizon=T_future,
+            T_past=T_past,
+            T_future=T_future,
+            device=device
+        )
+        
+        # Convert from -inf/0 mask to boolean mask for InterpretableMultiHeadAttention
+        # True indicates positions that should be masked (where attn_mask was -inf)
+        bool_mask = (attn_mask == float('-inf')).unsqueeze(0).expand(B, -1, -1)
+        
+        # 4. Apply multihead attention (only use future part as queries)
+        attn_output, attn_output_weights = self.multihead_attn(
+            q=attn_input[:, T_past:],       # Only use future part as queries
+            k=attn_input,                   # Use whole sequence as keys
+            v=attn_input,                   # Use whole sequence as values
+            mask=bool_mask                  # Boolean mask where True indicates masked positions
+        )
+        
+        # 5. Apply skip connection and gated add & norm
+        attn_output = self.post_attn_gate_norm(
+            attn_output, attn_input[:, T_past:]
+        )
+        
+        # 6. Apply position-wise feed-forward network
+        output = self.pos_wise_ff(attn_output)
+        
+        # 7. Apply final skip connection and gated add & norm
+        output = self.pre_output_gate_norm(
+            output, transformer_output[:, T_past:]
+        )
 
         # 8) Extract attention weights for past and future if needed
         attn_past = None
         attn_future = None
-        if cross_attn is not None:
-            # Split attention weights for different parts of memory
-            attn_past = cross_attn[:, :, :T_past]  # => [B, T_future, T_past]
-            attn_future = cross_attn[:, :, T_past:T_past + T_future]  # => [B, T_future, T_future]
+        if return_attn and attn_output_weights is not None:
+            # InterpretableMultiHeadAttention returns weights with shape [B, T_future, n_heads, T_past+T_future]
+            
+            # Average across heads (dim=2)
+            if attn_output_weights.dim() == 4:
+                attn_output_weights = attn_output_weights.mean(dim=2)  # Now [B, T_future, T_past+T_future]
+            
+            # Split attention weights for different parts of attn_input
+            # First T_past values are the past context
+            attn_past = attn_output_weights[:, :, :T_past]  # => [B, T_future, T_past]
+            # Next T_future values are from the memory's future part
+            attn_future = attn_output_weights[:, :, T_past:T_past + T_future]  # => [B, T_future, T_future]
 
         # Force full precision for the final output and the residual connection
         with torch.amp.autocast("cuda", enabled=False):
             # 9) Final projection to get quantile predictions (position wise)
-            pred_future = self.forecast_linear(decoder_output)
+            pred_future = self.forecast_linear(output)
 
             # Add residual connection if configured
             if self.add_residual_connection_before_predictions:
