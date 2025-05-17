@@ -85,20 +85,22 @@ class UserEncoder(nn.Module):
         self.total_features = self.num_cat_features + self.num_real_features
         self.project_to_single_vector = project_to_single_vector
         
-        # Individual embeddings for each categorical feature
-        self.cat_embeddings = nn.ModuleList([
-            nn.Embedding(size, self.hidden_dim)
-            for size in categorical_variable_sizes.values()
-        ])
+        # Individual embeddings for each categorical feature, named by variable
+        self.cat_embeddings = nn.ModuleDict({
+            var_name: nn.Embedding(size, self.hidden_dim)
+            for var_name, size in categorical_variable_sizes.items()
+        })
         
-        # Process all real features at once with a single set of layers
+        # Individual projection layers for each real feature, named by variable
         if self.num_real_features > 0:
-            self.real_projection = nn.Sequential(
-                nn.Linear(1, self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate)
-            )
+            self.real_projections = nn.ModuleDict({
+                var_name: nn.Sequential(
+                    nn.Linear(1, self.hidden_dim),
+                    nn.LayerNorm(self.hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout_rate)
+                ) for var_name in real_variables
+            })
         
         # Type embeddings to differentiate between each individual feature
         # Each feature (both categorical and real) gets its own type embedding
@@ -132,12 +134,12 @@ class UserEncoder(nn.Module):
         dtype = next(self.parameters()).dtype
         device = user_categoricals.device
         
-        # Process categorical variables
+        # Process categorical variables using named embedding layers
         cat_embeddings_list = []
-        for i, embedding_layer in enumerate(self.cat_embeddings):
+        for i, var_name in enumerate(self.categorical_variable_sizes.keys()):
             cat_feature = user_categoricals[:, i].long()
             # Get embeddings and add type embedding for this specific categorical feature
-            feature_emb = embedding_layer(cat_feature)  # [B, hidden_dim]
+            feature_emb = self.cat_embeddings[var_name](cat_feature)  # [B, hidden_dim]
             type_id = torch.full((batch_size,), i, device=device, dtype=torch.long)
             feature_emb = feature_emb + self.type_embeddings(type_id)  # [B, hidden_dim]
             cat_embeddings_list.append(feature_emb)
@@ -148,15 +150,14 @@ class UserEncoder(nn.Module):
         else:
             cat_embeddings = torch.empty((batch_size, 0, self.hidden_dim), device=device, dtype=dtype)
         
-        # Process all real features at once
+        # Process real features using named projection layers
         real_embeddings_list = []
         if self.num_real_features > 0:
-            # Process each real feature individually to add its type embedding
-            for i in range(self.num_real_features):
+            for i, var_name in enumerate(self.real_variables):
                 # Get single real feature and ensure correct dtype
                 real_feature = user_reals[:, i].to(dtype=dtype).unsqueeze(-1)  # [B, 1]
-                # Project through shared layers
-                feature_emb = self.real_projection(real_feature)  # [B, hidden_dim]
+                # Project through named projection layer
+                feature_emb = self.real_projections[var_name](real_feature)  # [B, hidden_dim]
                 # Add type embedding for this specific real feature
                 type_id = torch.full((batch_size,), self.num_cat_features + i, device=device, dtype=torch.long)
                 feature_emb = feature_emb + self.type_embeddings(type_id)  # [B, hidden_dim]
@@ -216,6 +217,17 @@ class MealEncoder(nn.Module):
         self.add_residual_connection_before_meal_timestep_embedding = add_residual_connection_before_meal_timestep_embedding
         self.positional_embedding = positional_embedding  # Store the positional embedding
         
+        # Define macro feature names
+        self.macro_feature_names = [
+            "food__eaten_quantity_in_gram", 
+            "food__energy_kcal_eaten",
+            "food__carb_eaten", 
+            "food__fat_eaten",
+            "food__protein_eaten", 
+            "food__fiber_eaten",
+            "food__alcohol_eaten"
+        ]
+        
         # --------------------
         #  Embedding Layers
         # --------------------
@@ -223,8 +235,11 @@ class MealEncoder(nn.Module):
         self.food_emb_proj = nn.Linear(food_embed_dim, hidden_dim)
         
         if not self.ignore_food_macro_features:
-            # We need the macro projection only if we are using all the macro features
-            self.macro_proj = nn.Linear(food_macro_dim, hidden_dim, bias=False)
+            # Individual projection layers for each macro feature
+            self.macro_projections = nn.ModuleDict({
+                macro_name: nn.Linear(1, hidden_dim, bias=False)
+                for macro_name in self.macro_feature_names[:food_macro_dim]
+            })
 
         # Optional aggregator token to collect representations (only used in "set" mode).
         self.start_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
@@ -321,9 +336,23 @@ class MealEncoder(nn.Module):
             food_scaled_weight = filtered_meal_macros[:, :, 0].unsqueeze(-1)
             meal_token_emb = food_emb * food_scaled_weight
         else:
-            macro_emb = self.macro_proj(filtered_meal_macros)    # (N_non_empty, M, hidden_dim)
+            # Process each macro feature separately using its dedicated projection layer
+            macro_embs = []
+            for idx, feature_name in enumerate(self.macro_feature_names[:self.food_macro_dim]):
+                # Extract the specific macro feature and ensure correct shape
+                macro_feature = filtered_meal_macros[:, :, idx].unsqueeze(-1)  # (N_non_empty, M, 1)
+                # Project with the dedicated layer for this feature
+                projected_feature = self.macro_projections[feature_name](macro_feature)  # (N_non_empty, M, hidden_dim)
+                macro_embs.append(projected_feature)
+            
+            # Combine all macro embeddings by stacking and summing them explicitly along the macro dimension
+            # First stack all macro embeddings: shape becomes (N_non_empty, M, num_macros, hidden_dim)
+            stacked_macro_embs = torch.stack(macro_embs, dim=2)
+            # Sum across the macro dimension (dim=2)
+            macro_emb = torch.sum(stacked_macro_embs, dim=2)  # (N_non_empty, M, hidden_dim)
             macro_emb = self.dropout(macro_emb)
-            # Combine 
+            
+            # Combine with food embeddings
             meal_token_emb = food_emb + macro_emb  # shape = (N_non_empty, M, hidden_dim)
 
         # Process with the chosen aggregator strategy

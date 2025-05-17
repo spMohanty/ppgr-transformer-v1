@@ -36,7 +36,7 @@ class ExperimentConfig:
     sliding_window_stride: int = None
     use_meal_level_food_covariates: bool = True # This should not change for the current version of the dataset.py
     
-    use_simple_meal_encoder: bool = True # This aggregates the per-marco consumption disregarding the food-level covariates.
+    use_simple_meal_encoder: bool = False # This aggregates the per-marco consumption disregarding the food-level covariates.
     use_bootstraped_food_embeddings: bool = True
     freeze_food_id_embeddings: bool = True
     ignore_food_macro_features: bool = False
