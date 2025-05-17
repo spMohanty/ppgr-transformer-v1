@@ -81,7 +81,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.disable_plots = config.disable_plots
         
         # Configure feed-forward network parameters
-        self.ffn_expansion_factor = getattr(config, 'ffn_expansion_factor', 4)
+        self.ffn_expansion_factor = getattr(config, 'ffn_expansion_factor', 1)
         self.post_decoder_residual = getattr(config, 'post_decoder_residual', True)
         
         # Initialize component models
@@ -149,6 +149,12 @@ class MealGlucoseForecastModel(pl.LightningModule):
                 
         # Create learnable type embeddings for each sequence type
         self.type_embeddings = nn.Embedding(5, config.hidden_dim)  # 4 types: past_meals, future_meals, glucose, user, microbiome
+        
+        # Create learnable query embeddings for the decoder with fixed shape (T_future, hidden_dim)
+        # Since T_future is constant (prediction_length), we can create this parameter directly
+        self.future_query_embeddings = nn.Parameter(
+            torch.randn(1, config.prediction_length, config.hidden_dim)
+        )
         
     def _init_positional_embeddings(self, config: ExperimentConfig) -> None:
         """Initialize the positional embeddings."""
@@ -359,7 +365,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             temporal_categoricals=batch["future_temporal_categoricals"],
             temporal_reals=batch["future_temporal_reals"],
             positions=future_indices,
-            mask=None  # Future usually doesn't have a mask
+            mask=None 
         )
                 
         
@@ -466,15 +472,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         else:
             # Fallback to uniform weights if attention isn't available
             future_weights = torch.ones(B, T_future, self.future_num_modalities, device=device) / self.future_num_modalities
-        
-        # Ensure future meal embeddings have positional information
-        fused_meal_future = self.rope_emb(fused_meal_future, future_indices)
-        
-        
-        # Add Residual Connection for memory units
-        fused_glucose_past = fused_glucose_past + glucose_enc
-        fused_meal_future = fused_meal_future + future_meal_enc
-        
+                        
         
         # 5) Combine all encodings in a single "memory" sequence
         memory = [
@@ -504,9 +502,12 @@ class MealGlucoseForecastModel(pl.LightningModule):
             device=device
         )
         
-        # directly use the future embeddings as the target sequence,
+        # Use the learnable future query embeddings as the target sequence for the decoder
+        # Simply expand across batch dimension since T_future is fixed
+        future_query_embeddings = self.future_query_embeddings.expand(B, -1, -1)
+        
         decoder_output, cross_attn = self.decoder(
-            tgt=fused_meal_future,  # Use future embeddings as query sequence
+            tgt=future_query_embeddings,  # Use learnable query embeddings
             memory=memory,
             tgt_mask=causal_mask,   # Self-attention mask (autoregressive)
             memory_mask=memory_mask,  # Cross-attention mask (causal constraints)

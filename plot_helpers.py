@@ -84,6 +84,8 @@ def plot_forecast(
     attention_cmap = LinearSegmentedColormap.from_list(
         "attention_cmap", PALETTE["attention"], N=512
     )
+    # attention_cmap = sns.color_palette("rocket", as_cmap=True)
+    
     mpl.rcParams.update({
         'font.family':'serif',
         'font.serif':['DejaVu Serif','Liberation Serif','serif'],

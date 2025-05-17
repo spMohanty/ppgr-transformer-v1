@@ -42,7 +42,7 @@ class ExperimentConfig:
     group_by_columns: list = None
     
     
-    project_user_features_to_single_vector: bool = True
+    project_user_features_to_single_vector: bool = False
 
     # Feature lists (users, food, temporal)
     user_static_categoricals: list = None
