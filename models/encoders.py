@@ -449,6 +449,9 @@ class MealEncoder(nn.Module):
         meal_timestep_emb_flat[non_empty_indices] = filtered_meal_emb
         meal_timestep_emb = meal_timestep_emb_flat.view(B, T, self.hidden_dim)
         
+        # Add singleton dimension to match SimpleMealEncoder output shape [B, T, 1, hidden_dim]
+        meal_timestep_emb = meal_timestep_emb.unsqueeze(2)
+        
         return meal_timestep_emb, self_attn_out
 
     def _bootstrap_food_id_embeddings(self, bootstrap_food_id_embeddings: nn.Embedding, freeze_embeddings: bool = True):
@@ -460,6 +463,145 @@ class MealEncoder(nn.Module):
             if freeze_embeddings:
                 self.food_emb.weight.requires_grad = not freeze_embeddings
                 logger.warning(f"Food id embeddings have been frozen")
+
+
+class SimpleMealEncoder(nn.Module):
+    """
+    A simplified meal encoder that focuses only on the macro nutrients of meals.
+    
+    This encoder:
+    1. Sums the per-macro features of all meals in each timestep
+    2. Projects each macro to hidden_dim using separate linear layers
+    3. Returns the encoded macros as separate features [B, T, num_macros, hidden_dim]
+    
+    This can be used as a drop-in replacement for MealEncoder, providing per-macro information
+    rather than a single embedding per timestep.
+    """
+    def __init__(
+        self,
+        food_embed_dim: int,  # Kept for compatibility with MealEncoder
+        hidden_dim: int,
+        num_foods: int,  # Kept for compatibility with MealEncoder
+        food_macro_dim: int,
+        food_names: List[str],  # Kept for compatibility with MealEncoder
+        food_group_names: List[str],  # Kept for compatibility with MealEncoder
+        positional_embedding: nn.Module,
+        max_meals: int = 11,  # Kept for compatibility with MealEncoder
+        num_heads: int = 4,  # Kept for compatibility with MealEncoder
+        num_layers: int = 1,  # Kept for compatibility with MealEncoder
+        layers_share_weights: bool = False,  # Kept for compatibility with MealEncoder
+        dropout_rate: float = 0.2,
+        transformer_dropout: float = 0.1,  # Kept for compatibility with MealEncoder
+        aggregator_type: str = "set",  # Kept for compatibility with MealEncoder
+        ignore_food_macro_features: bool = False,  # Kept for compatibility with MealEncoder
+        bootstrap_food_id_embeddings: Optional[nn.Embedding] = None,  # Kept for compatibility with MealEncoder
+        freeze_food_id_embeddings: bool = True,  # Kept for compatibility with MealEncoder
+        add_residual_connection_before_meal_timestep_embedding: bool = True  # Kept for compatibility with MealEncoder
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.food_macro_dim = food_macro_dim
+        self.positional_embedding = positional_embedding
+        
+        # Define macro feature names (same as in MealEncoder)
+        self.macro_feature_names = [
+            "food__eaten_quantity_in_gram", 
+            "food__energy_kcal_eaten",
+            "food__carb_eaten", 
+            "food__fat_eaten",
+            "food__protein_eaten", 
+            "food__fiber_eaten",
+            "food__alcohol_eaten"
+        ]
+        
+        # Individual projection layers for each macro feature
+        self.macro_projections = nn.ModuleDict({
+            macro_name: nn.Linear(1, hidden_dim)
+            for macro_name in self.macro_feature_names[:food_macro_dim]
+        })
+        
+        # Dropout
+        self.dropout = nn.Dropout(dropout_rate)
+        
+        # Layer normalization per macro
+        self.layer_norms = nn.ModuleDict({
+            macro_name: nn.LayerNorm(hidden_dim)
+            for macro_name in self.macro_feature_names[:food_macro_dim]
+        })
+            
+    def forward(
+        self,
+        meal_ids: torch.LongTensor,  # Kept for compatibility with MealEncoder
+        meal_macros: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        return_self_attn: bool = False  # Kept for compatibility with MealEncoder
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Encode meals for each timestep based only on macro features.
+        
+        Args:
+            meal_ids: (B, T, M) with each M being item indices in that meal (ignored in this encoder)
+            meal_macros: (B, T, M, food_macro_dim) macro features for each item
+            positions: (B, T) position indices for each timestep
+            mask: (B, T) boolean mask where True indicates valid timesteps
+            return_self_attn: Kept for compatibility with MealEncoder (always returns None)
+            
+        Returns:
+            meal_macros_emb: (B, T, num_macros, hidden_dim) macro encodings for each timestep
+            self_attn: Always None for compatibility with MealEncoder
+        """
+        B, T, M, F = meal_macros.shape
+        device = meal_macros.device
+        
+        # Initialize output tensor with zeros - now with an extra dimension for macros
+        meal_macros_emb = torch.zeros(B, T, F, self.hidden_dim, device=device)
+        
+        # Apply mask to find valid timesteps
+        if mask is not None:
+            # Expand mask to match meal_macros dimensions
+            expanded_mask = mask.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, M, F)
+            # Zero out invalid positions
+            masked_meal_macros = meal_macros * expanded_mask.float()
+        else:
+            masked_meal_macros = meal_macros
+        
+        # Sum across all meals for each macro feature (M dimension)
+        # Result: (B, T, F) - sum of each macro nutrient across all foods at each timestep
+        summed_macros = masked_meal_macros.sum(dim=2)
+        
+        # Process each macro feature separately using its dedicated projection layer
+        for idx, feature_name in enumerate(self.macro_feature_names[:self.food_macro_dim]):
+            # Extract the specific macro feature and ensure correct shape
+            macro_feature = summed_macros[:, :, idx].unsqueeze(-1)  # (B, T, 1)
+            
+            # Project with the dedicated layer for this feature
+            projected_feature = self.macro_projections[feature_name](macro_feature)  # (B, T, hidden_dim)
+            projected_feature = self.dropout(projected_feature)
+            projected_feature = self.layer_norms[feature_name](projected_feature)
+            
+            # Add positional embeddings if provided
+            if self.positional_embedding is not None and positions is not None:
+                projected_feature = self.positional_embedding(projected_feature, positions)
+            
+            # Store in the output tensor
+            meal_macros_emb[:, :, idx, :] = projected_feature
+        
+        # Apply mask if provided
+        if mask is not None:
+            # In this codebase, mask=True means valid values
+            # Expand mask to match the output dimensions and zero out invalid positions
+            expanded_mask = mask.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, F, self.hidden_dim)
+            meal_macros_emb = meal_macros_emb * expanded_mask.float()
+        
+        return meal_macros_emb, None
+    
+    def _bootstrap_food_id_embeddings(self, bootstrap_food_id_embeddings: nn.Embedding, freeze_embeddings: bool = True):
+        """
+        Stub method for compatibility with MealEncoder (does nothing in SimpleMealEncoder).
+        """
+        # This encoder doesn't use food embeddings, so this is a no-op
+        pass
 
 
 class GlucosePatcher(nn.Module):

@@ -16,6 +16,43 @@ PPGR Transformer is an implementation of a transformer based forecasting model f
 - **Configurable Training** – `main.py` exposes all options from `ExperimentConfig` via CLI flags and integrates custom callbacks such as a OneCycle learning rate scheduler.
 - **Visualization Tools** – `plot_helpers.py` generates forecast plots, attention maps, and incremental AUC correlations to aid model analysis.
 - **Hyperparameter Sweeps** – `sweeps/hyperparams-v0.yaml` provides a W&B Bayesian sweep template for exploring model settings.
+- **Modular Architecture** – Supports different data modalities (meals, glucose, user data, etc.)
+- **SimpleMealEncoder** – A simplified version of the MealEncoder that sums per-macro features of all meals in each timestep and projects each macro to hidden_dim using separate linear layers.
+
+## SimpleMealEncoder
+
+The SimpleMealEncoder is a simplified version of the MealEncoder that:
+
+1. Sums per-macro features of all meals in each timestep
+2. Projects each macro to hidden_dim using separate linear layers
+3. Returns an encoding of shape [B, T, num_macros, hidden_dim]
+
+This encoder disregards the food IDs and just uses the aggregated macro features, which can be useful for:
+- Focusing on nutritional content rather than specific foods
+- Reducing model complexity
+- Providing more interpretable features based on macronutrients
+
+### Using SimpleMealEncoder
+
+To use the SimpleMealEncoder instead of the standard MealEncoder, add the `--use_simple_meal_encoder` flag when running the model:
+
+```bash
+python main.py --use_simple_meal_encoder
+```
+
+For a debug run with fewer epochs:
+
+```bash
+python main.py --debug --max_epochs 2 --use_simple_meal_encoder
+```
+
+## Model Architecture
+
+The model uses a transformer architecture with:
+- Encoder components for different modalities
+- Fusion mechanisms to combine modality information
+- Transformer decoder for sequence modeling
+- Multihead attention mechanisms from Temporal Fusion Transformer
 
 ## Installation
 

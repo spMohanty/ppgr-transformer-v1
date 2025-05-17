@@ -211,7 +211,8 @@ def log_fusion_feature_weights(
     use_projected_user_features: bool,
     logger_fn=None,
     prefix: str = "",
-    base_modality_names: List[str] = None
+    base_modality_names: List[str] = None,
+    using_simple_meal_encoder: bool = False
 ) -> Dict[str, float]:
     """
     Calculate and log fusion feature weights for both VSN and CrossModalFusion blocks.
@@ -228,6 +229,7 @@ def log_fusion_feature_weights(
         logger_fn: Function to log the weights (e.g., self.log). If None, weights are only returned
         prefix: Prefix for logging
         base_modality_names: Optional list of base modality names. If None, defaults to ["glucose", "meal", "temporal", "microbiome"]
+        using_simple_meal_encoder: Whether SimpleMealEncoder is being used
         
     Returns:
         Dictionary of calculated feature weights
@@ -240,7 +242,39 @@ def log_fusion_feature_weights(
         all_modalities = ["glucose", "meal", "temporal", "microbiome"]
         base_modality_names = all_modalities[:min(len(all_modalities), base_modalities_count)]
     
-    # Log base modality weights
+    # Create a mapping of modality name -> column index
+    modality_indices = {}
+    
+    # If using SimpleMealEncoder, we need to handle meal macros differently
+    if using_simple_meal_encoder:
+        # Remove "meal" from base_modality_names and replace with an aggregated weight
+        if "meal" in base_modality_names:
+            base_modality_names.remove("meal")
+        
+        # Identify all meal macro columns (they start with "meal_macro_")
+        meal_macro_indices = []
+        for i in range(feature_weights.shape[2]):
+            if i >= len(base_modality_names) and i < feature_weights.shape[2]:
+                # This is a candidate for a meal macro column
+                meal_macro_indices.append(i)
+        
+        # If we found any meal macro columns
+        if meal_macro_indices:
+            # Compute aggregated meal weight
+            meal_macro_weights = feature_weights[:, :, meal_macro_indices].mean(dim=2)
+            weight = meal_macro_weights.mean().item()
+            weight_dict[f"{prefix}_meal_macros_weight"] = weight
+            if logger_fn:
+                logger_fn(f"{prefix}_meal_macros_weight", weight)
+                
+            # Also log individual macro weights
+            for i, idx in enumerate(meal_macro_indices):
+                weight = feature_weights[:, :, idx].mean().item()
+                weight_dict[f"{prefix}_meal_macro_{i}_weight"] = weight
+                if logger_fn:
+                    logger_fn(f"{prefix}_meal_macro_{i}_weight", weight)
+    
+    # Log base modality weights (excluding meal if using SimpleMealEncoder)
     for i, name in enumerate(base_modality_names):
         if i < feature_weights.shape[2]:  # Make sure we don't exceed the number of features
             weight = feature_weights[:, :, i].mean().item()
@@ -254,8 +288,12 @@ def log_fusion_feature_weights(
     # Compute user feature weights
     if use_projected_user_features:
         # In single vector mode, there's only one user feature column to log
-        # It comes right after the base modalities
+        # It comes right after the base modalities or meal macro features if using SimpleMealEncoder
         user_feature_idx = base_modalities_count
+        if using_simple_meal_encoder:
+            # Find the index after all meal macro features
+            user_feature_idx = max(meal_macro_indices) + 1 if meal_macro_indices else base_modalities_count
+        
         if user_feature_idx < feature_weights.shape[2]:  # Check bounds
             weight = feature_weights[:, :, user_feature_idx].mean().item()
             weight_dict[f"{prefix}_user_aggregate_weight"] = weight
@@ -264,6 +302,10 @@ def log_fusion_feature_weights(
     else:
         # In multi-vector mode, user features are individual columns
         user_feature_start_idx = base_modalities_count
+        if using_simple_meal_encoder:
+            # Find the index after all meal macro features
+            user_feature_start_idx = max(meal_macro_indices) + 1 if meal_macro_indices else base_modalities_count
+            
         user_feature_end_idx = user_feature_start_idx + num_user_features
         
         # If we have enough weights columns

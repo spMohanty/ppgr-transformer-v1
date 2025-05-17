@@ -191,6 +191,7 @@ def generate_experiment_name(config: ExperimentConfig, kwargs: dict) -> str:
         'use_meal_level_food_covariates': 'meal_cov',
         'use_bootstraped_food_embeddings': 'boot_emb',
         'use_microbiome_embeddings': 'micro_emb',
+        'use_simple_meal_encoder': 'simple_meal',
         
         # Model architecture
         'food_embed_dim': 'food_emb',

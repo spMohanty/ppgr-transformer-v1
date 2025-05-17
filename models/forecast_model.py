@@ -24,7 +24,7 @@ from torchmetrics.functional.regression import (
 
 from .encoders import (
     UserEncoder, MealEncoder, PatchedGlucoseEncoder, SimpleGlucoseEncoder,
-    TemporalEncoder, MicrobiomeEncoder
+    TemporalEncoder, MicrobiomeEncoder, SimpleMealEncoder
 )
 from .transformer_blocks import TransformerDecoderLayer, TransformerDecoder, CrossModalFusionBlock, TransformerVariableSelectionNetwork, RotaryPositionalEmbeddings
 from .utils import expand_user_embeddings, get_user_context, get_attention_mask, compute_forecast_metrics, log_fusion_feature_weights, expand_user_embeddings_for_fusion
@@ -198,7 +198,10 @@ class MealGlucoseForecastModel(pl.LightningModule):
 
     def _init_meal_encoder(self, config: ExperimentConfig) -> None:
         """Initialize the meal encoder component."""
-        self.meal_encoder = MealEncoder(
+        # Use SimpleMealEncoder if configured, otherwise use MealEncoder
+        meal_encoder_class = SimpleMealEncoder if getattr(config, 'use_simple_meal_encoder', False) else MealEncoder
+        
+        self.meal_encoder = meal_encoder_class(
             food_embed_dim=config.food_embed_dim,
             hidden_dim=config.hidden_dim,
             num_foods=self.num_foods,
@@ -217,6 +220,9 @@ class MealGlucoseForecastModel(pl.LightningModule):
             freeze_food_id_embeddings=config.freeze_food_id_embeddings,
             aggregator_type=config.meal_aggregator_type
         )
+        
+        # Keep track of whether we're using SimpleMealEncoder
+        self.using_simple_meal_encoder = getattr(config, 'use_simple_meal_encoder', False)
         
     def _init_glucose_encoder(self, config: ExperimentConfig) -> None:
         """Initialize the glucose encoder component."""
@@ -294,33 +300,55 @@ class MealGlucoseForecastModel(pl.LightningModule):
             raise ValueError(f"Unsupported fusion mode: {fusion_mode}")
         self.cross_modal_fusion_mode = fusion_mode
         
+        # Check if using SimpleMealEncoder
+        using_simple_meal_encoder = getattr(config, 'use_simple_meal_encoder', False)
+        
         # Count the number of modalities for past and future (used for logging)
-        self.past_num_modalities = len(BASE_MODALITIES_PAST)  # Base modalities (glucose, meal, temporal, microbiome)
+        if using_simple_meal_encoder:
+            # If using SimpleMealEncoder, replace single 'meal' modality with individual macros
+            base_modalities_past_adjusted = [m for m in BASE_MODALITIES_PAST if m != 'meal']
+            base_modalities_future_adjusted = [m for m in BASE_MODALITIES_FUTURE if m != 'meal']
+            
+            # Add food macro features (each becomes a separate modality)
+            food_macro_modalities_count = self.food_macro_dim
+            
+            self.past_num_modalities = len(base_modalities_past_adjusted) + food_macro_modalities_count
+            self.future_num_modalities = len(base_modalities_future_adjusted) + food_macro_modalities_count
+        else:
+            # Using standard MealEncoder
+            self.past_num_modalities = len(BASE_MODALITIES_PAST)  # Base modalities (glucose, meal, temporal, microbiome)
+            self.future_num_modalities = len(BASE_MODALITIES_FUTURE)  # Base modalities (meal, temporal, microbiome)
+        
+        # Add user features
         if config.project_user_features_to_single_vector:
             self.past_num_modalities += 1  # Add one for projected user features
-        else:
-            self.past_num_modalities += len(user_static_categoricals) + len(user_static_reals)  # Individual user features
-            
-        # Future modalities count
-        self.future_num_modalities = len(BASE_MODALITIES_FUTURE)  # Base modalities (meal, temporal, microbiome)
-        if config.project_user_features_to_single_vector:
             self.future_num_modalities += 1  # Add one for projected user features
         else:
+            self.past_num_modalities += len(user_static_categoricals) + len(user_static_reals)  # Individual user features
             self.future_num_modalities += len(user_static_categoricals) + len(user_static_reals)  # Individual user features
         
         # Create input_sizes dictionaries for past and future fusion blocks
         past_input_sizes = {
             'glucose': config.hidden_dim,
-            'meal': config.hidden_dim,
             'temporal': config.hidden_dim,
             'microbiome': config.hidden_dim
         }
         
         future_input_sizes = {
-            'meal': config.hidden_dim,
             'temporal': config.hidden_dim,
             'microbiome': config.hidden_dim
         }
+        
+        # Add meal features based on encoder type
+        if using_simple_meal_encoder:
+            # Add individual macro features for SimpleMealEncoder
+            for i in range(self.food_macro_dim):
+                past_input_sizes[f'meal_macro_{i}'] = config.hidden_dim
+                future_input_sizes[f'meal_macro_{i}'] = config.hidden_dim
+        else:
+            # Add single meal feature for regular MealEncoder
+            past_input_sizes['meal'] = config.hidden_dim
+            future_input_sizes['meal'] = config.hidden_dim
         
         # Add user features to input_sizes
         if config.project_user_features_to_single_vector:
@@ -523,12 +551,12 @@ class MealGlucoseForecastModel(pl.LightningModule):
             positions=past_indices,
             mask=encoder_padding_mask, 
             return_self_attn=return_meal_self_attn
-        ) # [B, T_past, hidden_dim]
+        ) # [B, T_past, C, hidden_dim] where C=1 for MealEncoder or C=food_macro_dim for SimpleMealEncoder
         future_meal_enc, meal_self_attn_future = self.meal_encoder(
             future_meal_ids, future_meal_macros, 
             positions=future_indices,
             return_self_attn=return_meal_self_attn
-        ) # [B, T_future, hidden_dim]
+        ) # [B, T_future, C, hidden_dim]
             
         
         # --- Cross-modal fusion block ---        
@@ -539,16 +567,43 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Create base modality dictionaries
         past_modalities_dict = {
             'glucose': glucose_enc,           # [B, T_past, hidden_dim]
-            'meal': past_meal_enc,            # [B, T_past, hidden_dim]
             'temporal': past_temporal_emb,    # [B, T_past, hidden_dim]
             'microbiome': microbiome_embeddings.expand(-1, T_past, -1)  # [B, T_past, hidden_dim]
         }
         
         future_modalities_dict = {
-            'meal': future_meal_enc,              # [B, T_future, hidden_dim]
             'temporal': future_temporal_emb,      # [B, T_future, hidden_dim]
             'microbiome': microbiome_embeddings.expand(-1, T_future, -1)  # [B, T_future, hidden_dim]
         }
+        
+        # Process meal encodings based on which encoder was used
+        if self.using_simple_meal_encoder:
+            # For SimpleMealEncoder, expand the macro features as individual entries
+            # Define the function inline instead of importing
+            def expand_meal_macros_embeddings_for_fusion(meal_macros_embeddings, meal_prefix='meal_macro_'):
+                """
+                Prepare meal macro embeddings from SimpleMealEncoder for fusion block input.
+                """
+                meal_macros_dict = {}
+                B, T, F, hidden_dim = meal_macros_embeddings.shape
+                
+                # Convert each macro feature to its own entry in the dictionary
+                for i in range(F):
+                    macro_key = f"{meal_prefix}{i}"
+                    meal_macros_dict[macro_key] = meal_macros_embeddings[:, :, i, :]  # [B, T, hidden_dim]
+                
+                return meal_macros_dict
+            
+            past_meal_dict = expand_meal_macros_embeddings_for_fusion(past_meal_enc)
+            future_meal_dict = expand_meal_macros_embeddings_for_fusion(future_meal_enc)
+            
+            # Update modality dictionaries with expanded meal macros
+            past_modalities_dict.update(past_meal_dict)
+            future_modalities_dict.update(future_meal_dict)
+        else:
+            # For regular MealEncoder, squeeze out the singleton dimension
+            past_modalities_dict['meal'] = past_meal_enc.squeeze(2)  # [B, T_past, hidden_dim]
+            future_modalities_dict['meal'] = future_meal_enc.squeeze(2)  # [B, T_future, hidden_dim]
         
         # Expand user embeddings across time dimensions
         past_user_dict, future_user_dict = expand_user_embeddings_for_fusion(
@@ -805,7 +860,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
                 use_projected_user_features=self.config.project_user_features_to_single_vector,
                 logger_fn=self.log,
                 prefix=f"{phase}_past_vsn",
-                base_modality_names=BASE_MODALITIES_PAST
+                base_modality_names=BASE_MODALITIES_PAST,
+                using_simple_meal_encoder=self.using_simple_meal_encoder
             )
             
             # Future weights
@@ -817,7 +873,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
                 use_projected_user_features=self.config.project_user_features_to_single_vector,
                 logger_fn=self.log,
                 prefix=f"{phase}_future_vsn",
-                base_modality_names=BASE_MODALITIES_FUTURE
+                base_modality_names=BASE_MODALITIES_FUTURE,
+                using_simple_meal_encoder=self.using_simple_meal_encoder
             )
         
         return metrics["metrics"]["q_loss"]
