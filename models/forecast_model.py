@@ -80,6 +80,10 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.food_embedding_projection_batch_size = config.food_embedding_projection_batch_size
         self.disable_plots = config.disable_plots
         
+        # Configure feed-forward network parameters
+        self.ffn_expansion_factor = getattr(config, 'ffn_expansion_factor', 4)
+        self.post_decoder_residual = getattr(config, 'post_decoder_residual', True)
+        
         # Initialize component models
         self._init_positional_embeddings(config)
         self._init_user_encoder(config, dataset_metadata)
@@ -252,8 +256,6 @@ class MealGlucoseForecastModel(pl.LightningModule):
         )
         
         # By default, share weights among decoder layers
-        # This matches the SharedTransformerDecoder in the TFT model
-        # where the same decoder layer is applied multiple times
         layers_share_weights = config.transformer_decoder_layers_share_weights
         if layers_share_weights is None:
             layers_share_weights = True
@@ -264,6 +266,19 @@ class MealGlucoseForecastModel(pl.LightningModule):
             layers_share_weights=layers_share_weights,
             norm=nn.LayerNorm(config.hidden_dim)
         )
+        
+        # Add position-wise feed-forward network after decoder output
+        self.post_decoder_ffn = nn.Sequential(
+            nn.LayerNorm(config.hidden_dim),  # Normalize first (Pre-LN architecture style)
+            nn.Linear(config.hidden_dim, config.hidden_dim * self.ffn_expansion_factor),
+            nn.GELU(),  # GELU activation as used in modern transformers
+            nn.Dropout(config.dropout_rate),
+            nn.Linear(config.hidden_dim * self.ffn_expansion_factor, config.hidden_dim),
+            nn.Dropout(config.dropout_rate)
+        )
+        
+        # Optional residual connection for the FFN
+        self.post_decoder_residual = True
     
     def forward(
         self,
@@ -454,7 +469,12 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # Ensure future meal embeddings have positional information
         fused_meal_future = self.rope_emb(fused_meal_future, future_indices)
-                
+        
+        
+        # Add Residual Connection for memory units
+        fused_glucose_past = fused_glucose_past + glucose_enc
+        fused_meal_future = fused_meal_future + future_meal_enc
+        
         
         # 5) Combine all encodings in a single "memory" sequence
         memory = [
@@ -493,6 +513,12 @@ class MealGlucoseForecastModel(pl.LightningModule):
             return_attn=return_attn
         )
 
+        # Apply position-wise feed-forward network with residual connection
+        if self.post_decoder_residual:
+            decoder_output = decoder_output + self.post_decoder_ffn(decoder_output)
+        else:
+            decoder_output = self.post_decoder_ffn(decoder_output)
+
         # 8) Extract attention weights for past and future if needed
         attn_past = None
         attn_future = None
@@ -501,7 +527,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             attn_past = cross_attn[:, :, :T_past]  # => [B, T_future, T_past]
             attn_future = cross_attn[:, :, T_past:T_past + T_future]  # => [B, T_future, T_future]
 
-        # Force full precision for the final output and theresidual connection
+        # Force full precision for the final output and the residual connection
         with torch.amp.autocast("cuda", enabled=False):
             # 9) Final projection to get quantile predictions (position wise)
             pred_future = self.forecast_linear(decoder_output)
