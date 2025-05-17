@@ -3,6 +3,7 @@ Main meal-based glucose forecasting model.
 """
 from dataclasses import asdict
 from typing import List, Optional, Tuple, Dict, Any, Union
+from enum import Enum, auto
 
 import os
 import torch
@@ -33,6 +34,20 @@ from plot_helpers import plot_meal_self_attention, plot_forecast_examples, plot_
 from dataset import PPGRToMealGlucoseWrapper
 from .losses import quantile_loss, compute_iAUC, unscale_tensor
 
+# Add these constants at the top of the file, after the imports
+class FusionBlockType(Enum):
+    """Enum for fusion block types"""
+    CROSS_MODAL_FUSION = "cmf"
+    VARIABLE_SELECTION = "vsn"
+
+class FusionMode(Enum):
+    """Enum for fusion modes (used by CrossModalFusion)"""
+    MEAN_POOLING = "mean_pooling"
+    QUERY_TOKEN = "query_token"
+
+# Modality names constants
+BASE_MODALITIES_PAST = ["glucose", "meal", "temporal", "microbiome"]
+BASE_MODALITIES_FUTURE = ["meal", "temporal", "microbiome"]
 
 class MealGlucoseForecastModel(pl.LightningModule):
     """
@@ -105,38 +120,25 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Store whether we're using projected user features
         self.use_projected_user_features = config.project_user_features_to_single_vector
         
-        # Replace VSNs with CrossModalFusion blocks
-        # Count the number of modalities for past and future
-        self.past_num_modalities = 4  # glucose, meal, temporal, microbiome
-        if self.use_projected_user_features:
-            self.past_num_modalities += 1  # projected user features
-        else:
-            self.past_num_modalities += len(user_static_categoricals) + len(user_static_reals)  # individual user features
-            
-        self.past_fusion = CrossModalFusionBlock(
-            hidden_dim=config.hidden_dim,
-            num_modalities=self.past_num_modalities,
-            num_heads=config.num_heads,
-            fusion_dropout=config.dropout_rate
-        )
+        # Cross-modal fusion mode and block type
+        fusion_block_type = getattr(config, 'fusion_block_type', FusionBlockType.CROSS_MODAL_FUSION.value)
+        # Validate and store fusion block type
+        if fusion_block_type not in [t.value for t in FusionBlockType]:
+            raise ValueError(f"Unsupported fusion block type: {fusion_block_type}")
+        self.fusion_block_type = fusion_block_type
         
-        # Future modalities: meal, temporal, user (individual features), microbiome (no glucose)
-        self.future_num_modalities = 3  # meal, temporal, microbiome
-        if self.use_projected_user_features:
-            self.future_num_modalities += 1  # projected user features
-        else:
-            self.future_num_modalities += len(user_static_categoricals) + len(user_static_reals)  # individual user features
-            
-        self.future_fusion = CrossModalFusionBlock(
-            hidden_dim=config.hidden_dim,
-            num_modalities=self.future_num_modalities,
-            num_heads=config.num_heads,
-            fusion_dropout=config.dropout_rate
-        )
+        # Get and validate fusion mode (for CrossModalFusion)
+        fusion_mode = getattr(config, 'cross_modal_fusion_mode', FusionMode.QUERY_TOKEN.value)
+        if fusion_mode not in [m.value for m in FusionMode]:
+            raise ValueError(f"Unsupported fusion mode: {fusion_mode}")
+        self.cross_modal_fusion_mode = fusion_mode
+        
+        # Initialize modality counts and fusion blocks
+        self._init_fusion_blocks(config, user_static_categoricals, user_static_reals)
         
         # Final projection: hidden_dim -> num_quantiles
         self.forecast_linear = nn.Linear(config.hidden_dim, config.num_quantiles)
-
+        
         # Register the quantiles as a buffer
         self.register_buffer("quantiles", torch.linspace(0.05, 0.95, steps=config.num_quantiles))
         
@@ -286,6 +288,90 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Optional residual connection for the FFN
         self.post_decoder_residual = True
     
+    def _init_fusion_blocks(self, config: ExperimentConfig, user_static_categoricals: List[str], user_static_reals: List[str]) -> None:
+        """Initialize the fusion blocks based on the configuration."""
+        # Count the number of modalities for past and future
+        self.past_num_modalities = len(BASE_MODALITIES_PAST)  # Base modalities (glucose, meal, temporal, microbiome)
+        if self.use_projected_user_features:
+            self.past_num_modalities += 1  # Add one for projected user features
+        else:
+            self.past_num_modalities += len(user_static_categoricals) + len(user_static_reals)  # Individual user features
+            
+        # Future modalities: meal, temporal, microbiome (no glucose in future)
+        self.future_num_modalities = len(BASE_MODALITIES_FUTURE)  # Base modalities (meal, temporal, microbiome)
+        if self.use_projected_user_features:
+            self.future_num_modalities += 1  # Add one for projected user features
+        else:
+            self.future_num_modalities += len(user_static_categoricals) + len(user_static_reals)  # Individual user features
+            
+        # Initialize fusion blocks based on configuration
+        if self.fusion_block_type == FusionBlockType.CROSS_MODAL_FUSION.value:
+            # Use CrossModalFusion blocks
+            self.past_fusion = CrossModalFusionBlock(
+                hidden_dim=config.hidden_dim,
+                num_modalities=self.past_num_modalities,
+                num_heads=config.num_heads,
+                fusion_dropout=config.dropout_rate,
+                fusion_mode=self.cross_modal_fusion_mode
+            )
+            
+            self.future_fusion = CrossModalFusionBlock(
+                hidden_dim=config.hidden_dim,
+                num_modalities=self.future_num_modalities,
+                num_heads=config.num_heads,
+                fusion_dropout=config.dropout_rate,
+                fusion_mode=self.cross_modal_fusion_mode
+            )
+        elif self.fusion_block_type == FusionBlockType.VARIABLE_SELECTION.value:
+            # Use Variable Selection Network blocks
+            # For VSN, we need to create dictionaries mapping variable names to their dimensions
+            
+            # Past modalities
+            past_variable_sizes = {
+                'glucose': config.hidden_dim,
+                'meal': config.hidden_dim,
+                'temporal': config.hidden_dim,
+                'microbiome': config.hidden_dim
+            }
+            
+            # Add user features
+            if self.use_projected_user_features:
+                past_variable_sizes['user'] = config.hidden_dim
+            else:
+                for feature in user_static_categoricals + user_static_reals:
+                    past_variable_sizes[f'user_{feature}'] = config.hidden_dim
+            
+            # Future modalities
+            future_variable_sizes = {
+                'meal': config.hidden_dim,
+                'temporal': config.hidden_dim,
+                'microbiome': config.hidden_dim
+            }
+            
+            # Add user features
+            if self.use_projected_user_features:
+                future_variable_sizes['user'] = config.hidden_dim
+            else:
+                for feature in user_static_categoricals + user_static_reals:
+                    future_variable_sizes[f'user_{feature}'] = config.hidden_dim
+            
+            # Create VSN blocks
+            self.past_fusion = TransformerVariableSelectionNetwork(
+                input_sizes=past_variable_sizes,
+                hidden_size=config.hidden_dim,
+                n_heads=config.num_heads,
+                dropout=config.dropout_rate
+            )
+            
+            self.future_fusion = TransformerVariableSelectionNetwork(
+                input_sizes=future_variable_sizes,
+                hidden_size=config.hidden_dim,
+                n_heads=config.num_heads,
+                dropout=config.dropout_rate
+            )
+        else:
+            raise ValueError(f"Unsupported fusion block type: {self.fusion_block_type}")
+
     def forward(
         self,
         batch: Dict[str, torch.Tensor],
@@ -320,7 +406,9 @@ class MealGlucoseForecastModel(pl.LightningModule):
         B = past_glucose.size(0)
         
         # Get user embeddings - now passing the entire batch to the encoder
-        user_embeddings = self.user_encoder(user_categoricals, user_reals) # [B, num_user_{cat+real}_features, hidden_dim]
+        user_embeddings = self.user_encoder(user_categoricals, user_reals) 
+        # [B, num_user_{cat+real}_features, hidden_dim]
+        # or [B, 1, hidden_dim] if project_to_single_vector=True
                 
         # Handle microbiome data
         microbiome_embeddings = self.microbiome_encoder(batch.get("user_microbiome_embeddings"))
@@ -337,13 +425,13 @@ class MealGlucoseForecastModel(pl.LightningModule):
         future_indices = torch.arange(T_future, device=device).unsqueeze(0).expand(B, -1) + T_past
         
         # Center indices by subtracting (max_encoder_length - 1) for each batch item
-        # This makes the last valid position have index 0
+        # This makes the last valid position in the encoder sequence have index 0
         batch_max_encoder_length = past_glucose.shape[-1] 
         offset_value = batch_max_encoder_length - 1
         centered_offset = offset_value * torch.ones((B, 1), device=device, dtype=torch.long)
         
         # Apply centering to all indices
-        past_indices = past_indices - centered_offset
+        past_indices = past_indices - centered_offset # Past ends at index 0
         future_indices = future_indices - centered_offset  # Future will start at index 1
         
         
@@ -365,7 +453,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             temporal_categoricals=batch["future_temporal_categoricals"],
             temporal_reals=batch["future_temporal_reals"],
             positions=future_indices,
-            mask=None 
+            mask=None # No padding mask needed in the decoder
         )
                 
         
@@ -375,22 +463,23 @@ class MealGlucoseForecastModel(pl.LightningModule):
             positions=past_indices,
             mask=encoder_padding_mask, 
             return_self_attn=return_meal_self_attn
-        )
+        ) # [B, T_past, hidden_dim]
         future_meal_enc, meal_self_attn_future = self.meal_encoder(
             future_meal_ids, future_meal_macros, 
             positions=future_indices,
             return_self_attn=return_meal_self_attn
-        )
+        ) # [B, T_future, hidden_dim]
             
         
         # --- Cross-modal fusion block ---        
         # Get number of timesteps for processing
         T_past = glucose_enc.size(1)  # Now this is the full sequence length
         
-        # Process microbiome embeddings
+        # Create microbiome per timestep embeddings
         microbiome_per_timestep = microbiome_embeddings.expand(-1, T_past, -1)  # [B, T_past, hidden_dim]
+        microbiome_per_timestep_future = microbiome_embeddings.expand(-1, T_future, -1)
         
-        # Prepare inputs for CrossModalFusion for past timesteps
+        # Prepare inputs for fusion for past timesteps
         # Create a list of modality tensors
         past_modalities = [
             glucose_enc,           # [B, T_past, hidden_dim]
@@ -418,36 +507,24 @@ class MealGlucoseForecastModel(pl.LightningModule):
                 feature_emb_expanded = feature_emb.expand(-1, T_past, -1)  # [B, T_past, hidden_dim]
                 past_modalities.append(feature_emb_expanded)
         
-        # Stack modalities along a new dimension
-        # From list of [B, T_past, hidden_dim] to [B, T_past, num_modalities, hidden_dim]
-        past_modalities_stacked = torch.stack(past_modalities, dim=2)
+        # Stack modalities for fusion
+        past_modalities_stacked = torch.stack(past_modalities, dim=2)  # [B, T_past, num_modalities, hidden_dim]
         
-        # Apply CrossModalFusion
-        fused_glucose_past, past_attn_weights = self.past_fusion(past_modalities_stacked)  # [B, T_past, hidden_dim], [B, T_past, N, N]
-        
-        # Convert CrossModalFusion attention weights to feature importance weights
-        # We'll use the mean attention score that each modality receives from all others
-        if past_attn_weights is not None:
-            # Average across all query modalities to get how much each modality is attended to
-            past_weights = past_attn_weights.mean(dim=2)  # [B, T_past, num_modalities]
-        else:
-            # Fallback to uniform weights if attention isn't available
-            past_weights = torch.ones(B, T_past, self.past_num_modalities, device=device) / self.past_num_modalities
-        
-        # Similar approach for future modalities
-        T_future = future_meal_ids.size(1) if future_meal_ids is not None else 0
-        microbiome_per_timestep_future = microbiome_embeddings.expand(-1, T_future, -1)
-        
-        # Prepare inputs for CrossModalFusion for future timesteps
+        # Process future modalities
         future_modalities = [
             future_meal_enc,              # [B, T_future, hidden_dim]
             future_temporal_emb,          # [B, T_future, hidden_dim]
             microbiome_per_timestep_future # [B, T_future, hidden_dim]
         ]
         
-        # Add user embeddings to future modalities
+        # Add user embeddings to modalities (either as a single vector or individual features)
         if self.use_projected_user_features:
-            # Use the same projected user embedding but expand to T_future
+            # Project all user features to a single vector
+            if user_embeddings.dim() == 3:  # [B, num_features, hidden_dim]
+                user_emb_combined = user_embeddings.mean(dim=1, keepdim=True)  # [B, 1, hidden_dim]
+            else:  # Already [B, hidden_dim]
+                user_emb_combined = user_embeddings.unsqueeze(1)  # [B, 1, hidden_dim]
+            # Expand to match sequence length
             user_emb_expanded = user_emb_combined.expand(-1, T_future, -1)  # [B, T_future, hidden_dim]
             future_modalities.append(user_emb_expanded)
         else:
@@ -459,21 +536,84 @@ class MealGlucoseForecastModel(pl.LightningModule):
                 feature_emb_expanded = feature_emb.expand(-1, T_future, -1)  # [B, T_future, hidden_dim]
                 future_modalities.append(feature_emb_expanded)
         
-        # Stack future modalities
+        # Stack modalities for fusion
         future_modalities_stacked = torch.stack(future_modalities, dim=2)  # [B, T_future, num_modalities, hidden_dim]
         
-        # Apply CrossModalFusion
-        fused_meal_future, future_attn_weights = self.future_fusion(future_modalities_stacked)  # [B, T_future, hidden_dim], [B, T_future, N, N]
+        # Apply fusion based on the block type
+        if self.fusion_block_type == FusionBlockType.CROSS_MODAL_FUSION.value:
+            # CrossModalFusion approach
+            fused_glucose_past, past_attn_weights = self.past_fusion(past_modalities_stacked)
+            fused_meal_future, future_attn_weights = self.future_fusion(future_modalities_stacked)
+            
+            # Convert CrossModalFusion attention weights to feature importance weights
+            # We'll use the mean attention score that each modality receives from all others
+            if past_attn_weights is not None:
+                if self.cross_modal_fusion_mode == FusionMode.MEAN_POOLING.value:
+                    # Average across all query modalities to get how much each modality is attended to
+                    past_weights = past_attn_weights.mean(dim=2)  # [B, T_past, num_modalities]
+                else:  # query_token mode
+                    # With query token, weights are already [B, T_past, 1, num_modalities]
+                    past_weights = past_attn_weights.squeeze(2)  # [B, T_past, num_modalities]
+            else:
+                # Fallback to uniform weights if attention isn't available
+                past_weights = torch.ones(B, T_past, self.past_num_modalities, device=device) / self.past_num_modalities
+                
+            # Process future attention weights
+            if future_attn_weights is not None:
+                if self.cross_modal_fusion_mode == FusionMode.MEAN_POOLING.value:
+                    # Average across all query modalities
+                    future_weights = future_attn_weights.mean(dim=2)  # [B, T_future, num_modalities]
+                else:  # query_token mode
+                    # With query token, weights are already [B, T_future, 1, num_modalities]
+                    future_weights = future_attn_weights.squeeze(2)  # [B, T_future, num_modalities]
+            else:
+                # Fallback to uniform weights
+                future_weights = torch.ones(B, T_future, self.future_num_modalities, device=device) / self.future_num_modalities
+                
+        elif self.fusion_block_type == FusionBlockType.VARIABLE_SELECTION.value:
+            # VSN approach - need to convert stacked tensor to dictionary
+            past_modality_dict = {}
+            
+            # Base modalities
+            for i, name in enumerate(BASE_MODALITIES_PAST):
+                if i < len(past_modalities):
+                    past_modality_dict[name] = past_modalities[i]
+            
+            # Add user features
+            if self.use_projected_user_features:
+                past_modality_dict['user'] = past_modalities[len(BASE_MODALITIES_PAST)]
+            else:
+                for i, feature in enumerate(self.user_categorical_features + self.user_real_features):
+                    idx = len(BASE_MODALITIES_PAST) + i
+                    if idx < len(past_modalities):
+                        past_modality_dict[f'user_{feature}'] = past_modalities[idx]
+            
+            # Apply VSN
+            fused_glucose_past, past_weights = self.past_fusion(past_modality_dict)  # [B, T_past, hidden_dim], [B, T_past, num_modalities]
+            
+            # Process future modalities for VSN
+            future_modality_dict = {}
+            
+            # Base modalities
+            future_modality_dict['meal'] = future_modalities[0]
+            future_modality_dict['temporal'] = future_modalities[1]
+            future_modality_dict['microbiome'] = future_modalities[2]
+            
+            # Add user embeddings
+            if self.use_projected_user_features:
+                future_modality_dict['user'] = future_modalities[3]
+            else:
+                for i, feature in enumerate(self.user_categorical_features + self.user_real_features):
+                    idx = 3 + i
+                    if idx < len(future_modalities):
+                        future_modality_dict[f'user_{feature}'] = future_modalities[idx]
+            
+            # Apply VSN for future
+            fused_meal_future, future_weights = self.future_fusion(future_modality_dict)  # [B, T_future, hidden_dim], [B, T_future, num_modalities]
         
-        # Convert future CrossModalFusion attention weights to feature importance weights
-        if future_attn_weights is not None:
-            # Average across all query modalities to get how much each modality is attended to
-            future_weights = future_attn_weights.mean(dim=2)  # [B, T_future, num_modalities]
         else:
-            # Fallback to uniform weights if attention isn't available
-            future_weights = torch.ones(B, T_future, self.future_num_modalities, device=device) / self.future_num_modalities
-                        
-        
+            raise ValueError(f"Unsupported fusion block type: {self.fusion_block_type}")
+            
         # 5) Combine all encodings in a single "memory" sequence
         memory = [
             fused_glucose_past,   # [B, T_past, D]
@@ -645,7 +785,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
                 use_projected_user_features=self.use_projected_user_features,
                 logger_fn=self.log,
                 prefix=f"{phase}_past_vsn",
-                base_modality_names=["glucose", "meal", "temporal", "microbiome"]
+                base_modality_names=BASE_MODALITIES_PAST
             )
             
             # Future weights
@@ -657,7 +797,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
                 use_projected_user_features=self.use_projected_user_features,
                 logger_fn=self.log,
                 prefix=f"{phase}_future_vsn",
-                base_modality_names=["meal", "temporal", "microbiome"]  # No glucose in future
+                base_modality_names=BASE_MODALITIES_FUTURE
             )
         
         return metrics["metrics"]["q_loss"]

@@ -67,6 +67,17 @@ class ExperimentConfig:
     num_quantiles: int = 7
     loss_iauc_weight: float = 0.00
     
+    # Fusion block configuration
+    # fusion_block_type: Choice between two fusion approaches:
+    # - 'cmf': CrossModalFusion - Fuses modalities using multi-head attention
+    # - 'vsn': VariableSelectionNetwork - Uses a CLS token approach for attention
+    fusion_block_type: str = "vsn"
+    
+    # cross_modal_fusion_mode: Mode for CrossModalFusion (only applies when fusion_block_type='cmf')
+    # - 'mean_pooling': Original approach with self-attention across modalities followed by mean pooling
+    # - 'query_token': Uses a learnable query token to attend to all modalities (similar to VSN)
+    cross_modal_fusion_mode: str = "query_token"
+    
     # New dropout hyperparameters
     dropout_rate: float = 0.2          # Used for projections, cross-attention, forecast MLP, etc.
     transformer_dropout: float = 0.1   # Used within Transformer layers
@@ -198,6 +209,9 @@ def generate_experiment_name(config: ExperimentConfig, kwargs: dict) -> str:
         'num_quantiles': 'quantiles',
         'loss_iauc_weight': 'iauc_wt',
         'add_glucose_causal_mask': 'gluc_causal_mask',
+        # Fusion block parameters
+        'fusion_block_type': 'fusion_type',
+        'cross_modal_fusion_mode': 'cmf_mode',
         
         # Dropout
         'dropout_rate': 'drop',
