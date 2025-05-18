@@ -115,3 +115,38 @@ def unscale_tensor(tensor: torch.Tensor, target_scales: torch.Tensor) -> torch.T
     max_glucose = 30.0  # Above physiological range but allow for some prediction error
     
     return torch.clamp(unscaled, min=min_glucose, max=max_glucose)
+
+
+def calculate_correlation(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Calculate Pearson correlation between predicted and target values.
+    
+    Args:
+        pred: Predicted values
+        target: Target values
+        
+    Returns:
+        Correlation coefficient as a tensor
+    """
+    # Handle edge cases
+    if pred.numel() == 0 or target.numel() == 0:
+        return torch.tensor(0.0, device=pred.device)
+        
+    # Calculate means
+    pred_mean = torch.mean(pred)
+    target_mean = torch.mean(target)
+    
+    # Calculate covariance
+    cov = torch.mean((pred - pred_mean) * (target - target_mean))
+    
+    # Calculate standard deviations
+    pred_std = torch.std(pred, unbiased=False)
+    target_std = torch.std(target, unbiased=False)
+    
+    # Avoid division by zero
+    epsilon = 1e-8
+    
+    # Calculate correlation
+    corr = cov / (pred_std * target_std + epsilon)
+    
+    return corr

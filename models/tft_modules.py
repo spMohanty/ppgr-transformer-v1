@@ -11,30 +11,217 @@ from typing import Dict, Tuple, Optional
 import math
 
 class GatedLinearUnit(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int = None, dropout: float = 0.0):
-        """
-        Applies a linear layer followed by dropout and then splits the output
-        into two halves. which is then gated by a GLU activation.
-        """
-        super().__init__()
-        
+    """Gated Linear Unit"""
+
+    def __init__(self, input_size: int, hidden_size: int = None, dropout: float = None):
+        super(GatedLinearUnit, self).__init__()
+
+        if hidden_size is None:
+            hidden_size = input_size
         self.input_size = input_size
-        self.hidden_size = hidden_size or input_size
-        self.fc = nn.Linear(input_size,  self.hidden_size * 2)
-        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+        self.hidden_size = hidden_size
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(input_size, hidden_size)
+        self.sigmoid = nn.Sigmoid()
+        if dropout is not None:
+            self.dropout = nn.Dropout(dropout)
+        else:
+            self.dropout = dropout
+
+    def forward(self, x):
+        if torch.isnan(x).any():
+            # Replace NaN values with zeros
+            x = torch.nan_to_num(x, nan=0.0)
+            
+        # Calculate gating mechanism
+        sig = self.sigmoid(self.fc1(x))
         
-        self.reset_parameters()
+        # Check for and handle NaN values in sigmoid output
+        if torch.isnan(sig).any():
+            sig = torch.nan_to_num(sig, nan=0.5)  # Use 0.5 as neutral value for sigmoid
+            
+        # Apply linear transformation
+        x_tilde = self.fc2(x)
+        
+        # Check for and handle NaN values in linear output
+        if torch.isnan(x_tilde).any():
+            x_tilde = torch.nan_to_num(x_tilde, nan=0.0)
+            
+        # Apply gating mechanism
+        output = sig * x_tilde
+        
+        # Final NaN check
+        if torch.isnan(output).any():
+            output = torch.nan_to_num(output, nan=0.0)
+            
+        if self.dropout is not None:
+            output = self.dropout(output)
+        return output
 
-    def reset_parameters(self):
-        nn.init.xavier_uniform_(self.fc.weight)
-        if self.fc.bias is not None:
-            nn.init.zeros_(self.fc.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.dropout(x)
-        x = self.fc(x)
-        x = F.glu(x, dim=-1)
-        return x
+class VariableSelectionNetwork(nn.Module):
+    def __init__(
+        self,
+        input_sizes: Dict[str, int],
+        hidden_size: int,
+        input_embedding_flags: Dict[str, bool] = {},
+        dropout: float = None,
+        context_size: int = None,
+    ):
+        """
+        Variable selection network.
+        
+        Args:
+            input_sizes: Dict with input sizes for each input variable
+            hidden_size: Size of hidden layers
+            input_embedding_flags: Dict indicating if variables need an embedding
+            dropout: Dropout rate
+            context_size: Size of context vector
+        """
+        super(VariableSelectionNetwork, self).__init__()
+
+        self.hidden_size = hidden_size
+        self.input_sizes = input_sizes
+        self.input_embedding_flags = input_embedding_flags
+        self.dropout = dropout
+
+        if len(self.input_sizes) > 1:
+            self.flattened_grn = GatedResidualNetwork(
+                input_size=sum(self.input_sizes.values()),
+                hidden_size=hidden_size,
+                output_size=len(self.input_sizes),
+                dropout=dropout,
+                context_size=context_size,
+                residual=False,
+            )
+
+        self.single_variable_grns = nn.ModuleDict()
+        for name, input_size in self.input_sizes.items():
+            if self.input_embedding_flags.get(name, False):
+                self.single_variable_grns[name] = TimeDistributedEmbeddingBag(
+                    input_size, hidden_size
+                )
+            else:
+                self.single_variable_grns[name] = GatedResidualNetwork(
+                    input_size=input_size,
+                    hidden_size=hidden_size,
+                    output_size=hidden_size,
+                    dropout=dropout,
+                )
+
+        # Set for holding cached variable encodings
+        self.cached_var_encodings = {}
+        
+    def forward(self, x: Dict[str, torch.Tensor], context: Optional[torch.Tensor] = None):
+        """
+        Forward pass of the variable selection network.
+        
+        Args:
+            x: Dict with input variables
+            context: Optional context vector
+            
+        Returns:
+            Tuple of processed variable tensor and attention weights
+        """
+        # Check that input sizes are correct
+        for name, tensor in x.items():
+            if name not in self.input_sizes:
+                raise ValueError(f"Input variable {name} not found in input_sizes")
+        
+        # Handle NaN values in inputs by replacing with zeros
+        for name, tensor in x.items():
+            if torch.isnan(tensor).any():
+                x[name] = torch.nan_to_num(tensor, nan=0.0)
+                
+        if len(self.input_sizes) > 1:
+            # Concatenate inputs
+            var_encodings = []
+            weight_inputs = []
+
+            # Apply transformations
+            for name, input_network in self.single_variable_grns.items():
+                if name in x:
+                    var_encodings.append(input_network(x[name]))
+                    weight_inputs.append(x[name])
+                else:
+                    # Handle missing variables with zeros
+                    batch_size = next(iter(x.values())).size(0)
+                    time_steps = next(iter(x.values())).size(1) if len(next(iter(x.values())).size()) > 1 else 1
+                    zero_tensor = torch.zeros((batch_size, time_steps, self.input_sizes[name]), 
+                                            device=next(iter(x.values())).device)
+                    var_encodings.append(input_network(zero_tensor))
+                    weight_inputs.append(zero_tensor)
+
+            # Check for NaN values in var_encodings and fix them
+            for i, encoding in enumerate(var_encodings):
+                if torch.isnan(encoding).any():
+                    print(f"WARNING: NaN values detected in variable encoding {i}")
+                    var_encodings[i] = torch.nan_to_num(encoding, nan=0.0)
+
+            # Cache variable encodings (useful for interpretation)
+            self.cached_var_encodings = {name: var_encodings[i] for i, name in enumerate(self.single_variable_grns.keys())}
+
+            # Concatenate weight inputs
+            if len(weight_inputs[0].shape) == 3:
+                # For temporal inputs
+                flatten = torch.cat(weight_inputs, dim=2)
+            else:
+                # For static inputs
+                flatten = torch.cat(weight_inputs, dim=1)
+
+            # Check for NaN values in flattened input
+            if torch.isnan(flatten).any():
+                flatten = torch.nan_to_num(flatten, nan=0.0)
+
+            # Calculate variable weights
+            sparse_weights = self.flattened_grn(flatten, context)
+            
+            # Check for NaN values in weights
+            if torch.isnan(sparse_weights).any():
+                print(f"WARNING: NaN values detected in variable selection weights")
+                sparse_weights = torch.nan_to_num(sparse_weights, nan=1.0 / len(self.input_sizes))
+
+            # Ensure weights are valid probabilities
+            sparse_weights = F.softmax(sparse_weights, dim=-1)
+
+            # Stack variable encodings
+            if len(var_encodings[0].shape) == 3:
+                # For temporal inputs
+                var_encodings = torch.stack(var_encodings, dim=-1)
+                # Apply variable selection weights
+                outputs = var_encodings * sparse_weights.unsqueeze(2)
+                outputs = outputs.sum(dim=-1)
+            else:
+                # For static inputs
+                var_encodings = torch.stack(var_encodings, dim=1)
+                # Apply variable selection weights
+                outputs = var_encodings * sparse_weights.unsqueeze(2)
+                outputs = outputs.sum(dim=1)
+
+            # Final NaN check
+            if torch.isnan(outputs).any():
+                print(f"WARNING: NaN values detected in variable selection outputs")
+                outputs = torch.nan_to_num(outputs, nan=0.0)
+                
+            return outputs, sparse_weights
+        else:
+            # For single variable, just apply the transformation
+            name = next(iter(self.single_variable_grns.keys()))
+            var_encoding = self.single_variable_grns[name](x[name])
+            
+            # Handle NaN values
+            if torch.isnan(var_encoding).any():
+                var_encoding = torch.nan_to_num(var_encoding, nan=0.0)
+                
+            # Create dummy weights
+            if len(var_encoding.shape) == 3:
+                batch_size, time_steps, _ = var_encoding.shape
+                sparse_weights = torch.ones((batch_size, time_steps, 1), device=var_encoding.device)
+            else:
+                batch_size, _ = var_encoding.shape
+                sparse_weights = torch.ones((batch_size, 1), device=var_encoding.device)
+                
+            return var_encoding, sparse_weights
 
 class AddNorm(nn.Module):
     def __init__(
@@ -241,105 +428,169 @@ class TransformerVariableSelectionNetwork(nn.Module):
         input_sizes: Dict[str, int],
         hidden_size: int,
         n_heads: int,
+        input_embedding_flags: Dict[str, bool] = None,
         dropout: float = 0.1,
         context_size: int = None,
         single_variable_grns: Dict[str, nn.Module] = None,
+        prescalers: Dict[str, nn.Module] = None,
     ):
         """
-        Variable selection network using self-attention.
+        Transformer-based variable selection network.
         
         Args:
-            input_sizes: Dictionary mapping variable names to their dimensions
-            hidden_size: Size of hidden layers
-            n_heads: Number of attention heads
-            dropout: Dropout rate
-            context_size: Size of optional conditioning context
-            single_variable_grns: Optional pre-initialized variable-wise GRNs
+            input_sizes: Dictionary mapping variable names to their input dimensions.
+            hidden_size: The hidden dimension (this is used as the transformer model dimension).
+            input_embedding_flags: (Ignored in this implementation, but left here for compatibility with the original code.)
+            dropout: Dropout probability.
+            context_size: If provided, context will be projected and added to a learnable CLS token.
+            single_variable_grns: (Ignored in this implementation. - as here All variables are treated as “tokens” in a single attention mechanism)
+            prescalers: Optional dict mapping variable names to a prescaler (e.g. an nn.Linear)
+                        that should be applied before the main variable embedding.
         """
         super().__init__()
-        
-        self.hidden_size = hidden_size
         self.input_sizes = input_sizes
+        self.hidden_size = hidden_size
         self.n_heads = n_heads
         self.dropout = dropout
+        self.context_size = context_size
+        self.input_embedding_flags = input_embedding_flags if input_embedding_flags is not None else {}
+        self.n_vars = len(input_sizes)
+        self.single_variable = (self.n_vars == 1)
+
+        # If provided, use the given prescalers; otherwise, initialize an empty ModuleDict.
+        if prescalers is not None:
+            self.prescalers = nn.ModuleDict(prescalers)
+        else:
+            self.prescalers = nn.ModuleDict()
+
+        # Build a simple per-variable embedding layer mapping from the variable’s input dim to hidden_size.
+        self.variable_embeddings = nn.ModuleDict()
+        for name, size in input_sizes.items():
+            self.variable_embeddings[name] = nn.Linear(size, hidden_size)
+
+        # If context is provided, project it to hidden_size.
+        if context_size is not None:
+            self.context_proj = nn.Linear(context_size, hidden_size)
+        else:
+            self.context_proj = None
         
-        # Create a single variable grn for each variable (or use provided ones)
-        self.single_variable_grns = nn.ModuleDict()
-        for name, input_size in self.input_sizes.items():
-            if single_variable_grns is not None and name in single_variable_grns:
-                self.single_variable_grns[name] = single_variable_grns[name]
-            else:
-                self.single_variable_grns[name] = PreNormResidualBlock(
-                    input_dim=input_size,
-                    hidden_dim=self.hidden_size,
-                    output_dim=self.hidden_size,
-                    dropout=self.dropout
-                )
-        
-        # Create the variable selection weights using a GRN with optional context
-        self.var_selection_grn = PreNormResidualBlock(
-            input_dim=len(self.input_sizes) * self.hidden_size,
-            hidden_dim=self.hidden_size,
-            output_dim=len(self.input_sizes),
-            context_dim=context_size,
-            dropout=self.dropout
+        # Learned CLS token used as the query for variable selection.
+        # Shape: [1, 1, hidden_size] — later expanded to match the batch (and time) dimensions.
+        self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_size))
+
+        # Multi-head attention layer.
+        self.mha = nn.MultiheadAttention(
+            embed_dim=hidden_size, num_heads=self.n_heads, dropout=dropout, batch_first=True
         )
-        
+
+        # An optional feed-forward network and layer norm following the attention layer.
+        self.feed_forward = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        self.layer_norm = nn.LayerNorm(hidden_size)
+
     def forward(
         self, x: Dict[str, torch.Tensor], context: torch.Tensor = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass through the Variable Selection Network.
-        
         Args:
-            x: Dictionary of input variables {var_name: tensor of shape [batch, time, input_size]}
-            context: Optional context tensor for conditioning
-        
+            x: Dictionary of variable names to tensors.
+               Each tensor can be of shape [batch, input_dim] or [batch, time, input_dim].
+            context: Optional context tensor of shape [batch, context_size] or [batch, time, context_size].
+
         Returns:
-            Tuple of (processed variables tensor, variable selection weights)
+            output: The combined variable embedding, of shape [batch, hidden_size] (if no time dimension)
+                    or [batch, time, hidden_size] (if inputs are time-varying).
+            sparse_weights: The variable selection weights (attention weights),
+                            of shape [batch, n_vars] or [batch, time, n_vars].
         """
-        # Get batch size and sequence length from first input
-        first_var = list(x.values())[0]
-        batch_size, seq_len = first_var.shape[:2]
-        device = first_var.device
-        
-        # Process each variable independently
-        var_outputs = {}
-        for k, v in x.items():
-            var_outputs[k] = self.single_variable_grns[k](v)
-        
-        # Concatenate variables for self-attention
-        var_concat = torch.cat([var_outputs[k] for k in self.input_sizes.keys()], dim=-1)
-        
-        # Compute variable selection weights
+        # Determine whether inputs are time-varying based on one sample.
+        sample_tensor = next(iter(x.values()))
+        has_time = (sample_tensor.dim() == 3)
+
+        # --- Case 1: Single variable input ---
+        if self.single_variable:
+            var_name = list(self.input_sizes.keys())[0]
+            var_tensor = x[var_name]
+            if var_tensor.dim() == 2:
+                var_tensor = var_tensor.unsqueeze(1)  # Shape: [B, 1, input_dim]
+            if var_name in self.prescalers:
+                var_tensor = self.prescalers[var_name](var_tensor)
+            # Embed the variable.
+            output = self.variable_embeddings[var_name](var_tensor)  # [B, T, hidden_size]
+            B, T, _ = output.shape
+            # Create trivial sparse weights (all ones).
+            sparse_weights = torch.ones(B, T, 1, device=output.device)
+            # If time dimension is 1, squeeze it.
+            if T == 1:
+                output = output.squeeze(1)
+                sparse_weights = sparse_weights.squeeze(1)
+            return output, sparse_weights
+
+        # --- Case 2: Multiple variable inputs ---
+        # Process each variable: apply prescaler (if provided) then the embedding.
+        embedded_vars = []
+        for name, size in self.input_sizes.items():
+            var_tensor = x[name]
+            if var_tensor.dim() == 2:
+                var_tensor = var_tensor.unsqueeze(1)  # [B, 1, input_dim]
+            if name in self.prescalers:
+                var_tensor = self.prescalers[name](var_tensor)
+            embedded = self.variable_embeddings[name](var_tensor)  # [B, T, hidden_size]
+            embedded_vars.append(embedded)
+
+        # Stack along a new variable dimension so that tokens shape becomes [B, T, n_vars, hidden_size].
+        tokens = torch.stack(embedded_vars, dim=2)
+        B, T, n_vars, H = tokens.shape
+        # Merge batch and time dimensions for transformer processing: [B*T, n_vars, H].
+        tokens_reshaped = tokens.view(B * T, n_vars, H)
+
+        # Create a CLS token for each instance.
+        cls_tokens = self.cls_token.expand(B * T, -1, -1)  # [B*T, 1, H]
+        # If a context tensor is provided, project and add it to the CLS token.
         if context is not None:
-            # Ensure context has the right shape for sequence data
-            if context.ndim == 2:
-                # Add sequence dimension if missing
-                context = context.unsqueeze(1).expand(-1, seq_len, -1)
-                
-            # Apply the GRN with context to get variable weights
-            weights = self.var_selection_grn(var_concat, context)
-        else:
-            # Apply the GRN without context
-            weights = self.var_selection_grn(var_concat)
-        
-        # Apply softmax to get variable selection weights
-        weights = F.softmax(weights, dim=-1)
-        
-        # Construct weighted combination of variables
-        var_list = [var_outputs[k] for k in self.input_sizes.keys()]
-        var_stacked = torch.stack(var_list, dim=-2)  # [batch, time, num_vars, hidden]
-        
-        # Apply weights to get the final output
-        # weights: [batch, time, num_vars]
-        # var_stacked: [batch, time, num_vars, hidden]
-        # -> Need to expand weights to [batch, time, num_vars, 1]
-        weights_expanded = weights.unsqueeze(-1)
-        combined = (var_stacked * weights_expanded).sum(dim=-2)  # [batch, time, hidden]
-        
-        return combined, weights
-        
+            if context.dim() == 3:
+                # [B, T, context_size] -> [B*T, 1, context_size]
+                context = context.reshape(B * T, 1, -1)
+            elif context.dim() == 2:
+                # [B, context_size] -> [B, 1, context_size] then repeat for each time step.
+                context = context.unsqueeze(1).expand(B, T, -1).reshape(B * T, 1, -1)
+            if self.context_proj is not None:
+                context = self.context_proj(context)
+            cls_tokens = cls_tokens + context
+
+        # Concatenate the CLS token with the variable tokens.
+        # attn_input: [B*T, 1+n_vars, H]
+        attn_input = torch.cat([cls_tokens, tokens_reshaped], dim=1)
+
+        # Use the CLS token as the query, and the full sequence as key/value.
+        query = attn_input[:, :1, :]  # [B*T, 1, H]
+        key = attn_input             # [B*T, 1+n_vars, H]
+        value = attn_input
+
+        # Apply multi-head attention.
+        attn_output, attn_weights = self.mha(query, key, value)
+        # attn_weights shape: [B*T, 1, 1+n_vars]. Discard the first column (self-attention of CLS).
+        variable_selection_weights = attn_weights[:, :, 1:]  # [B*T, 1, n_vars]
+
+        # pass the output through a feed-forward network and add a residual connection.
+        ff = self.feed_forward(attn_output)
+        output = self.layer_norm(attn_output + ff)  # [B*T, 1, H]
+
+        # Reshape back to [B, T, H].
+        output = output.view(B, T, H)
+        variable_selection_weights = variable_selection_weights.view(B, T, n_vars)
+
+        # If time dimension is 1, squeeze it.
+        if T == 1:
+            output = output.squeeze(1)
+            variable_selection_weights = variable_selection_weights.squeeze(1)
+
+        return output, variable_selection_weights
+
 # Custom TransformerDecoderLayer that supports returning attention weights
 class CustomTransformerDecoderLayer(nn.Module):
     """
@@ -451,158 +702,216 @@ class CustomTransformerDecoderLayer(nn.Module):
             return tgt, attn_weights
         else:
             return tgt
-            
+
 class ScaledDotProductAttention(nn.Module):
-    """
-    Scaled Dot-Product Attention as described in "Attention Is All You Need"
-    
-    Computes attention weights using scaled dot product between query and key,
-    then applies these weights to the values.
-    """
-    def __init__(self, dropout: float = 0.0, scale: bool = True):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else None
-        self.softmax = nn.Softmax(dim=-1)
+    def __init__(self, dropout: float = None, scale: bool = True):
+        super(ScaledDotProductAttention, self).__init__()
+        if dropout is not None:
+            self.dropout = nn.Dropout(p=dropout)
+        else:
+            self.dropout = dropout
+        self.softmax = nn.Softmax(dim=2)
         self.scale = scale
 
     def forward(self, q, k, v, mask=None):
-        """
-        Computes scaled dot-product attention.
-        
-        Args:
-            q: Query tensor [batch_size, seq_len_q, d_k]
-            k: Key tensor [batch_size, seq_len_k, d_k]
-            v: Value tensor [batch_size, seq_len_v, d_v] (seq_len_k == seq_len_v)
-            mask: Optional mask tensor [batch_size, seq_len_q, seq_len_k]
-            
-        Returns:
-            output: Attention output [batch_size, seq_len_q, d_v]
-            attn: Attention weights [batch_size, seq_len_q, seq_len_k]
-        """
-        # Calculate dot product attention
-        attn = torch.bmm(q, k.transpose(-2, -1))  # [batch, seq_len_q, seq_len_k]
-        
-        # Scale attention scores
+        attn = torch.bmm(q, k.permute(0, 2, 1))  # query-key overlap
+
         if self.scale:
-            d_k = k.size(-1)
-            attn = attn / math.sqrt(d_k)
-        
-        # Apply mask if provided
+            dimension = torch.as_tensor(
+                k.size(-1), dtype=attn.dtype, device=attn.device
+            ).sqrt()
+            attn = attn / dimension
+
         if mask is not None:
-            # Convert mask to proper format
-            mask_expanded = ~mask if mask.dtype == torch.bool else mask
-            attn = attn.masked_fill(mask_expanded == 0, -1e9)
-        
-        # Apply softmax to get attention weights
+            attn = attn.masked_fill(mask, -1e9)
         attn = self.softmax(attn)
-        
-        # Apply dropout if defined
+
         if self.dropout is not None:
             attn = self.dropout(attn)
-        
-        # Apply attention weights to values
-        output = torch.bmm(attn, v)  # [batch, seq_len_q, d_v]
-        
+        output = torch.bmm(attn, v)
         return output, attn
 
 
 class InterpretableMultiHeadAttention(nn.Module):
-    """
-    Interpretable Multi-head Self-Attention layer.
-    
-    Based on the implementation from pytorch_forecasting's TFT model.
-    Uses separate projection layers for each head and processes them independently
-    before combining the results.
-    """
     def __init__(self, n_head: int, d_model: int, dropout: float = 0.0):
-        super().__init__()
-        
+        super(InterpretableMultiHeadAttention, self).__init__()
+
         self.n_head = n_head
         self.d_model = d_model
         self.d_k = self.d_q = self.d_v = d_model // n_head
         self.dropout = nn.Dropout(p=dropout)
-        
-        # Shared value projection layer
+
         self.v_layer = nn.Linear(self.d_model, self.d_v)
-        
-        # Separate projection layers for each head
-        self.q_layers = nn.ModuleList([nn.Linear(self.d_model, self.d_q) for _ in range(n_head)])
-        self.k_layers = nn.ModuleList([nn.Linear(self.d_model, self.d_k) for _ in range(n_head)])
-        
-        # Attention mechanism
-        self.attention = ScaledDotProductAttention(dropout=dropout)
-        
-        # Output projection
-        self.out_proj = nn.Linear(self.d_v, self.d_model, bias=False)
-        
-        # Initialize weights
-        self.reset_parameters()
-        
-    def reset_parameters(self):
-        # Initialize linear layers using Xavier uniform initialization
+        self.q_layers = nn.ModuleList(
+            [nn.Linear(self.d_model, self.d_q) for _ in range(self.n_head)]
+        )
+        self.k_layers = nn.ModuleList(
+            [nn.Linear(self.d_model, self.d_k) for _ in range(self.n_head)]
+        )
+        self.attention = ScaledDotProductAttention()
+        self.w_h = nn.Linear(self.d_v, self.d_model, bias=False)
+
+        self.init_weights()
+
+    def init_weights(self):
         for name, p in self.named_parameters():
             if "bias" not in name:
-                nn.init.xavier_uniform_(p)
+                torch.nn.init.xavier_uniform_(p)
             else:
-                nn.init.zeros_(p)
-    
-    def forward(self, q, k, v, mask=None):
-        """
-        Forward pass for interpretable multi-head attention.
-        
-        Args:
-            q: Query tensor [batch_size, seq_len_q, d_model]
-            k: Key tensor [batch_size, seq_len_k, d_model]
-            v: Value tensor [batch_size, seq_len_v, d_model]
-            mask: Optional mask tensor [batch_size, seq_len_q, seq_len_k]
-            
-        Returns:
-            output: Attention output [batch_size, seq_len_q, d_model]
-            attn: Attention weights [batch_size, n_head, seq_len_q, seq_len_k]
-        """
-        batch_size = q.size(0)
-        seq_len_q = q.size(1)
-        seq_len_k = k.size(1)
-        
-        # Project value once since it's shared across heads
-        vs = self.v_layer(v)
-        
-        # Process each head separately
+                torch.nn.init.zeros_(p)
+
+    def forward(self, q, k, v, mask=None) -> Tuple[torch.Tensor, torch.Tensor]:
         heads = []
         attns = []
-        
+        vs = self.v_layer(v)
         for i in range(self.n_head):
-            # Project queries and keys for this head
             qs = self.q_layers[i](q)
             ks = self.k_layers[i](k)
-            
-            # Apply attention
             head, attn = self.attention(qs, ks, vs, mask)
-            
-            # Apply dropout
-            head = self.dropout(head)
-            
-            # Collect outputs
-            heads.append(head)
+            head_dropout = self.dropout(head)
+            heads.append(head_dropout)
             attns.append(attn)
+
+        head = torch.stack(heads, dim=2) if self.n_head > 1 else heads[0]
+        attn = torch.stack(attns, dim=2)
+
+        outputs = torch.mean(head, dim=2) if self.n_head > 1 else head
+        outputs = self.w_h(outputs)
+        outputs = self.dropout(outputs)
+
+        return outputs, attn
+
+class GatedResidualNetwork(nn.Module):
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        output_size: int,
+        dropout: float = None,
+        context_size: Optional[int] = None,
+        residual: bool = True,
+    ):
+        """
+        Gated Residual Network as described in the TFT paper.
         
-        # Combine heads
-        if self.n_head > 1:
-            # For multiple heads, average the outputs
-            head = torch.stack(heads, dim=2)  # [batch, seq_len_q, n_head, d_v]
-            attn = torch.stack(attns, dim=1)  # [batch, n_head, seq_len_q, seq_len_k]
+        Args:
+            input_size: Input size
+            hidden_size: Hidden layer size
+            output_size: Output size
+            dropout: Dropout rate
+            context_size: External context size
+            residual: Whether to use residual connection
+        """
+        super(GatedResidualNetwork, self).__init__()
+        
+        self.input_size = input_size
+        self.output_size = output_size
+        self.context_size = context_size
+        self.hidden_size = hidden_size
+        self.residual = residual
+
+        # Setup layers
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.elu = nn.ELU()
+        
+        # Optional context layer for conditioning
+        if context_size is not None:
+            self.context_layer = nn.Linear(context_size, hidden_size, bias=False)
             
-            # Take mean across heads dimension
-            output = torch.mean(head, dim=2)  # [batch, seq_len_q, d_v]
-        else:
-            # For a single head, just use the first head's output
-            output = heads[0]  # [batch, seq_len_q, d_v]
-            attn = attns[0].unsqueeze(1)  # [batch, 1, seq_len_q, seq_len_k]
+        self.fc2 = nn.Linear(hidden_size, output_size)
+        self.dropout = nn.Dropout(dropout) if dropout is not None else nn.Identity()
         
-        # Project to output dimension
-        output = self.out_proj(output)  # [batch, seq_len_q, d_model]
+        # Skip connection mapping if input and output have different sizes
+        if self.residual and (input_size != output_size):
+            self.skip_layer = nn.Linear(input_size, output_size)
         
-        # Final dropout
+        # GLU for gates
+        self.gate = nn.Linear(input_size, output_size)
+        self.sigmoid = nn.Sigmoid()
+        
+        # Layer normalization for output
+        self.norm = nn.LayerNorm(output_size)
+    
+    def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Forward pass for GRN.
+        
+        Args:
+            x: Input tensor
+            context: Optional context tensor for conditioning
+            
+        Returns:
+            Processed tensor
+        """
+        # Handle NaN values in input
+        if torch.isnan(x).any():
+            x = torch.nan_to_num(x, nan=0.0)
+            
+        # Get residual connection ready
+        if self.residual:
+            residual = x
+            if hasattr(self, "skip_layer"):
+                residual = self.skip_layer(x)
+        
+        # Main network
+        output = self.fc1(x)
+        
+        # Check for NaN values after first layer
+        if torch.isnan(output).any():
+            print(f"WARNING: NaN values detected in GRN after fc1")
+            output = torch.nan_to_num(output, nan=0.0)
+        
+        # Add context if provided
+        if self.context_size is not None and context is not None:
+            # Handle NaN values in context
+            if torch.isnan(context).any():
+                context = torch.nan_to_num(context, nan=0.0)
+                
+            context_output = self.context_layer(context)
+            
+            # Check for NaN values after context layer
+            if torch.isnan(context_output).any():
+                print(f"WARNING: NaN values detected in GRN after context_layer")
+                context_output = torch.nan_to_num(context_output, nan=0.0)
+                
+            output = output + context_output
+        
+        # Apply activation and second layer
+        output = self.elu(output)
         output = self.dropout(output)
+        output = self.fc2(output)
         
-        return output, attn 
+        # Check for NaN values after second layer
+        if torch.isnan(output).any():
+            print(f"WARNING: NaN values detected in GRN after fc2")
+            output = torch.nan_to_num(output, nan=0.0)
+        
+        # Gating mechanism
+        gate = self.sigmoid(self.gate(x))
+        
+        # Check for NaN values in gate
+        if torch.isnan(gate).any():
+            print(f"WARNING: NaN values detected in GRN gate")
+            gate = torch.nan_to_num(gate, nan=0.5)  # Neutral value for sigmoid
+            
+        # Apply gate
+        output = gate * output
+        
+        # Add residual if needed
+        if self.residual:
+            output = output + residual
+            
+        # Check for NaN values after residual
+        if torch.isnan(output).any():
+            print(f"WARNING: NaN values detected in GRN after residual")
+            output = torch.nan_to_num(output, nan=0.0)
+        
+        # Apply normalization
+        output = self.norm(output)
+        
+        # Final NaN check
+        if torch.isnan(output).any():
+            print(f"WARNING: NaN values detected in GRN output after norm")
+            output = torch.nan_to_num(output, nan=0.0)
+            
+        return output 

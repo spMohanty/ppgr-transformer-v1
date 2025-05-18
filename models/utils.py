@@ -105,24 +105,57 @@ def get_attention_mask(
     batch_size = encoder_lengths.size(0)
     max_encoder_length = encoder_lengths.max().item()
     
-    # Create simple full mask first (all positions can attend)
-    mask = torch.ones(
-        batch_size, 
-        forecast_horizon,
-        max_encoder_length + forecast_horizon, 
-        dtype=torch.bool, 
-        device=device
-    )
+    # Print diagnostics
+    if torch.any(encoder_lengths <= 0):
+        print(f"WARNING: Invalid encoder lengths detected: min={encoder_lengths.min().item()}")
     
-    # Apply encoder padding mask (can't attend to padded positions)
+    if torch.any(decoder_lengths <= 0):
+        print(f"WARNING: Invalid decoder lengths detected: min={decoder_lengths.min().item()}")
+        
+    # Create encoder mask to handle padding
+    # Shape: [batch_size, forecast_horizon, max_encoder_length]
+    encoder_mask = torch.ones(batch_size, forecast_horizon, max_encoder_length, dtype=torch.bool, device=device)
+    
+    # Mask padded encoder positions
+    any_padding = False
     for i in range(batch_size):
-        # Mask out padding in encoder (can't attend to padded positions)
-        mask[i, :, encoder_lengths[i]:max_encoder_length] = False
+        # Set padding tokens to False (these positions won't be attended to)
+        if encoder_lengths[i] < max_encoder_length:
+            any_padding = True
+            encoder_mask[i, :, encoder_lengths[i]:] = False
     
-    # Apply causal mask in decoder part (can't attend to future positions)
-    for i in range(forecast_horizon):
-        # For each decoder position, mask out future positions
-        mask[:, i, max_encoder_length+i+1:] = False
+    if not any_padding:
+        print("INFO: No padding in encoder sequences - all sequences have length", max_encoder_length)
+    
+    # Create causal decoder mask
+    # For each decoder position (forecast step), create a mask where:
+    # - It can attend to all previous decoder positions
+    # - It cannot attend to future decoder positions
+    
+    # indices to which is attended
+    attend_step = torch.arange(forecast_horizon, device=device)
+    # indices for which is predicted
+    predict_step = torch.arange(0, forecast_horizon, device=device)[:, None]
+    # do not attend to steps to self or after prediction
+    decoder_mask = (attend_step >= predict_step).unsqueeze(0).expand(batch_size, -1, -1)
+    
+    # Combine encoder and decoder masks
+    # Shape: [batch_size, forecast_horizon, max_encoder_length + forecast_horizon]
+    mask = torch.cat((encoder_mask, decoder_mask), dim=2)
+    
+    # Diagnostic about mask density
+    mask_density = mask.float().mean().item()
+    print(f"INFO: Attention mask - {mask_density:.2f} of positions are attended to")
+    
+    # Verify the mask doesn't have all False values for any prediction position
+    all_masked_out = torch.any(~mask.any(dim=2))
+    if all_masked_out:
+        print("WARNING: Some prediction positions have all positions masked out!")
+        # Find which positions have all masked out
+        for i in range(batch_size):
+            for j in range(forecast_horizon):
+                if not mask[i, j].any():
+                    print(f"  Batch {i}, prediction position {j} has all attention positions masked out")
     
     return mask
 

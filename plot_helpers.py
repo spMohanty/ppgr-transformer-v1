@@ -249,7 +249,7 @@ def plot_forecast(
     # Add better labels
     ax_ts.set_xlabel("Time (15-min intervals)", fontsize=12)
     ax_ts.set_ylabel("Glucose (mmol/L)", fontsize=12)
-
+    
     # — attention heatmap —
     if encoder_attention_map is not None and ax_at is not None:
         # Combine encoder and decoder attention maps if both are provided
@@ -346,10 +346,7 @@ def plot_forecast_examples(
     sampled_indices = fixed_indices
 
     # Process attention weights to ensure they're in the correct format
-    # Handle None case or empty tensors
     def process_attention(attn_weights):
-        if attn_weights is None or attn_weights.numel() == 0:
-            return None
         # Detach and convert to CPU numpy array
         return attn_weights.detach().cpu().numpy()
     
@@ -357,15 +354,6 @@ def plot_forecast_examples(
     attn_past_np = process_attention(attn_weights_past) if attn_weights_past is not None else None
     attn_future_np = process_attention(attn_weights_future) if attn_weights_future is not None else None
     
-    # Check if attention weights are valid (not all zeros or NaNs)
-    if attn_past_np is not None:
-        if np.isnan(attn_past_np).any() or np.all(attn_past_np == 0):
-            print("Warning: Past attention weights contain all zeros or NaNs - setting to None")
-            attn_past_np = None
-    if attn_future_np is not None:
-        if np.isnan(attn_future_np).any() or np.all(attn_future_np == 0):
-            print("Warning: Future attention weights contain all zeros or NaNs - setting to None")
-            attn_future_np = None
 
     figs = []
     for sampled_idx in sampled_indices:

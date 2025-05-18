@@ -43,6 +43,7 @@ class ExperimentConfig:
     use_microbiome_embeddings: bool = True
     group_by_columns: list = None
     
+    microbiome_embed_dim: int = 512 # This is fixed for the current version of the dataset
     
     project_user_features_to_single_vector: bool = False
 
@@ -59,6 +60,8 @@ class ExperimentConfig:
     max_meals: int = 11  # Maximum number of meals to consider
     food_embed_dim: int = 512 # the number of dimensions from the pre-trained embeddings to use
     hidden_dim: int = 256
+    hidden_continuous_dim: int = 128
+    
     num_heads: int = 4
     transformer_encoder_layers: int = 2
     transformer_encoder_layers_share_weights: bool = True
@@ -68,6 +71,16 @@ class ExperimentConfig:
     add_residual_connection_before_meal_timestep_embedding: bool = True
     num_quantiles: int = 7
     loss_iauc_weight: float = 0.00
+    
+    
+    
+    ### New Variables
+    transformer_encoder_decoder_num_heads: int = 4
+    transformer_encoder_decoder_num_layers: int = 4
+    transformer_encoder_decoder_hidden_size: int = 32
+    variable_selection_network_n_heads: int = 4 
+    
+    share_single_variable_networks: bool = False
     
     # Fusion block configuration
     # fusion_block_type: Choice between two fusion approaches:
@@ -85,7 +98,7 @@ class ExperimentConfig:
     transformer_dropout: float = 0.1   # Used within Transformer layers
 
     # Training hyperparameters
-    batch_size: int = 1024 * 2
+    batch_size: int = 1024 * 2 
     max_epochs: int = 50
     optimizer_lr: float = 2e-4
     optimizer_lr_scheduler_pct_start: float = 0.1
