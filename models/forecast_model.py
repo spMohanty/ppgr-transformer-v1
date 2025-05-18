@@ -33,8 +33,6 @@ from .tft_modules import (
     SharedTransformerEncoder, SharedTransformerDecoder,
     TransformerVariableSelectionNetwork, InterpretableMultiHeadAttention
 )
-from .utils import expand_user_embeddings, get_user_context, get_attention_mask, compute_forecast_metrics, log_fusion_feature_weights, expand_user_embeddings_for_fusion
-from .enums import FusionBlockType, FusionMode, BASE_MODALITIES_PAST, BASE_MODALITIES_FUTURE
 
 from config import ExperimentConfig
 from plot_helpers import plot_meal_self_attention, plot_forecast_examples, plot_iAUC_scatter
@@ -81,8 +79,6 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Model configuration
         self.hidden_dim = config.hidden_dim
         self.hidden_continuous_dim = config.hidden_continuous_dim
-        self.optimizer_lr = config.optimizer_lr
-        self.weight_decay = config.weight_decay
         self.num_quantiles = config.num_quantiles
         self.loss_iauc_weight = config.loss_iauc_weight
         
@@ -524,23 +520,22 @@ class MealGlucoseForecastModel(pl.LightningModule):
                     future_meal_macros.sum(dim=2)[:,:,0]
                 ], dim=1).unsqueeze(-1)
         input_vectors.update(food_real_values)
-        
+                
         ## TODO: Add Meal Embeddings here
 
         ##########  Static Variable Selection  ##########
         # Static Variable Selection
-        static_embedding = {
+        static_embedding_variables = {
             **user_static_cat_embeddings,
             **user_real_values
         }
         # Calculate Static Embedding
         static_embedding, static_variable_selection = self.static_variable_selection(
-            static_embedding
+            static_embedding_variables
         )
         def _expand_static_context(static_context, timesteps):
             return static_context.unsqueeze(1).expand(-1, timesteps, -1)
         static_context_variable_selection = _expand_static_context(static_embedding, timesteps)
-
 
         ##########  Encoder Variable Selection  ##########
         embeddings_varying_encoder = {}
@@ -605,31 +600,22 @@ class MealGlucoseForecastModel(pl.LightningModule):
         causal_mask = nn.Transformer().generate_square_subsequent_mask(T_future).to(
             embeddings_varying_decoder.device
         )
-        
-        # Convert boolean padding masks to float masks for consistency with causal_mask
-        # Convert True (padding) to -inf, and False (valid) to 0.0
-        encoder_padding_mask_float = encoder_padding_mask.float().masked_fill(
-            encoder_padding_mask, float('-inf')
-        ).masked_fill(~encoder_padding_mask, 0.0)
-        
-        decoder_padding_mask_float = decoder_padding_mask.float().masked_fill(
-            decoder_padding_mask, float('-inf')
-        ).masked_fill(~decoder_padding_mask, 0.0)
 
         # Pass through the encoder
         transformer_encoder_output = self.transformer_encoder(
-            src=embeddings_varying_encoder,  # B x T_past x hidden
-            src_key_padding_mask=encoder_padding_mask,  # B x T_past (still use boolean mask for encoder)
-        )  # -> B x T_past x hidden
-        
-        # Pass through the decoder with consistent float masks
+            src=embeddings_varying_encoder,  # B x T_enc x hidden
+            src_key_padding_mask=encoder_padding_mask,  # B x T_enc
+        )  # -> B x T_enc x hidden
+
+        # Pass through the decoder
         transformer_decoder_output = self.transformer_decoder(
-            tgt=embeddings_varying_decoder,        # B x T_future x hidden
-            memory=transformer_encoder_output,     # B x T_past x hidden
-            tgt_mask=causal_mask,                  # T_future x T_future, float (-inf/0)
-            tgt_key_padding_mask=decoder_padding_mask_float,  # B x T_future, float (-inf/0)
-            memory_key_padding_mask=encoder_padding_mask_float,  # B x T_past, float (-inf/0)
-        )  # -> B x T_future x hidden
+            tgt=embeddings_varying_decoder,        # B x T_dec x hidden
+            memory=transformer_encoder_output,                 # B x T_enc x hidden
+            tgt_mask=causal_mask,                  # T_dec x T_dec, standard
+            tgt_key_padding_mask=decoder_padding_mask,  # B x T_dec
+            memory_key_padding_mask=encoder_padding_mask,  # B x T_enc
+        )  # -> B x T_dec x hidden
+        
         
         # Add post transformer gating
         transformer_output_encoder = self.post_transformer_gate_encoder(transformer_encoder_output)
@@ -966,16 +952,44 @@ class MealGlucoseForecastModel(pl.LightningModule):
             f"pred_iAUC_{self.eval_window}": pred_iAUC,
             f"true_iAUC_{self.eval_window}": true_iAUC,        
         }
-
+    
     def configure_optimizers(self):
-        """Configure optimizers for PyTorch Lightning."""
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.optimizer_lr,
-            weight_decay=self.weight_decay
-        )
+        assert self.config.optimizer == "adamw", "Only adamw optimizer is supported atm"
+        assert self.config.optimizer_lr_scheduler in ["onecycle", "none"], "Only onecycle scheduler is supported atm or none or auto"
         
-        return optimizer
+        assert self.config.optimizer_lr_scheduler_max_lr_multiplier >= 1.0, "lr_scheduler_max_lr_multiplier must be >= 1.0"
+        
+        optimizer = torch.optim.AdamW(self.parameters(), 
+                          lr=self.config.optimizer_lr, 
+                          weight_decay=self.config.optimizer_weight_decay)
+
+        # Return only the optimizer if lr_scheduler is "none"
+        if self.config.optimizer_lr_scheduler == "none":
+            return optimizer
+        
+        # Estimate total steps if trainer is not attached yet
+        total_steps = self.trainer.estimated_stepping_batches
+        
+        lr_scheduler = {}
+        if self.config.optimizer_lr_scheduler == "onecycle":
+            # Configure the OneCycleLR scheduler
+            lr_scheduler = {
+                'scheduler': torch.optim.lr_scheduler.OneCycleLR(
+                    optimizer,
+                    max_lr=self.config.optimizer_lr * self.config.optimizer_lr_scheduler_max_lr_multiplier,           # Peak learning rate during the cycle
+                    total_steps=total_steps,  # Total number of training steps
+                    pct_start=self.config.optimizer_lr_scheduler_pct_start,         # Fraction of steps spent increasing the LR
+                    anneal_strategy=self.config.optimizer_lr_scheduler_anneal_strategy, # Cosine annealing for LR decay
+                    cycle_momentum=self.config.optimizer_lr_scheduler_cycle_momentum   # Set to True if you wish to cycle momentum
+                ),
+                'interval': 'step',        # Update the scheduler every training step
+            }
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": lr_scheduler
+        }    
+    
     
     @classmethod
     def load_from_checkpoint(cls, checkpoint_path: str, config: ExperimentConfig, num_foods: int, 

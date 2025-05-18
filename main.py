@@ -154,22 +154,11 @@ def prepare_callbacks(config: ExperimentConfig, model: MealGlucoseForecastModel,
     Returns:
         List of callbacks
     """
-    # Initialize optimizer
-    optimizer = model.configure_optimizers()
-    
     # Standard callbacks
     rich_model_summary = RichModelSummary(max_depth=2)
     rich_progress_bar = RichProgressBar()
-    
-    # Learning rate scheduler callback
-    lr_scheduler = LRSchedulerCallback(
-        optimizer=optimizer,
-        base_lr=config.optimizer_lr,
-        total_steps=config.max_epochs * len(train_loader),
-        pct_start=config.optimizer_lr_scheduler_pct_start,
-    )
-    
-    callbacks = [rich_model_summary, lr_scheduler, rich_progress_bar]
+        
+    callbacks = [rich_model_summary, rich_progress_bar]
 
     if not config.disable_checkpoints:    
         # Create checkpoint directory if it doesn't exist

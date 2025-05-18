@@ -16,7 +16,7 @@ class ExperimentConfig:
     dataloader_prefetch_factor: int = 50
 
     # Data splitting & sequence parameters
-    min_encoder_length: int = 8 * 4    # e.g., 8hrs * 4
+    min_encoder_length: int = 12 * 4    # e.g., 12hrs * 4
     max_encoder_length: Optional[int] = None  # if None, will default to min_encoder_length
     prediction_length: int = 4 * 4     # e.g.,  4hrs * 4
     eval_window: int = 2 * 4            # e.g., 2hrs * 4
@@ -45,8 +45,6 @@ class ExperimentConfig:
     
     microbiome_embed_dim: int = 512 # This is fixed for the current version of the dataset
     
-    project_user_features_to_single_vector: bool = False
-
     # Feature lists (users, food, temporal)
     user_static_categoricals: list = None
     user_static_reals: list = None
@@ -87,9 +85,14 @@ class ExperimentConfig:
     # Training hyperparameters
     batch_size: int = 1024 * 2 
     max_epochs: int = 50
+    optimizer: str = "adamw"
     optimizer_lr: float = 1e-4
+    optimizer_lr_scheduler: str = "onecycle"
     optimizer_lr_scheduler_pct_start: float = 0.1
-    weight_decay: float = 0.05
+    optimizer_lr_scheduler_max_lr_multiplier: float = 1.5
+    optimizer_lr_scheduler_anneal_strategy: str = "cos"
+    optimizer_lr_scheduler_cycle_momentum: bool = True
+    optimizer_weight_decay: float = 0.05
     gradient_clip_val: float = 0.1  # Added gradient clipping parameter
 
 
