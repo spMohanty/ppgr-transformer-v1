@@ -82,15 +82,6 @@ def unscale_tensor(tensor: torch.Tensor, target_scales: torch.Tensor) -> torch.T
     Returns:
         Unscaled tensor
     """
-    # Check if inputs contain NaNs
-    if torch.isnan(tensor).any():
-        # Replace NaNs with zeros
-        tensor = torch.nan_to_num(tensor, nan=0.0)
-        
-    if torch.isnan(target_scales).any():
-        # Replace NaNs with reasonable defaults (no scaling)
-        target_scales = torch.nan_to_num(target_scales, nan=1.0)
-    
     # Extract scale parameters
     mean_val = target_scales[:, 0]
     std_val = target_scales[:, 1]

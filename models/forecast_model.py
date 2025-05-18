@@ -289,6 +289,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             dropout=self.config.dropout_rate,
             prescalers=self.prescalers,
         )
+        logger.info(f"Static Variable Selection Input Sizes: {self.static_variable_selection.input_sizes}")
 
         # Define time-varying categories and reals for encoder and decoder
         self.time_varying_categoricals_encoder = self.dataset_metadata["temporal_categoricals"]
@@ -367,7 +368,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
                 else self.shared_single_variable_grns
             ),
         )
-
+        logger.info(f"Encoder Variable Selection Input Sizes: {self.encoder_variable_selection.input_sizes}")
         self.decoder_variable_selection = TransformerVariableSelectionNetwork(
             input_sizes=decoder_input_sizes,
             hidden_size=self.config.hidden_dim,
@@ -383,7 +384,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
                 if not self.config.share_single_variable_networks
                 else self.shared_single_variable_grns
             ),
-        )    
+        )
+        logger.info(f"Decoder Variable Selection Input Sizes: {self.decoder_variable_selection.input_sizes}")
     
     def setup_output_layers(self):
         # post multihead attn processing before the output processing
@@ -516,8 +518,8 @@ class MealGlucoseForecastModel(pl.LightningModule):
         food_real_values = {}
         for idx, name in enumerate(self.dataset_metadata["food_reals"]):
             food_real_values[name] = torch.cat([
-                    past_meal_macros.sum(dim=2)[:,:,0],
-                    future_meal_macros.sum(dim=2)[:,:,0]
+                    past_meal_macros.sum(dim=2)[:,:,idx],
+                    future_meal_macros.sum(dim=2)[:,:,idx]
                 ], dim=1).unsqueeze(-1)
         input_vectors.update(food_real_values)
                 
@@ -600,7 +602,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         causal_mask = nn.Transformer().generate_square_subsequent_mask(T_future).to(
             embeddings_varying_decoder.device
         )
-
+        
         # Pass through the encoder
         transformer_encoder_output = self.transformer_encoder(
             src=embeddings_varying_encoder,  # B x T_enc x hidden
@@ -669,7 +671,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # Unscale predictions to original range
         pred_future = unscale_tensor(output, target_scales)
-        
+                
         # 12. Return appropriate outputs
         if return_attn:
             # Extract attention weights for past and future
