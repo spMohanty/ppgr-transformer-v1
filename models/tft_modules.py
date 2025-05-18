@@ -780,7 +780,7 @@ class InterpretableMultiHeadAttention(nn.Module):
         outputs = self.dropout(outputs)
 
         return outputs, attn
-
+    
 class GatedResidualNetwork(nn.Module):
     def __init__(
         self,

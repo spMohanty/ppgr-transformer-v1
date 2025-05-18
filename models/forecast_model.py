@@ -33,7 +33,7 @@ from .tft_modules import (
     SharedTransformerEncoder, SharedTransformerDecoder,
     CustomTransformerDecoderLayer, TransformerVariableSelectionNetwork
 )
-from .attention import InterpretableMultiHeadAttention
+# from .attention import InterpretableMultiHeadAttention
 from .utils import expand_user_embeddings, get_user_context, get_attention_mask, compute_forecast_metrics, log_fusion_feature_weights, expand_user_embeddings_for_fusion
 from .enums import FusionBlockType, FusionMode, BASE_MODALITIES_PAST, BASE_MODALITIES_FUTURE
 
@@ -479,12 +479,14 @@ class MealGlucoseForecastModel(pl.LightningModule):
         encoder_variables = [
             "target_columns",
             "temporal_categoricals",
-            "temporal_reals"
+            "temporal_reals",
+            "food_reals"
         ]
         # Decoder Variables
         decoder_variables = [
             "temporal_categoricals",
-            "temporal_reals"
+            "temporal_reals",
+            "food_reals"
         ]
         
         # 1. Create input_vectors dictionary
@@ -517,6 +519,17 @@ class MealGlucoseForecastModel(pl.LightningModule):
         }
         input_vectors.update(user_static_cat_embeddings) # Add to Input Vectors
         input_vectors.update(user_real_values) # Add to Input Vectors
+        
+        # Gather Food Variables
+        food_real_values = {}
+        for idx, name in enumerate(self.dataset_metadata["food_reals"]):
+            food_real_values[name] = torch.cat([
+                    past_meal_macros.sum(dim=2)[:,:,0],
+                    future_meal_macros.sum(dim=2)[:,:,0]
+                ], dim=1).unsqueeze(-1)
+        input_vectors.update(food_real_values)
+        
+        ## TODO: Add Meal Embeddings here
 
         ##########  Static Variable Selection  ##########
         # Static Variable Selection
