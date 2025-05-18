@@ -11,217 +11,30 @@ from typing import Dict, Tuple, Optional
 import math
 
 class GatedLinearUnit(nn.Module):
-    """Gated Linear Unit"""
-
-    def __init__(self, input_size: int, hidden_size: int = None, dropout: float = None):
-        super(GatedLinearUnit, self).__init__()
-
-        if hidden_size is None:
-            hidden_size = input_size
+    def __init__(self, input_size: int, hidden_size: int = None, dropout: float = 0.0):
+        """
+        Applies a linear layer followed by dropout and then splits the output
+        into two halves. which is then gated by a GLU activation.
+        """
+        super().__init__()
+        
         self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(input_size, hidden_size)
-        self.sigmoid = nn.Sigmoid()
-        if dropout is not None:
-            self.dropout = nn.Dropout(dropout)
-        else:
-            self.dropout = dropout
-
-    def forward(self, x):
-        if torch.isnan(x).any():
-            # Replace NaN values with zeros
-            x = torch.nan_to_num(x, nan=0.0)
-            
-        # Calculate gating mechanism
-        sig = self.sigmoid(self.fc1(x))
+        self.hidden_size = hidden_size or input_size
+        self.fc = nn.Linear(input_size,  self.hidden_size * 2)
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         
-        # Check for and handle NaN values in sigmoid output
-        if torch.isnan(sig).any():
-            sig = torch.nan_to_num(sig, nan=0.5)  # Use 0.5 as neutral value for sigmoid
-            
-        # Apply linear transformation
-        x_tilde = self.fc2(x)
-        
-        # Check for and handle NaN values in linear output
-        if torch.isnan(x_tilde).any():
-            x_tilde = torch.nan_to_num(x_tilde, nan=0.0)
-            
-        # Apply gating mechanism
-        output = sig * x_tilde
-        
-        # Final NaN check
-        if torch.isnan(output).any():
-            output = torch.nan_to_num(output, nan=0.0)
-            
-        if self.dropout is not None:
-            output = self.dropout(output)
-        return output
+        self.reset_parameters()
 
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.fc.weight)
+        if self.fc.bias is not None:
+            nn.init.zeros_(self.fc.bias)
 
-class VariableSelectionNetwork(nn.Module):
-    def __init__(
-        self,
-        input_sizes: Dict[str, int],
-        hidden_size: int,
-        input_embedding_flags: Dict[str, bool] = {},
-        dropout: float = None,
-        context_size: int = None,
-    ):
-        """
-        Variable selection network.
-        
-        Args:
-            input_sizes: Dict with input sizes for each input variable
-            hidden_size: Size of hidden layers
-            input_embedding_flags: Dict indicating if variables need an embedding
-            dropout: Dropout rate
-            context_size: Size of context vector
-        """
-        super(VariableSelectionNetwork, self).__init__()
-
-        self.hidden_size = hidden_size
-        self.input_sizes = input_sizes
-        self.input_embedding_flags = input_embedding_flags
-        self.dropout = dropout
-
-        if len(self.input_sizes) > 1:
-            self.flattened_grn = GatedResidualNetwork(
-                input_size=sum(self.input_sizes.values()),
-                hidden_size=hidden_size,
-                output_size=len(self.input_sizes),
-                dropout=dropout,
-                context_size=context_size,
-                residual=False,
-            )
-
-        self.single_variable_grns = nn.ModuleDict()
-        for name, input_size in self.input_sizes.items():
-            if self.input_embedding_flags.get(name, False):
-                self.single_variable_grns[name] = TimeDistributedEmbeddingBag(
-                    input_size, hidden_size
-                )
-            else:
-                self.single_variable_grns[name] = GatedResidualNetwork(
-                    input_size=input_size,
-                    hidden_size=hidden_size,
-                    output_size=hidden_size,
-                    dropout=dropout,
-                )
-
-        # Set for holding cached variable encodings
-        self.cached_var_encodings = {}
-        
-    def forward(self, x: Dict[str, torch.Tensor], context: Optional[torch.Tensor] = None):
-        """
-        Forward pass of the variable selection network.
-        
-        Args:
-            x: Dict with input variables
-            context: Optional context vector
-            
-        Returns:
-            Tuple of processed variable tensor and attention weights
-        """
-        # Check that input sizes are correct
-        for name, tensor in x.items():
-            if name not in self.input_sizes:
-                raise ValueError(f"Input variable {name} not found in input_sizes")
-        
-        # Handle NaN values in inputs by replacing with zeros
-        for name, tensor in x.items():
-            if torch.isnan(tensor).any():
-                x[name] = torch.nan_to_num(tensor, nan=0.0)
-                
-        if len(self.input_sizes) > 1:
-            # Concatenate inputs
-            var_encodings = []
-            weight_inputs = []
-
-            # Apply transformations
-            for name, input_network in self.single_variable_grns.items():
-                if name in x:
-                    var_encodings.append(input_network(x[name]))
-                    weight_inputs.append(x[name])
-                else:
-                    # Handle missing variables with zeros
-                    batch_size = next(iter(x.values())).size(0)
-                    time_steps = next(iter(x.values())).size(1) if len(next(iter(x.values())).size()) > 1 else 1
-                    zero_tensor = torch.zeros((batch_size, time_steps, self.input_sizes[name]), 
-                                            device=next(iter(x.values())).device)
-                    var_encodings.append(input_network(zero_tensor))
-                    weight_inputs.append(zero_tensor)
-
-            # Check for NaN values in var_encodings and fix them
-            for i, encoding in enumerate(var_encodings):
-                if torch.isnan(encoding).any():
-                    print(f"WARNING: NaN values detected in variable encoding {i}")
-                    var_encodings[i] = torch.nan_to_num(encoding, nan=0.0)
-
-            # Cache variable encodings (useful for interpretation)
-            self.cached_var_encodings = {name: var_encodings[i] for i, name in enumerate(self.single_variable_grns.keys())}
-
-            # Concatenate weight inputs
-            if len(weight_inputs[0].shape) == 3:
-                # For temporal inputs
-                flatten = torch.cat(weight_inputs, dim=2)
-            else:
-                # For static inputs
-                flatten = torch.cat(weight_inputs, dim=1)
-
-            # Check for NaN values in flattened input
-            if torch.isnan(flatten).any():
-                flatten = torch.nan_to_num(flatten, nan=0.0)
-
-            # Calculate variable weights
-            sparse_weights = self.flattened_grn(flatten, context)
-            
-            # Check for NaN values in weights
-            if torch.isnan(sparse_weights).any():
-                print(f"WARNING: NaN values detected in variable selection weights")
-                sparse_weights = torch.nan_to_num(sparse_weights, nan=1.0 / len(self.input_sizes))
-
-            # Ensure weights are valid probabilities
-            sparse_weights = F.softmax(sparse_weights, dim=-1)
-
-            # Stack variable encodings
-            if len(var_encodings[0].shape) == 3:
-                # For temporal inputs
-                var_encodings = torch.stack(var_encodings, dim=-1)
-                # Apply variable selection weights
-                outputs = var_encodings * sparse_weights.unsqueeze(2)
-                outputs = outputs.sum(dim=-1)
-            else:
-                # For static inputs
-                var_encodings = torch.stack(var_encodings, dim=1)
-                # Apply variable selection weights
-                outputs = var_encodings * sparse_weights.unsqueeze(2)
-                outputs = outputs.sum(dim=1)
-
-            # Final NaN check
-            if torch.isnan(outputs).any():
-                print(f"WARNING: NaN values detected in variable selection outputs")
-                outputs = torch.nan_to_num(outputs, nan=0.0)
-                
-            return outputs, sparse_weights
-        else:
-            # For single variable, just apply the transformation
-            name = next(iter(self.single_variable_grns.keys()))
-            var_encoding = self.single_variable_grns[name](x[name])
-            
-            # Handle NaN values
-            if torch.isnan(var_encoding).any():
-                var_encoding = torch.nan_to_num(var_encoding, nan=0.0)
-                
-            # Create dummy weights
-            if len(var_encoding.shape) == 3:
-                batch_size, time_steps, _ = var_encoding.shape
-                sparse_weights = torch.ones((batch_size, time_steps, 1), device=var_encoding.device)
-            else:
-                batch_size, _ = var_encoding.shape
-                sparse_weights = torch.ones((batch_size, 1), device=var_encoding.device)
-                
-            return var_encoding, sparse_weights
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.dropout(x)
+        x = self.fc(x)
+        x = F.glu(x, dim=-1)
+        return x
 
 class AddNorm(nn.Module):
     def __init__(
@@ -233,9 +46,10 @@ class AddNorm(nn.Module):
         self.trainable_add = trainable_add
         self.skip_size = skip_size or input_size
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
-        
         if self.input_size != self.skip_size:
-            self.resample = nn.Linear(skip_size, input_size)
+            self.resample = TimeDistributedInterpolation(
+                self.input_size, batch_first=True, trainable=False
+            )
 
         if self.trainable_add:
             self.mask = nn.Parameter(torch.zeros(self.input_size, dtype=torch.float))
@@ -288,27 +102,19 @@ class PreNormResidualBlock(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, output_dim)
         self.dropout = nn.Dropout(dropout)
         
-        # Optional projection for residual connection if input and output dimensions differ
-        self.skip_proj = nn.Linear(input_dim, output_dim) if input_dim != output_dim else None
-        
         self.context_layer = nn.Linear(context_dim, hidden_dim) if context_dim is not None else None
     
     def forward(self, x: torch.Tensor, context: torch.Tensor = None) -> torch.Tensor:
         # Apply layer norm before feed-forward block
         x_norm = self.norm1(x)
         hidden = self.fc1(x_norm)
-        if context is not None and self.context_layer is not None:
+        if context is not None:
             hidden = hidden + self.context_layer(context)
         hidden = self.act(hidden)
         hidden = self.dropout(hidden)
         out = self.fc2(hidden)
         out = self.dropout(out)
-        
-        # Apply projection for residual if dimensions don't match
-        if self.skip_proj is not None:
-            return self.skip_proj(x) + out
-        else:
-            return x + out  # residual connection
+        return x + out  # residual connection
 
 
 class SharedTransformerEncoder(nn.Module):
@@ -346,80 +152,16 @@ class SharedTransformerDecoder(nn.Module):
         self.num_layers = num_layers
 
     def forward(self, tgt, memory, tgt_mask=None, 
-                memory_mask=None, tgt_key_padding_mask=None, 
-                memory_key_padding_mask=None, return_attn=False):
-        """
-        Forward pass through the shared decoder layer.
-        
-        Args:
-            tgt: Target sequence
-            memory: Source sequence from encoder
-            tgt_mask: Target sequence mask
-            memory_mask: Memory mask
-            tgt_key_padding_mask: Target key padding mask
-            memory_key_padding_mask: Memory key padding mask
-            return_attn: Whether to return attention weights
-            
-        Returns:
-            output: Decoder output
-            attn: Attention weights if return_attn=True
-        """
+                tgt_key_padding_mask=None, memory_key_padding_mask=None):
         output = tgt
-        attn = None
-        
-        for i in range(self.num_layers):
-            # Only return attention on the last layer if requested
-            if return_attn and i == self.num_layers - 1:
-                try:
-                    output, layer_attn = self.shared_layer(
-                        output,
-                        memory,
-                        tgt_mask=tgt_mask,
-                        memory_mask=memory_mask,
-                        tgt_key_padding_mask=tgt_key_padding_mask,
-                        memory_key_padding_mask=memory_key_padding_mask,
-                        return_attn=True
-                    )
-                    attn = layer_attn
-                except Exception as e:
-                    print(f"Warning: Failed to get attention weights: {e}")
-                    # Create a fallback attention with proper shape
-                    batch_size = tgt.shape[0]
-                    seq_len_tgt = tgt.shape[1]
-                    seq_len_mem = memory.shape[1]
-                    attn = torch.ones(batch_size, seq_len_tgt, seq_len_mem, device=tgt.device) / seq_len_mem
-                    
-                    # Continue processing without attention
-                    output = self.shared_layer(
-                        output,
-                        memory,
-                        tgt_mask=tgt_mask,
-                        memory_mask=memory_mask,
-                        tgt_key_padding_mask=tgt_key_padding_mask,
-                        memory_key_padding_mask=memory_key_padding_mask,
-                        return_attn=False
-                    )
-            else:
-                output = self.shared_layer(
-                    output,
-                    memory,
-                    tgt_mask=tgt_mask,
-                    memory_mask=memory_mask,
-                    tgt_key_padding_mask=tgt_key_padding_mask,
-                    memory_key_padding_mask=memory_key_padding_mask,
-                )
-        
-        # If we're returning attention but didn't get any, create a fallback
-        if return_attn and attn is None:
-            print("Warning: No attention weights returned from decoder layers")
-            batch_size = tgt.shape[0]
-            seq_len_tgt = tgt.shape[1]
-            seq_len_mem = memory.shape[1]
-            attn = torch.ones(batch_size, seq_len_tgt, seq_len_mem, device=tgt.device) / seq_len_mem
-            
-        # Return output with or without attention
-        if return_attn:
-            return output, attn
+        for _ in range(self.num_layers):
+            output = self.shared_layer(
+                output,
+                memory,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+            )
         return output
 
 class TransformerVariableSelectionNetwork(nn.Module):
@@ -591,117 +333,6 @@ class TransformerVariableSelectionNetwork(nn.Module):
 
         return output, variable_selection_weights
 
-# Custom TransformerDecoderLayer that supports returning attention weights
-class CustomTransformerDecoderLayer(nn.Module):
-    """
-    Custom TransformerDecoderLayer implementation that allows returning attention weights.
-    Based on PyTorch's TransformerDecoderLayer but modified to return attention weights.
-    """
-    def __init__(
-        self, 
-        d_model: int, 
-        nhead: int, 
-        dim_feedforward: int = 2048, 
-        dropout: float = 0.1, 
-        activation: str = "relu",
-        batch_first: bool = True
-    ):
-        super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
-        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
-        
-        # Feed-forward network
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-
-        # Normalization layers
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
-        
-        # Dropout layers
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.dropout3 = nn.Dropout(dropout)
-
-        # Activation
-        self.activation = F.relu if activation == "relu" else F.gelu
-        
-    def forward(
-        self, 
-        tgt: torch.Tensor, 
-        memory: torch.Tensor, 
-        tgt_mask: Optional[torch.Tensor] = None,
-        memory_mask: Optional[torch.Tensor] = None,
-        tgt_key_padding_mask: Optional[torch.Tensor] = None,
-        memory_key_padding_mask: Optional[torch.Tensor] = None,
-        return_attn: bool = False
-    ):
-        """
-        Forward pass with option to return attention weights.
-        
-        Args:
-            tgt: Target sequence
-            memory: Source sequence from encoder
-            tgt_mask: Target sequence mask
-            memory_mask: Memory mask
-            tgt_key_padding_mask: Target key padding mask
-            memory_key_padding_mask: Memory key padding mask
-            return_attn: Whether to return attention weights
-            
-        Returns:
-            output: Decoder layer output
-            attn: Attention weights if return_attn=True
-        """
-        # Self-attention block
-        tgt2 = self.norm1(tgt)
-        tgt2, _ = self.self_attn(
-            tgt2, tgt2, tgt2,
-            attn_mask=tgt_mask,
-            key_padding_mask=tgt_key_padding_mask
-        )
-        tgt = tgt + self.dropout1(tgt2)
-
-        # Cross-attention block
-        tgt2 = self.norm2(tgt)
-        try:
-            tgt2, attn_weights = self.multihead_attn(
-                tgt2, memory, memory,
-                attn_mask=memory_mask,
-                key_padding_mask=memory_key_padding_mask
-            )
-            
-            # Validate the attention weights
-            if attn_weights is None or torch.isnan(attn_weights).any() or torch.all(attn_weights == 0):
-                # Create uniform attention as fallback
-                batch_size = tgt.size(0)
-                tgt_len = tgt.size(1)
-                src_len = memory.size(1)
-                attn_weights = torch.ones(batch_size, tgt_len, src_len, device=tgt.device) / src_len
-                
-        except Exception as e:
-            print(f"Warning: Error computing cross-attention: {e}")
-            # Create uniform attention as fallback
-            batch_size = tgt.size(0)
-            tgt_len = tgt.size(1)
-            src_len = memory.size(1)
-            attn_weights = torch.ones(batch_size, tgt_len, src_len, device=tgt.device) / src_len
-            
-            # Apply a simple attention computation as fallback
-            tgt2 = torch.matmul(attn_weights, memory)
-            
-        tgt = tgt + self.dropout2(tgt2)
-
-        # Feed-forward block
-        tgt2 = self.norm3(tgt)
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
-        tgt = tgt + self.dropout3(tgt2)
-
-        if return_attn:
-            return tgt, attn_weights
-        else:
-            return tgt
 
 class ScaledDotProductAttention(nn.Module):
     def __init__(self, dropout: float = None, scale: bool = True):
@@ -781,137 +412,3 @@ class InterpretableMultiHeadAttention(nn.Module):
 
         return outputs, attn
     
-class GatedResidualNetwork(nn.Module):
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: int,
-        output_size: int,
-        dropout: float = None,
-        context_size: Optional[int] = None,
-        residual: bool = True,
-    ):
-        """
-        Gated Residual Network as described in the TFT paper.
-        
-        Args:
-            input_size: Input size
-            hidden_size: Hidden layer size
-            output_size: Output size
-            dropout: Dropout rate
-            context_size: External context size
-            residual: Whether to use residual connection
-        """
-        super(GatedResidualNetwork, self).__init__()
-        
-        self.input_size = input_size
-        self.output_size = output_size
-        self.context_size = context_size
-        self.hidden_size = hidden_size
-        self.residual = residual
-
-        # Setup layers
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.elu = nn.ELU()
-        
-        # Optional context layer for conditioning
-        if context_size is not None:
-            self.context_layer = nn.Linear(context_size, hidden_size, bias=False)
-            
-        self.fc2 = nn.Linear(hidden_size, output_size)
-        self.dropout = nn.Dropout(dropout) if dropout is not None else nn.Identity()
-        
-        # Skip connection mapping if input and output have different sizes
-        if self.residual and (input_size != output_size):
-            self.skip_layer = nn.Linear(input_size, output_size)
-        
-        # GLU for gates
-        self.gate = nn.Linear(input_size, output_size)
-        self.sigmoid = nn.Sigmoid()
-        
-        # Layer normalization for output
-        self.norm = nn.LayerNorm(output_size)
-    
-    def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Forward pass for GRN.
-        
-        Args:
-            x: Input tensor
-            context: Optional context tensor for conditioning
-            
-        Returns:
-            Processed tensor
-        """
-        # Handle NaN values in input
-        if torch.isnan(x).any():
-            x = torch.nan_to_num(x, nan=0.0)
-            
-        # Get residual connection ready
-        if self.residual:
-            residual = x
-            if hasattr(self, "skip_layer"):
-                residual = self.skip_layer(x)
-        
-        # Main network
-        output = self.fc1(x)
-        
-        # Check for NaN values after first layer
-        if torch.isnan(output).any():
-            print(f"WARNING: NaN values detected in GRN after fc1")
-            output = torch.nan_to_num(output, nan=0.0)
-        
-        # Add context if provided
-        if self.context_size is not None and context is not None:
-            # Handle NaN values in context
-            if torch.isnan(context).any():
-                context = torch.nan_to_num(context, nan=0.0)
-                
-            context_output = self.context_layer(context)
-            
-            # Check for NaN values after context layer
-            if torch.isnan(context_output).any():
-                print(f"WARNING: NaN values detected in GRN after context_layer")
-                context_output = torch.nan_to_num(context_output, nan=0.0)
-                
-            output = output + context_output
-        
-        # Apply activation and second layer
-        output = self.elu(output)
-        output = self.dropout(output)
-        output = self.fc2(output)
-        
-        # Check for NaN values after second layer
-        if torch.isnan(output).any():
-            print(f"WARNING: NaN values detected in GRN after fc2")
-            output = torch.nan_to_num(output, nan=0.0)
-        
-        # Gating mechanism
-        gate = self.sigmoid(self.gate(x))
-        
-        # Check for NaN values in gate
-        if torch.isnan(gate).any():
-            print(f"WARNING: NaN values detected in GRN gate")
-            gate = torch.nan_to_num(gate, nan=0.5)  # Neutral value for sigmoid
-            
-        # Apply gate
-        output = gate * output
-        
-        # Add residual if needed
-        if self.residual:
-            output = output + residual
-            
-        # Check for NaN values after residual
-        if torch.isnan(output).any():
-            print(f"WARNING: NaN values detected in GRN after residual")
-            output = torch.nan_to_num(output, nan=0.0)
-        
-        # Apply normalization
-        output = self.norm(output)
-        
-        # Final NaN check
-        if torch.isnan(output).any():
-            print(f"WARNING: NaN values detected in GRN output after norm")
-            output = torch.nan_to_num(output, nan=0.0)
-            
-        return output 

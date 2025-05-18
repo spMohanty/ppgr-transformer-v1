@@ -31,9 +31,8 @@ from .positional_embeddings import RotaryPositionalEmbeddings
 from .tft_modules import (
     GatedLinearUnit, AddNorm, GateAddNorm, PreNormResidualBlock,
     SharedTransformerEncoder, SharedTransformerDecoder,
-    CustomTransformerDecoderLayer, TransformerVariableSelectionNetwork
+    TransformerVariableSelectionNetwork, InterpretableMultiHeadAttention
 )
-# from .attention import InterpretableMultiHeadAttention
 from .utils import expand_user_embeddings, get_user_context, get_attention_mask, compute_forecast_metrics, log_fusion_feature_weights, expand_user_embeddings_for_fusion
 from .enums import FusionBlockType, FusionMode, BASE_MODALITIES_PAST, BASE_MODALITIES_FUTURE
 
@@ -45,9 +44,6 @@ from .losses import quantile_loss, compute_iAUC, unscale_tensor, calculate_corre
 from pytorch_forecasting.models.nn import MultiEmbedding
 from pytorch_forecasting.utils import get_embedding_size, create_mask
 
-from pytorch_forecasting.models.temporal_fusion_transformer.sub_modules import (
-    InterpretableMultiHeadAttention,
-)
 
 
 class MealGlucoseForecastModel(pl.LightningModule):
@@ -300,10 +296,10 @@ class MealGlucoseForecastModel(pl.LightningModule):
 
         # Define time-varying categories and reals for encoder and decoder
         self.time_varying_categoricals_encoder = self.dataset_metadata["temporal_categoricals"]
-        self.time_varying_reals_encoder = self.dataset_metadata["temporal_reals"] + ["val"]  # Include glucose (target)
+        self.time_varying_reals_encoder = self.dataset_metadata["temporal_reals"] + ["val"]  + self.dataset_metadata["food_reals"]
         
         self.time_varying_categoricals_decoder = self.dataset_metadata["temporal_categoricals"]
-        self.time_varying_reals_decoder = self.dataset_metadata["temporal_reals"]
+        self.time_varying_reals_decoder = self.dataset_metadata["temporal_reals"] + self.dataset_metadata["food_reals"]
         
         # Create MultiEmbedding for time varying categoricals if not already created
         self.temporal_categorical_embeddings = MultiEmbedding(
@@ -551,8 +547,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         for variable_group_name in encoder_variables:
             for variable in self.dataset_metadata[variable_group_name]:
                 embeddings_varying_encoder[variable] = input_vectors[variable][:, :max_encoder_length]
-                
-                
+                        
         embeddings_varying_encoder, encoder_sparse_weights = (
             self.encoder_variable_selection(
                 embeddings_varying_encoder,

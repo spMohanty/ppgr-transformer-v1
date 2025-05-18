@@ -94,15 +94,15 @@ class ExperimentConfig:
     cross_modal_fusion_mode: str = "query_token"
     
     # New dropout hyperparameters
-    dropout_rate: float = 0.2          # Used for projections, cross-attention, forecast MLP, etc.
-    transformer_dropout: float = 0.1   # Used within Transformer layers
+    dropout_rate: float = 0.15         # Used for projections, cross-attention, forecast MLP, etc.
+    transformer_dropout: float = 0.15   # Used within Transformer layers
 
     # Training hyperparameters
     batch_size: int = 1024 * 2 
     max_epochs: int = 50
-    optimizer_lr: float = 2e-4
+    optimizer_lr: float = 1e-4
     optimizer_lr_scheduler_pct_start: float = 0.1
-    weight_decay: float = 4e-6
+    weight_decay: float = 0.05
     gradient_clip_val: float = 0.1  # Added gradient clipping parameter
 
 
