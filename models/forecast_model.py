@@ -130,9 +130,9 @@ class MealGlucoseForecastModel(pl.LightningModule):
             food_group_names=self.food_group_names,
             positional_embedding=None,  # We'll initialize this later
             max_meals=config.max_meals,
-            num_heads=config.num_heads,
-            num_layers=config.transformer_encoder_layers,
-            layers_share_weights=config.transformer_encoder_layers_share_weights,
+            num_heads=config.meal_transformer_num_heads,
+            num_layers=config.meal_transformer_encoder_layers,
+            layers_share_weights=config.meal_transformer_encoder_layers_share_weights,
             dropout_rate=config.dropout_rate,
             transformer_dropout=config.transformer_dropout,
             ignore_food_macro_features=config.ignore_food_macro_features,
@@ -754,18 +754,10 @@ class MealGlucoseForecastModel(pl.LightningModule):
         # Compute metrics - similar to model.py's step function
         metrics = self._compute_forecast_metrics(past_glucose, future_glucose, target_scales, preds)
         
-        # Log metrics with phase prefix - similar to model.py logging
+        # Log metrics with phase prefix
         for key, value in metrics["metrics"].items():
             # Log with more specific parameters to ensure visibility in progress bar
-            self.log(
-                f"{phase}_{key}", 
-                value, 
-                on_step=True, 
-                on_epoch=True, 
-                prog_bar=True,
-                logger=True,
-                sync_dist=True
-            )
+            self.log(f"{phase}_{key}", value, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         
         # Add iAUC correlation to progress bar - custom addition beyond model.py
         if f"pred_iAUC_{self.eval_window}" in metrics and f"true_iAUC_{self.eval_window}" in metrics:
@@ -810,7 +802,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
             self.example_meal_self_attn_past = meal_self_attn_past
             self.example_meal_self_attn_future = meal_self_attn_future
         
-        return metrics["metrics"]["q_loss"]
+        return metrics["metrics"]["total_loss"]
 
     def validation_step(self, batch, batch_idx):
         """
@@ -868,16 +860,9 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # Log detailed metrics
         for key, value in metrics["metrics"].items():
-            # Use the format train_step_X for consistency
-            self.log(
-                f"train_step_{key}", 
-                value, 
-                on_step=True, 
-                on_epoch=True, 
-                prog_bar=True,
-                logger=True
-            )
-            
+            # Use the format train_X for consistency with val/test
+            self.log(f"train_{key}", value, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+                        
         # Add iAUC metrics to progress bar if available
         if f"pred_iAUC_{self.eval_window}" in metrics and f"true_iAUC_{self.eval_window}" in metrics:
             pred_iauc = metrics[f"pred_iAUC_{self.eval_window}"]
@@ -893,12 +878,20 @@ class MealGlucoseForecastModel(pl.LightningModule):
                 on_step=True,
                 on_epoch=True,
                 prog_bar=True,
-                logger=True
+                logger=True,
+                sync_dist=True
             )
             
-        # Key metrics for progress monitoring
-        self.log("train_loss", metrics["metrics"]["total_loss"], prog_bar=True, on_step=True)
-        self.log("train_rmse", metrics["metrics"]["rmse"], prog_bar=True, on_step=True)
+            # Also log iAUC loss metrics
+            self.log(
+                f"train_iAUC_eh{self.eval_window}_loss",
+                metrics["metrics"][f"iAUC_eh{self.eval_window}_loss"],
+                on_step=True,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+                sync_dist=True
+            )
             
         return metrics["metrics"]["total_loss"]
 
@@ -940,10 +933,7 @@ class MealGlucoseForecastModel(pl.LightningModule):
         median_pred = predictions[:, :, median_idx]
         median_pred_eval = median_pred[:, :self.eval_window]
         future_glucose_unscaled_eval = future_glucose_unscaled[:, :self.eval_window]
-        
-        # Clamp predictions to physiological range (2.0-30.0 mmol/L) to avoid extreme values
-        median_pred_eval = torch.clamp(median_pred_eval, 2.0, 30.0)
-        
+                
         # Flatten predictions and targets to 1D contiguous tensors to avoid view errors in torchmetrics
         pred_flat = median_pred_eval.contiguous().reshape(-1)
         target_flat = future_glucose_unscaled_eval.contiguous().reshape(-1)
@@ -965,10 +955,10 @@ class MealGlucoseForecastModel(pl.LightningModule):
         return {
             "metrics": {
                 "q_loss": q_loss,
-                "rmse": rmse,
-                "mae": mae,
-                "mape": mape,
-                "smape": smape,
+                f"rmse_eh{self.eval_window}": rmse,
+                f"mae_eh{self.eval_window}": mae,
+                f"mape_eh{self.eval_window}": mape,
+                f"smape_eh{self.eval_window}": smape,
                 f"iAUC_eh{self.eval_window}_loss": iAUC_loss,
                 f"iAUC_eh{self.eval_window}_weighted_loss": weighted_iAUC_loss,
                 "total_loss": total_loss,
@@ -1109,8 +1099,13 @@ class MealGlucoseForecastModel(pl.LightningModule):
         
         # Log metrics - similar to model.py's logging
         self.logger.experiment.log({f"{phase}_iAUC_eh{self.eval_window}_correlation": corr.item()})
-        # Also log correlation to Lightning metrics
-        self.log(f"{phase}_iAUC_eh{self.eval_window}_correlation", corr.item(), on_step=False, on_epoch=True, prog_bar=True)
+        
+        # Also log epoch-level metrics for the progress bar with highlight for important ones
+        self.log(f"{phase}_epoch_iAUC_eh{self.eval_window}_correlation", corr.item(), on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        
+        # Calculate and log average q_loss at epoch level
+        avg_q_loss = torch.stack([output[f"{phase}_q_loss"] for output in outputs]).mean()
+        self.log(f"{phase}_epoch_q_loss", avg_q_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         
         # Clear outputs for the next epoch
         setattr(self, f"{phase}_outputs", [])

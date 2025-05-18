@@ -16,7 +16,7 @@ class ExperimentConfig:
     dataloader_prefetch_factor: int = 50
 
     # Data splitting & sequence parameters
-    min_encoder_length: int = 12 * 4    # e.g., 8hrs * 4
+    min_encoder_length: int = 8 * 4    # e.g., 8hrs * 4
     max_encoder_length: Optional[int] = None  # if None, will default to min_encoder_length
     prediction_length: int = 4 * 4     # e.g.,  4hrs * 4
     eval_window: int = 2 * 4            # e.g., 2hrs * 4
@@ -62,37 +62,24 @@ class ExperimentConfig:
     hidden_dim: int = 256
     hidden_continuous_dim: int = 128
     
-    num_heads: int = 4
-    transformer_encoder_layers: int = 2
-    transformer_encoder_layers_share_weights: bool = True
-    transformer_decoder_layers: int = 2
-    transformer_decoder_layers_share_weights: bool = True
-    add_residual_connection_before_predictions: bool = True
-    add_residual_connection_before_meal_timestep_embedding: bool = True
-    num_quantiles: int = 7
-    loss_iauc_weight: float = 0.00
-    
-    
-    
-    ### New Variables
+    ### Main Transformer Encoder-Decoder
     transformer_encoder_decoder_num_heads: int = 4
     transformer_encoder_decoder_num_layers: int = 4
     transformer_encoder_decoder_hidden_size: int = 32
     variable_selection_network_n_heads: int = 4 
-    
     share_single_variable_networks: bool = False
     
-    # Fusion block configuration
-    # fusion_block_type: Choice between two fusion approaches:
-    # - 'cmf': CrossModalFusion - Fuses modalities using multi-head attention
-    # - 'vsn': VariableSelectionNetwork - Uses a CLS token approach for attention
-    fusion_block_type: str = "vsn"
+    # Meal Transformer
+    meal_transformer_num_heads: int = 4
+    meal_transformer_encoder_layers: int = 4
+    meal_transformer_encoder_layers_share_weights: bool = True
     
-    # cross_modal_fusion_mode: Mode for CrossModalFusion (only applies when fusion_block_type='cmf')
-    # - 'mean_pooling': Original approach with self-attention across modalities followed by mean pooling
-    # - 'query_token': Uses a learnable query token to attend to all modalities (similar to VSN)
-    cross_modal_fusion_mode: str = "query_token"
     
+    add_residual_connection_before_predictions: bool = True
+    add_residual_connection_before_meal_timestep_embedding: bool = True
+    num_quantiles: int = 7
+    loss_iauc_weight: float = 0.00    
+            
     # New dropout hyperparameters
     dropout_rate: float = 0.15         # Used for projections, cross-attention, forecast MLP, etc.
     transformer_dropout: float = 0.15   # Used within Transformer layers
@@ -188,6 +175,7 @@ def generate_experiment_name(config: ExperimentConfig, kwargs: dict) -> str:
         
         # Sequence parameters
         'min_encoder_length': 'enc',
+        'max_encoder_length': 'max_enc',
         'prediction_length': 'pred',
         'encoder_length_randomization': 'encL_rand',
         'eval_window': 'eval',
@@ -205,22 +193,28 @@ def generate_experiment_name(config: ExperimentConfig, kwargs: dict) -> str:
         'use_bootstraped_food_embeddings': 'boot_emb',
         'use_microbiome_embeddings': 'micro_emb',
         'use_simple_meal_encoder': 'simple_meal',
+        'ignore_food_macro_features': 'ignore_macro',
+        'freeze_food_id_embeddings': 'freeze_emb',
+        'project_user_features_to_single_vector': 'proj_user',
         
         # Model architecture
         'food_embed_dim': 'food_emb',
-        'food_embed_adapter_dim': 'food_adapt',
         'hidden_dim': 'h',
-        'num_heads': 'heads',
-        'transformer_encoder_layers': 'enc_layers',
-        'transformer_decoder_layers': 'dec_layers',
+        'hidden_continuous_dim': 'h_cont',
+        'max_meals': 'max_meals',
+        'transformer_encoder_decoder_num_heads': 'tf_heads',
+        'transformer_encoder_decoder_num_layers': 'tf_layers',
+        'transformer_encoder_decoder_hidden_size': 'tf_hidden',
+        'meal_transformer_num_heads': 'meal_heads',
+        'meal_transformer_encoder_layers': 'meal_layers',
+        'meal_transformer_encoder_layers_share_weights': 'meal_share',
+        'variable_selection_network_n_heads': 'vsn_heads',
+        'share_single_variable_networks': 'share_vsn',
         'add_residual_connection_before_predictions': 'res_pred',
+        'add_residual_connection_before_meal_timestep_embedding': 'res_meal',
         'num_quantiles': 'quantiles',
         'loss_iauc_weight': 'iauc_wt',
-        'add_glucose_causal_mask': 'gluc_causal_mask',
-        # Fusion block parameters
-        'fusion_block_type': 'fusion_type',
-        'cross_modal_fusion_mode': 'cmf_mode',
-        
+                
         # Dropout
         'dropout_rate': 'drop',
         'transformer_dropout': 'tdrop',
@@ -229,24 +223,19 @@ def generate_experiment_name(config: ExperimentConfig, kwargs: dict) -> str:
         'batch_size': 'bs',
         'max_epochs': 'epochs',
         'optimizer_lr': 'lr',
+        'optimizer_lr_scheduler_pct_start': 'lr_pct',
         'weight_decay': 'wd',
         'gradient_clip_val': 'clip',
-        
-        # Logging
-        'wandb_project': 'wandb',
-        'wandb_run_name': 'run',
-        
-        # Precision
         'precision': 'prec',
         
-        # Food embedding projection
-        'food_embedding_projection_batch_size': 'proj_bs',
+        # WandB
+        'wandb_project': 'wandb',
+        'wandb_run_name': 'run',
+        'wandb_log_embeddings': 'log_emb',
         
-        # Plots
+        # Plots and misc
         'disable_plots': 'no_plots',
-        
-        # WandB logging
-        'wandb_log_embeddings': 'log_emb'
+        'microbiome_embed_dim': 'micro_dim'
     }
     
     # Build name components for modified parameters

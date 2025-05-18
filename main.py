@@ -169,7 +169,7 @@ def prepare_callbacks(config: ExperimentConfig, model: MealGlucoseForecastModel,
         pct_start=config.optimizer_lr_scheduler_pct_start,
     )
     
-    callbacks = [rich_model_summary, lr_scheduler]    
+    callbacks = [rich_model_summary, lr_scheduler, rich_progress_bar]
 
     if not config.disable_checkpoints:    
         # Create checkpoint directory if it doesn't exist
