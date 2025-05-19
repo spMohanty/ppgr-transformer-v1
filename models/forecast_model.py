@@ -206,11 +206,16 @@ class MealGlucoseForecastModel(pl.LightningModule):
         self.post_transformer_gate_encoder = GatedLinearUnit(
             self.config.hidden_dim, dropout=self.config.dropout_rate
         )
-        self.post_transformer_gate_decoder = self.post_transformer_gate_encoder
+        self.post_transformer_gate_decoder = GatedLinearUnit(
+            self.config.hidden_dim, dropout=self.config.dropout_rate
+        )
+        
         self.post_transformer_add_norm_encoder = AddNorm(
             self.config.hidden_dim, trainable_add=False
         )
-        self.post_transformer_add_norm_decoder = self.post_transformer_add_norm_encoder
+        self.post_transformer_add_norm_decoder = AddNorm(
+            self.config.hidden_dim, trainable_add=False
+        )
     
     def setup_static_categorical_embeddings(self):
         user_static_categoricals = []

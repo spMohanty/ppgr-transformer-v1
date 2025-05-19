@@ -34,7 +34,7 @@ def compute_iAUC(
     Compute the incremental Area Under the Curve (iAUC) for glucose predictions.
     
     Args:
-        median_pred: Median prediction tensor (B, T)
+        median_pred: Median prediction tensor (B, T) (already unscaled)
         future_glucose: Future glucose values tensor (B, T)
         past_glucose: Past glucose values tensor (B, T_past)
         target_scales: Scaling factors (B, 2) for min/max
@@ -42,7 +42,7 @@ def compute_iAUC(
         
     Returns:
         Tuple of predicted iAUC and true iAUC tensors (B,)
-    """
+    """    
     # Unscale past glucose
     past_glucose_unscaled = past_glucose * target_scales[:, 1].unsqueeze(1) + target_scales[:, 0].unsqueeze(1)
     
