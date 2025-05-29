@@ -181,6 +181,8 @@ class PPGRTimeSeriesDataset(Dataset):
                         categorical_encoders: Dict[str, NaNLabelEncoder] = {},  # These have to be provided to avoid mistakes
                         continuous_scalers: Dict[str, StandardScaler] = {}, # These have to be provided to avoid mistakes
                         
+                        disable_target_scaling: bool = True,
+                        
                         device: torch.device = torch.device("cpu")
                     ):
         self.ppgr_df = ppgr_df
@@ -226,6 +228,8 @@ class PPGRTimeSeriesDataset(Dataset):
         self.group_by_columns = group_by_columns
         self.categorical_encoders = categorical_encoders
         self.continuous_scalers = continuous_scalers
+        
+        self.disable_target_scaling = disable_target_scaling
         
         self.device = device
         
@@ -327,13 +331,27 @@ class PPGRTimeSeriesDataset(Dataset):
         self.df_scaled = self.ppgr_df.copy() # NOTE: This should be the merged dataframe by now
         
         assert (self.df_scaled.index == self.ppgr_df.index).all()
-        
+                
         # Scale the continuous variables
         for col in self.main_df_scaled_all_real_columns:
-            logger.debug(f"Scaling {col}")            
-            self.df_scaled[col] = self.continuous_scalers[col].transform(
-                self.df_scaled[col].to_numpy().reshape(-1, 1)
-            )
+            if self.disable_target_scaling: 
+                if col not in self.target_columns:
+                    logger.debug(f"Scaling {col}")            
+                    self.df_scaled[col] = self.continuous_scalers[col].transform(
+                        self.df_scaled[col].to_numpy().reshape(-1, 1)
+                    )
+                else:
+                    # Disable scaling for target columns
+                    for col in self.target_columns:
+                        logger.debug(f"Target scaling disabled for {col}. Copying values verbatim")
+                        # Copy values verbatim
+                        self.df_scaled[col] = self.df_scaled[col]
+            else:
+                logger.debug(f"Scaling {col}")            
+                self.df_scaled[col] = self.continuous_scalers[col].transform(
+                    self.df_scaled[col].to_numpy().reshape(-1, 1)
+                )
+                
             
         ### 2. Encode the categorical variables
         for col in self.main_df_scaled_all_categorical_columns:            
@@ -343,7 +361,13 @@ class PPGRTimeSeriesDataset(Dataset):
         # Add target scales to conveniently access in __getitem__
         self.target_scales =[]
         for col in self.target_columns:
-            self.target_scales.append([self.continuous_scalers[col].mean_, self.continuous_scalers[col].scale_])
+            if not self.disable_target_scaling:
+                mean = self.continuous_scalers[col].mean_
+                std = self.continuous_scalers[col].scale_
+            else:
+                mean, std = 0, 1                
+            self.target_scales.append([mean, std])
+            
         self.target_scales = torch.tensor(np.array(self.target_scales)).to(self.device).squeeze()
         
         # reset the index so we can start from index 0 and maintain a continuous index that aligns with the torch indexing system

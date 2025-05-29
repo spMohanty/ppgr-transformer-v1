@@ -358,36 +358,6 @@ def scale_tensor(tensor, scales):
     return (tensor - mean) / std
 
 
-def unscale_tensor(tensor, target_scales):
-    """
-    Unscale the given tensor using target_scales.
-    
-    If target_scales has two columns, the first column is treated as the offset and
-    the second as the scaling factor. If it only has one column, we assume that it's
-    the scaling factor and the offset is zero.
-    
-    tensor: A torch.Tensor to be unscaled.
-    target_scales: A torch.Tensor of shape [B, 1] or [B, 2].
-    
-    Returns:
-        The unscaled tensor.
-    """
-    if target_scales.size(1) == 1:
-        # Only a scaling factor is provided; assume offset=0.
-        offset = torch.zeros_like(target_scales)
-        scale = target_scales
-    else:
-        offset = target_scales[:, 0]
-        scale = target_scales[:, 1]
-
-    # Ensure offset and scale are broadcastable with tensor.
-    # For example, if tensor is [B, T, ...], we want offset and scale to be [B, 1, ...]
-    for _ in range(tensor.ndim - 1):
-        offset = offset.unsqueeze(-1)
-        scale = scale.unsqueeze(-1)
-    return tensor * scale + offset 
-
-
 def create_click_options(config_class: Type[Any]) -> Callable:
     """
     Create a decorator that adds Click options based on the fields of a 

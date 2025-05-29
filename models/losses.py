@@ -99,13 +99,7 @@ def unscale_tensor(tensor: torch.Tensor, target_scales: torch.Tensor) -> torch.T
     else:
         raise ValueError(f"Unsupported tensor dimension: {tensor.dim()}")
     
-    # Clip extreme values to prevent NaNs in subsequent calculations
-    # Glucose values typically range from ~40 to ~400 mg/dL
-    # Or approximately 2.5 to 22 mmol/L in SI units
-    min_glucose = 2.0   # Below physiological range but allow for some prediction error
-    max_glucose = 30.0  # Above physiological range but allow for some prediction error
-    
-    return torch.clamp(unscaled, min=min_glucose, max=max_glucose)
+    return unscaled
 
 
 def calculate_correlation(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
