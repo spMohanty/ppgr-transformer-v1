@@ -394,11 +394,14 @@ class PPGRTimeSeriesDataset(Dataset):
             
             # In this mode, the food_id and food_group_cname are the categorical columns
             
+            # Keep a track of the normalized baselines for all food real columns
+            self.food_reals_normalized_zero = {} # Store the normalized version of 0.0 for the said column
             # Scale the continuous variables
             for col in self.food_reals:
                 logger.debug(f"Scaling {col}")
                 # Note: in this mode, the continuous scalers are already fit on the dishes data (instead of that of the ppgr_df)
                 # check setup_scalers_and_encoders in utils.py for more details
+
                 
                 # temporary: some column values may be nan, so we fillna with 0 first (this is not the case for the ppgr_df)
                 # ideally, we should move this pre-processing to the fay-data-aggregator. 
@@ -408,11 +411,21 @@ class PPGRTimeSeriesDataset(Dataset):
                 self.dishes_df_scaled[col] = self.continuous_scalers[col].transform(
                     self.dishes_df_scaled[col].to_numpy().reshape(-1, 1)
                 )
+                
+                # Store the normalized baselines for all food real columns
+                normalized_zero = self.continuous_scalers[col].transform([[0.0]])[0, 0]
+                self.food_reals_normalized_zero[col] = normalized_zero
+
+            # Create an aggregated tensor of all the normalized zero values for the food reals
+            self.food_reals_normalized_zero_tensor = []
+            for col in self.food_reals:
+                self.food_reals_normalized_zero_tensor.append(self.food_reals_normalized_zero[col])
+            self.food_reals_normalized_zero_tensor = torch.tensor(self.food_reals_normalized_zero_tensor).to(self.device)
+                
             # Encode the categorical variables
             for col in self.food_categoricals:
                 logger.debug(f"Encoding {col}")
                 self.dishes_df_scaled[col] = self.categorical_encoders[col].transform(self.dishes_df_scaled[col])
-            
             
             # Prepare the dishes df tensor
             self.dishes_df_scaled = self.dishes_df_scaled.reset_index(drop=True)
@@ -753,7 +766,7 @@ class PPGRTimeSeriesDataset(Dataset):
         # We return everything as a nested tensor        
         dish_tensors_cat_for_this_slice = torch.nested.nested_tensor(dish_tensors_cat_for_this_slice)
         dish_tensors_real_for_this_slice = torch.nested.nested_tensor(dish_tensors_real_for_this_slice)
-                
+                        
         # Padd the sequences to the same size for easier batching
         # Probably better to move the padding to the collate function
         # PADDING_VALUE = -1
@@ -1223,6 +1236,7 @@ class PPGRToMealGlucoseWrapper(Dataset):
         # Past glucose: assume "x_real_target" has shape [T_enc, 1] → squeeze last dimension.
         past_glucose = item["x_real_target"].squeeze(-1)  # shape: [T_enc]
         
+        
         # Convert nested meal-level tensors to padded dense tensors.
         if item["x_food_cat"].size(0) == 0 or all(t.size(0) == 0 for t in item["x_food_cat"]):
             # Create zero tensors of desired shape
@@ -1234,7 +1248,7 @@ class PPGRToMealGlucoseWrapper(Dataset):
             x_food_real = torch.zeros(x_length, self.max_meals, num_real_features)
         else:
             x_food_cat = torch.nested.to_padded_tensor(item["x_food_cat"], padding=0)
-            x_food_real = torch.nested.to_padded_tensor(item["x_food_real"], padding=0)
+            x_food_real = torch.nested.to_padded_tensor(item["x_food_real"], padding=0)            
         
         # Get the index of the food_id column in the food_cat dictionary
         self.food_id_col_idx = self.ppgr_dataset.food_categoricals.index("food_id")
@@ -1245,6 +1259,12 @@ class PPGRToMealGlucoseWrapper(Dataset):
         # For the meal macros, assume columns 2:5 hold the desired macronutrients.
         past_meal_macros = x_food_real[:, :, :].float()  # shape: [T_enc, max_meals, num_nutrients]
         past_meal_macros = self.pad_or_truncate(past_meal_macros, self.max_meals, dim=1)
+        
+        ## Fix past_meal_macros padding to use normalized zero values, instead of scalar 0 values            
+        # Find positions where all features are 0 (i.e., padding positions)
+        past_meal_macros_padding_mask = (past_meal_macros.sum(dim=-1) == 0)  # Shape: [T, max_meals]
+        # Replace padding positions with normalized zeros
+        past_meal_macros[past_meal_macros_padding_mask] = self.ppgr_dataset.food_reals_normalized_zero_tensor.to(past_meal_macros.device, dtype=past_meal_macros.dtype)
         
         # ---------------------------
         # Future (prediction) side:
@@ -1262,14 +1282,19 @@ class PPGRToMealGlucoseWrapper(Dataset):
             y_food_real = torch.zeros(y_length, self.max_meals, num_real_features).to(device)
         else:
             y_food_cat = torch.nested.to_padded_tensor(item["y_food_cat"], padding=0)
-            y_food_real = torch.nested.to_padded_tensor(item["y_food_real"], padding=0)
-        
+            y_food_real = torch.nested.to_padded_tensor(item["y_food_real"], padding=0)        
                 
         future_meal_ids = y_food_cat[:, :, self.food_id_col_idx].long()  # shape: [T_pred, max_meals]
         future_meal_ids = self.pad_or_truncate(future_meal_ids, self.max_meals, dim=1)
         
         future_meal_macros = y_food_real[:, :, :].float()  # shape: [T_pred, max_meals, num_nutrients]
         future_meal_macros = self.pad_or_truncate(future_meal_macros, self.max_meals, dim=1)
+        
+        # Fix future_meal_macros padding to use normalized zero values, instead of scalar 0 values            
+        # Find positions where all features are 0 (i.e., padding positions)
+        future_meal_macros_padding_mask = (future_meal_macros.sum(dim=-1) == 0)  # Shape: [T, max_meals]
+        # Replace padding positions with normalized zeros
+        future_meal_macros[future_meal_macros_padding_mask] = self.ppgr_dataset.food_reals_normalized_zero_tensor.to(future_meal_macros.device, dtype=future_meal_macros.dtype)            
         
         target_scales = item["target_scales"].squeeze() # TODO: check the provenance of this tensor and if we really need to do this squeeze here
     
@@ -1417,6 +1442,7 @@ def meal_glucose_collate_fn(batch):
     past_meal_macros_batch = torch.nn.utils.rnn.pad_sequence(
         extracted_data["past_meal_macros"], batch_first=True, padding_value=0, padding_side="left"
     )
+    # TODO: When having variable lengths, padding_value=0 will not work, and will have to carefully pad the meal macro values to the normalized zero values 
     
     # Future sequences should all have the same length, so we can just stack them
     future_glucose_batch = torch.stack(extracted_data["future_glucose"])

@@ -207,7 +207,7 @@ def main(**kwargs):
     # Create data loaders
     train_loader, val_loader, test_loader, training_dataset = get_dataloaders(config)
     logger.info(f"Dataset loaded: {len(training_dataset)} training, {len(val_loader.dataset)} validation, {len(test_loader.dataset)} test samples")
-        
+    
     # Create model
     model = MealGlucoseForecastModel.from_dataset(training_dataset, config)
     logger.info(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")    
