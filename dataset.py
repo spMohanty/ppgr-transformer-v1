@@ -1433,12 +1433,20 @@ def meal_glucose_collate_fn(batch):
     Returns:
         A dictionary of padded tensors ready for the model.
     """
+    
+    use_meal_level_food_covariates = "past_meal_ids" in batch[0].keys()
+    
     # Extract all lists in a single pass
     keys = ["user_categoricals", "user_reals", "user_microbiome_embeddings", 
             "past_temporal_categoricals", "past_temporal_reals", "future_temporal_categoricals", "future_temporal_reals",
-            "past_glucose", "past_meal_ids", "past_meal_macros", 
-            "future_meal_ids", "future_meal_macros", "future_glucose", 
+            "past_glucose", "future_glucose",             
             "target_scales", "encoder_length"]
+    
+    if use_meal_level_food_covariates:
+        keys.extend(["past_meal_ids", "past_meal_macros", "future_meal_ids", "future_meal_macros"])
+    else:
+        keys.extend(["past_food_cat", "past_food_real", "future_food_cat", "future_food_real"])
+    
     
     # Initialize empty lists for each key
     extracted_data = {k: [] for k in keys}
@@ -1480,20 +1488,33 @@ def meal_glucose_collate_fn(batch):
         extracted_data["past_glucose"], batch_first=True, padding_value=0.0, padding_side="left"
     )
     
-    past_meal_ids_batch = torch.nn.utils.rnn.pad_sequence(
-        extracted_data["past_meal_ids"], batch_first=True, padding_value=0, padding_side="left"
-    )
-    
-    past_meal_macros_batch = torch.nn.utils.rnn.pad_sequence(
-        extracted_data["past_meal_macros"], batch_first=True, padding_value=0, padding_side="left"
-    )
-    # TODO: When having variable lengths, padding_value=0 will not work, and will have to carefully pad the meal macro values to the normalized zero values 
+    if use_meal_level_food_covariates:
+        past_meal_ids_batch = torch.nn.utils.rnn.pad_sequence(
+            extracted_data["past_meal_ids"], batch_first=True, padding_value=0, padding_side="left"
+        )
+        past_meal_macros_batch = torch.nn.utils.rnn.pad_sequence(
+            extracted_data["past_meal_macros"], batch_first=True, padding_value=0, padding_side="left"
+        )
+        # TODO: When having variable lengths, padding_value=0 will not work, and will have to carefully pad the meal macro values to the normalized zero values 
+    else:
+        past_food_cat_batch = torch.nn.utils.rnn.pad_sequence(
+            extracted_data["past_food_cat"], batch_first=True, padding_value=0, padding_side="left"
+        )
+        past_food_real_batch = torch.nn.utils.rnn.pad_sequence(
+            extracted_data["past_food_real"], batch_first=True, padding_value=0, padding_side="left"
+        )
+        # TODO: When having variable lengths, padding_value=0 will not work, and will have to carefully pad the meal macro values to the normalized zero values         
         
     
     # Future sequences should all have the same length, so we can just stack them
     future_glucose_batch = torch.stack(extracted_data["future_glucose"])
-    future_meal_ids_batch = torch.stack(extracted_data["future_meal_ids"])
-    future_meal_macros_batch = torch.stack(extracted_data["future_meal_macros"])
+    
+    if use_meal_level_food_covariates:
+        future_meal_ids_batch = torch.stack(extracted_data["future_meal_ids"])
+        future_meal_macros_batch = torch.stack(extracted_data["future_meal_macros"])
+    else:
+        future_food_cat_batch = torch.stack(extracted_data["future_food_cat"])
+        future_food_real_batch = torch.stack(extracted_data["future_food_real"])
     
     # Stack target scales
     target_scales_batch = torch.stack(extracted_data["target_scales"])
@@ -1503,7 +1524,7 @@ def meal_glucose_collate_fn(batch):
     start_positions = max_encoder_len - encoder_lengths.unsqueeze(1)
     encoder_padding_mask = positions.unsqueeze(0) >= start_positions
     
-    return {
+    response_payload = {
         "user_categoricals": user_categoricals,
         "user_reals": user_reals,
         "user_microbiome_embeddings": user_microbiome_embeddings,
@@ -1512,16 +1533,29 @@ def meal_glucose_collate_fn(batch):
         "future_temporal_categoricals": future_temporal_categoricals,
         "future_temporal_reals": future_temporal_reals,
         "past_glucose": past_glucose_batch, 
-        "past_meal_ids": past_meal_ids_batch, 
-        "past_meal_macros": past_meal_macros_batch, 
-        "future_meal_ids": future_meal_ids_batch, 
-        "future_meal_macros": future_meal_macros_batch, 
         "future_glucose": future_glucose_batch, 
         "target_scales": target_scales_batch,
         "encoder_lengths": encoder_lengths,
         "encoder_padding_mask": encoder_padding_mask,
         "metadata": metadata
     }
+    
+    if use_meal_level_food_covariates:
+        response_payload.update({
+            "past_meal_ids": past_meal_ids_batch, 
+            "past_meal_macros": past_meal_macros_batch, 
+            "future_meal_ids": future_meal_ids_batch, 
+            "future_meal_macros": future_meal_macros_batch, 
+        })
+    else:
+        response_payload.update({
+            "past_food_cat": past_food_cat_batch,
+            "past_food_real": past_food_real_batch,
+            "future_food_cat": future_food_cat_batch,
+            "future_food_real": future_food_real_batch,
+        })
+    
+    return response_payload
 
 
 # -----------------------------------------------------------------------------
@@ -1976,7 +2010,7 @@ if __name__ == "__main__":
         debug_mode=True,
         dataset_version="v0.5",
         use_bootstraped_food_embeddings=True,
-        use_meal_level_food_covariates=True,
+        use_meal_level_food_covariates=False,
         use_cache = False
     )
 
