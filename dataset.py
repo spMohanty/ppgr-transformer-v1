@@ -448,6 +448,9 @@ class PPGRTimeSeriesDataset(Dataset):
         if not self.use_bootstraped_food_embeddings:
             return
 
+        if not self.use_meal_level_food_covariates:
+            return
+
         if "food_id" not in self.categorical_encoders:
             raise AssertionError(
                 "food_id should be present in the categorical_encoders dictionary when using bootstraped food embeddings"
@@ -1130,28 +1133,31 @@ class PPGRToMealGlucoseWrapper(Dataset):
         """Validate that the dataset meets all requirements for this wrapper."""
         # Food-related validations
         assert hasattr(self.ppgr_dataset, "categorical_encoders"), "Dataset missing categorical_encoders attribute"
-        assert "food_id" in self.ppgr_dataset.categorical_encoders, "food_id missing from categorical_encoders"
-        assert hasattr(self.ppgr_dataset, "food_names"), "Dataset missing food_names attribute"
-        assert hasattr(self.ppgr_dataset, "food_group_names"), "Dataset missing food_group_names attribute"
+        if self.ppgr_dataset.use_meal_level_food_covariates:
+            assert "food_id" in self.ppgr_dataset.categorical_encoders, "food_id missing from categorical_encoders"
+            assert hasattr(self.ppgr_dataset, "food_names"), "Dataset missing food_names attribute"
+            assert hasattr(self.ppgr_dataset, "food_group_names"), "Dataset missing food_group_names attribute"
         
         # Nutrient-related validations
         assert hasattr(self.ppgr_dataset, "food_reals"), "Dataset missing food_reals attribute"
 
     def _initialize_attributes(self):
         """Initialize all required attributes after validation has passed."""
-        # Initialize max meals
-        if hasattr(self.ppgr_dataset, "max_meals_per_timestep"):
-            self.max_meals = self.ppgr_dataset.max_meals_per_timestep
-        else:
-            self.max_meals = 11  # default fallback
-            
-        # Initialize food attributes
-        self.food_names = self.ppgr_dataset.food_names
-        self.food_group_names = self.ppgr_dataset.food_group_names
-        self.num_foods = len(self.food_names)
-            
-        # Initialize nutrient dimensions
-        self.num_nutrients = len(self.ppgr_dataset.food_reals)
+        
+        if self.ppgr_dataset.use_meal_level_food_covariates:
+            # Initialize max meals
+            if hasattr(self.ppgr_dataset, "max_meals_per_timestep"):
+                self.max_meals = self.ppgr_dataset.max_meals_per_timestep
+            else:
+                self.max_meals = 11  # default fallback
+                
+            # Initialize food attributes
+            self.food_names = self.ppgr_dataset.food_names
+            self.food_group_names = self.ppgr_dataset.food_group_names
+            self.num_foods = len(self.food_names)
+                
+            # Initialize nutrient dimensions
+            self.num_nutrients = len(self.ppgr_dataset.food_reals)
 
     def __len__(self):
         return len(self.ppgr_dataset)
@@ -1234,74 +1240,100 @@ class PPGRToMealGlucoseWrapper(Dataset):
         # Past (encoder) side:
         # ---------------------------
         # Past glucose: assume "x_real_target" has shape [T_enc, 1] → squeeze last dimension.
-        past_glucose = item["x_real_target"].squeeze(-1)  # shape: [T_enc]
+        past_glucose = item["x_real_target"].squeeze(-1)  # shape: [T_enc]        
         
         
-        # Convert nested meal-level tensors to padded dense tensors.
-        if item["x_food_cat"].size(0) == 0 or all(t.size(0) == 0 for t in item["x_food_cat"]):
-            # Create zero tensors of desired shape
-            # [T_enc, max_meals, num_features]
-            x_length = item["x_real_target"].shape[0]
-            num_cat_features = item["x_food_cat"][0].shape[-1]
-            num_real_features = item["x_food_real"][0].shape[-1]
-            x_food_cat = torch.zeros(x_length, self.max_meals, num_cat_features)
-            x_food_real = torch.zeros(x_length, self.max_meals, num_real_features)
+        if self.ppgr_dataset.use_meal_level_food_covariates:
+            ##########################################################################################
+            ##########################################################################################
+            ### Meal Level Food Covariates
+            ##########################################################################################
+            ##########################################################################################
+            
+            # Convert nested meal-level tensors to padded dense tensors.
+            if item["x_food_cat"].size(0) == 0 or all(t.size(0) == 0 for t in item["x_food_cat"]):
+                # Create zero tensors of desired shape
+                # [T_enc, max_meals, num_features]
+                x_length = item["x_real_target"].shape[0]
+                num_cat_features = item["x_food_cat"][0].shape[-1]
+                num_real_features = item["x_food_real"][0].shape[-1]
+                x_food_cat = torch.zeros(x_length, self.max_meals, num_cat_features)
+                x_food_real = torch.zeros(x_length, self.max_meals, num_real_features)
+            else:
+                x_food_cat = torch.nested.to_padded_tensor(item["x_food_cat"], padding=0)
+                x_food_real = torch.nested.to_padded_tensor(item["x_food_real"], padding=0)        
+                
+            
+            # Get the index of the food_id column in the food_cat dictionary
+            self.food_id_col_idx = self.ppgr_dataset.food_categoricals.index("food_id")
+            
+            past_meal_ids = x_food_cat[:, :, self.food_id_col_idx].long()  # shape: [T_enc, max_meals]
+            past_meal_ids = self.pad_or_truncate(past_meal_ids, self.max_meals, dim=1)
+            
+            # For the meal macros, assume columns 2:5 hold the desired macronutrients.
+            past_meal_macros = x_food_real[:, :, :].float()  # shape: [T_enc, max_meals, num_nutrients]
+            past_meal_macros = self.pad_or_truncate(past_meal_macros, self.max_meals, dim=1)
+            
+            ## Fix past_meal_macros padding to use normalized zero values, instead of scalar 0 values            
+            # Find positions where all features are 0 (i.e., padding positions)
+            past_meal_macros_padding_mask = (past_meal_macros.sum(dim=-1) == 0)  # Shape: [T, max_meals]
+            # Replace padding positions with normalized zeros
+            past_meal_macros[past_meal_macros_padding_mask] = self.ppgr_dataset.food_reals_normalized_zero_tensor.to(past_meal_macros.device, dtype=past_meal_macros.dtype)
+        
         else:
-            x_food_cat = torch.nested.to_padded_tensor(item["x_food_cat"], padding=0)
-            x_food_real = torch.nested.to_padded_tensor(item["x_food_real"], padding=0)            
-        
-        # Get the index of the food_id column in the food_cat dictionary
-        self.food_id_col_idx = self.ppgr_dataset.food_categoricals.index("food_id")
-        
-        past_meal_ids = x_food_cat[:, :, self.food_id_col_idx].long()  # shape: [T_enc, max_meals]
-        past_meal_ids = self.pad_or_truncate(past_meal_ids, self.max_meals, dim=1)
-        
-        # For the meal macros, assume columns 2:5 hold the desired macronutrients.
-        past_meal_macros = x_food_real[:, :, :].float()  # shape: [T_enc, max_meals, num_nutrients]
-        past_meal_macros = self.pad_or_truncate(past_meal_macros, self.max_meals, dim=1)
-        
-        ## Fix past_meal_macros padding to use normalized zero values, instead of scalar 0 values            
-        # Find positions where all features are 0 (i.e., padding positions)
-        past_meal_macros_padding_mask = (past_meal_macros.sum(dim=-1) == 0)  # Shape: [T, max_meals]
-        # Replace padding positions with normalized zeros
-        past_meal_macros[past_meal_macros_padding_mask] = self.ppgr_dataset.food_reals_normalized_zero_tensor.to(past_meal_macros.device, dtype=past_meal_macros.dtype)
+            # Standard case with aggregated nutrient information
+            x_food_cat = item["x_food_cat"]
+            x_food_real = item["x_food_real"]
         
         # ---------------------------
         # Future (prediction) side:
         # ---------------------------
         future_glucose = item["y_real_target"].squeeze(-1)  # shape: [T_pred]
         
-        # Handle empty nested tensors for food data
-        if item["y_food_cat"].size(0) == 0 or all(t.size(0) == 0 for t in item["y_food_cat"]):
-            # Create zero tensors of desired shape
-            # [T_pred, max_meals, num_features]
-            y_length = item["y_real_target"].shape[0]
-            num_cat_features = item["y_food_cat"][0].shape[-1]
-            num_real_features = item["y_food_real"][0].shape[-1]
-            y_food_cat = torch.zeros(y_length, self.max_meals, num_cat_features).to(device)
-            y_food_real = torch.zeros(y_length, self.max_meals, num_real_features).to(device)
+        
+        if self.ppgr_dataset.use_meal_level_food_covariates:
+            ##########################################################################################
+            ##########################################################################################
+            ### Meal Level Food Covariates
+            ##########################################################################################
+            ##########################################################################################
+        
+            # Handle empty nested tensors for food data
+            if item["y_food_cat"].size(0) == 0 or all(t.size(0) == 0 for t in item["y_food_cat"]):
+                # Create zero tensors of desired shape
+                # [T_pred, max_meals, num_features]
+                y_length = item["y_real_target"].shape[0]
+                num_cat_features = item["y_food_cat"][0].shape[-1]
+                num_real_features = item["y_food_real"][0].shape[-1]
+                y_food_cat = torch.zeros(y_length, self.max_meals, num_cat_features).to(device)
+                y_food_real = torch.zeros(y_length, self.max_meals, num_real_features).to(device)
+            else:
+                y_food_cat = torch.nested.to_padded_tensor(item["y_food_cat"], padding=0)
+                y_food_real = torch.nested.to_padded_tensor(item["y_food_real"], padding=0)        
+                    
+            future_meal_ids = y_food_cat[:, :, self.food_id_col_idx].long()  # shape: [T_pred, max_meals]
+            future_meal_ids = self.pad_or_truncate(future_meal_ids, self.max_meals, dim=1)
+            
+            future_meal_macros = y_food_real[:, :, :].float()  # shape: [T_pred, max_meals, num_nutrients]
+            future_meal_macros = self.pad_or_truncate(future_meal_macros, self.max_meals, dim=1)
+            
+            # Fix future_meal_macros padding to use normalized zero values, instead of scalar 0 values            
+            # Find positions where all features are 0 (i.e., padding positions)
+            future_meal_macros_padding_mask = (future_meal_macros.sum(dim=-1) == 0)  # Shape: [T, max_meals]
+            # Replace padding positions with normalized zeros
+            future_meal_macros[future_meal_macros_padding_mask] = self.ppgr_dataset.food_reals_normalized_zero_tensor.to(future_meal_macros.device, dtype=future_meal_macros.dtype)            
+            
         else:
-            y_food_cat = torch.nested.to_padded_tensor(item["y_food_cat"], padding=0)
-            y_food_real = torch.nested.to_padded_tensor(item["y_food_real"], padding=0)        
-                
-        future_meal_ids = y_food_cat[:, :, self.food_id_col_idx].long()  # shape: [T_pred, max_meals]
-        future_meal_ids = self.pad_or_truncate(future_meal_ids, self.max_meals, dim=1)
-        
-        future_meal_macros = y_food_real[:, :, :].float()  # shape: [T_pred, max_meals, num_nutrients]
-        future_meal_macros = self.pad_or_truncate(future_meal_macros, self.max_meals, dim=1)
-        
-        # Fix future_meal_macros padding to use normalized zero values, instead of scalar 0 values            
-        # Find positions where all features are 0 (i.e., padding positions)
-        future_meal_macros_padding_mask = (future_meal_macros.sum(dim=-1) == 0)  # Shape: [T, max_meals]
-        # Replace padding positions with normalized zeros
-        future_meal_macros[future_meal_macros_padding_mask] = self.ppgr_dataset.food_reals_normalized_zero_tensor.to(future_meal_macros.device, dtype=future_meal_macros.dtype)            
+            # Standard case with aggregated nutrient information
+            y_food_cat = item["y_food_cat"]
+            y_food_real = item["y_food_real"]
         
         target_scales = item["target_scales"].squeeze() # TODO: check the provenance of this tensor and if we really need to do this squeeze here
     
     
         metadata = item["metadata"]
         # Return the 6-tuple.
-        return {
+        response_payload ={
             "user_categoricals": user_cat, # [num_user_cat_features]
             "user_reals": user_real, # [num_user_real_features]
             "user_microbiome_embeddings": user_microbiome_embedding, # [num_microbiome_features]
@@ -1310,15 +1342,28 @@ class PPGRToMealGlucoseWrapper(Dataset):
             "future_temporal_categoricals": future_temporal_cat, # [num_temporal_cat_features]
             "future_temporal_reals": future_temporal_real, # [num_temporal_real_features]
             "past_glucose": past_glucose.float(),           # [T_enc]
-            "past_meal_ids": past_meal_ids,          # [T_enc, max_meals]
-            "past_meal_macros": past_meal_macros.float(),       # [T_enc, max_meals, num_nutrients]
-            "future_meal_ids": future_meal_ids,        # [T_pred, max_meals]
-            "future_meal_macros": future_meal_macros.float(),     # [T_pred, max_meals, num_nutrients]
             "future_glucose": future_glucose.float(),         # [T_pred]
             "target_scales": target_scales,         # [2]
             "encoder_length": encoder_length,         # [1]
             "metadata": metadata         # Dict with metadata
         }
+        
+        if self.ppgr_dataset.use_meal_level_food_covariates:
+            response_payload.update({
+                "past_meal_ids": past_meal_ids,          # [T_enc, max_meals]
+                "past_meal_macros": past_meal_macros.float(),       # [T_enc, max_meals, num_nutrients]
+                "future_meal_ids": future_meal_ids,        # [T_pred, max_meals]
+                "future_meal_macros": future_meal_macros.float(),     # [T_pred, max_meals, num_nutrients]                
+            })
+        else:
+            response_payload.update({
+                "past_food_cat": x_food_cat,          # [T_enc, num_food_cat_features]
+                "past_food_real": x_food_real.float(),       # [T_enc, num_food_real_features]
+                "future_food_cat": y_food_cat,        # [T_pred, num_food_cat_features]
+                "future_food_real": y_food_real.float(),     # [T_pred, num_food_real_features]                
+            })
+        
+        return response_payload
     
     def get_cache_stats(self):
         """Return statistics about the cache performance."""
@@ -1443,6 +1488,7 @@ def meal_glucose_collate_fn(batch):
         extracted_data["past_meal_macros"], batch_first=True, padding_value=0, padding_side="left"
     )
     # TODO: When having variable lengths, padding_value=0 will not work, and will have to carefully pad the meal macro values to the normalized zero values 
+        
     
     # Future sequences should all have the same length, so we can just stack them
     future_glucose_batch = torch.stack(extracted_data["future_glucose"])
@@ -1930,6 +1976,7 @@ if __name__ == "__main__":
         debug_mode=True,
         dataset_version="v0.5",
         use_bootstraped_food_embeddings=True,
+        use_meal_level_food_covariates=True,
         use_cache = False
     )
 
